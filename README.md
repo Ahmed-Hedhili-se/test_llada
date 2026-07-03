@@ -34,6 +34,7 @@ bash start.sh --weight-dir ./weights            # start server on :8000
 
 ```
 src/model.py       — model implementation
+src/model_small.py — ~195M scaled-down variant (random weights, same architecture)
 src/generate.py    — masked diffusion decode loop
 src/server.py      — OpenAI-compatible chat completions server
 compare_models.py  — logit + generation comparison vs HF reference
