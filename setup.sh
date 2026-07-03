@@ -41,7 +41,10 @@ PY="$VENV/bin/python"
 PIP="$VENV/bin/pip"
 
 # Detect CUDA version for torch wheel selection
-CUDA_VER=$(nvcc --version 2>/dev/null | grep -oP 'release \K[0-9]+\.[0-9]+' || echo "12.4")
+# Prefer nvidia-smi over nvcc (nvcc may not be in PATH on inference nodes)
+CUDA_VER=$(nvidia-smi 2>/dev/null | grep -oP 'CUDA Version: \K[0-9]+\.[0-9]+' \
+        || nvcc --version 2>/dev/null | grep -oP 'release \K[0-9]+\.[0-9]+' \
+        || echo "12.4")
 CUDA_MAJOR=$(echo "$CUDA_VER" | cut -d. -f1)
 CUDA_MINOR=$(echo "$CUDA_VER" | cut -d. -f2)
 
