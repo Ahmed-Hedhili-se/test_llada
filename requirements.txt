@@ -1,0 +1,12 @@
+torch>=2.12.1
+safetensors
+transformers==4.53.2
+accelerate
+fastapi
+uvicorn[standard]
+pydantic
+jinja2>=3.1.0
+huggingface_hub
+lm-eval[api]>=0.4.4
+aiohttp
+tqdm

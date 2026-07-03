@@ -11,7 +11,7 @@ WEIGHT_DIR="$SCRIPT_DIR/weights"
 PORT=8000
 HOST="0.0.0.0"
 DEVICE="cuda:0"
-VENV="${VENV:-$HOME/venv}"
+VENV="${VENV:-$SCRIPT_DIR/.venv}"
 
 while [[ $# -gt 0 ]]; do
     case $1 in

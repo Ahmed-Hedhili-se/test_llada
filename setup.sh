@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # One-shot setup for LLaDA-MoE-7B-A1B-Instruct inference engine.
-# Creates a Python venv at ~/venv (reuses if it exists from prior Qwen setup).
+# Creates a dedicated venv at $SCRIPT_DIR/.venv
+# Requires transformers==4.53.2 (5.x removed ROPE_INIT_FUNCTIONS['default'])
 #
 # Usage:
 #   bash setup.sh                        # install deps + download weights
@@ -11,7 +12,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WEIGHT_DIR="$SCRIPT_DIR/weights"
 SKIP_WEIGHTS=0
-VENV="${VENV:-$HOME/venv}"
+VENV="${VENV:-$SCRIPT_DIR/.venv}"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -61,18 +62,7 @@ else
     echo "  PyTorch already available"
 fi
 
-"$PIP" install -q \
-    safetensors \
-    "transformers==4.53.2" \
-    accelerate \
-    fastapi \
-    "uvicorn[standard]" \
-    pydantic \
-    "jinja2>=3.1.0" \
-    huggingface_hub \
-    "lm-eval[api]>=0.4.4" \
-    aiohttp \
-    tqdm
+"$PIP" install -q -r "$SCRIPT_DIR/requirements.txt"
 
 echo "  Done."
 echo ""
