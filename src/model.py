@@ -210,9 +210,12 @@ class LLaDAMoE(nn.Module):
 
 # ── Weight loading ────────────────────────────────────────────────────────────
 def _hf_to_our_key(hk: str) -> Optional[str]:
-    """Strip HF 'model.' prefix; skip non-backbone keys."""
+    """Strip HF 'model.' prefix. lm_head lives at top level in HF (no prefix)."""
     if hk.startswith("model."):
         return hk[len("model."):]
+    # lm_head.weight is at the top level in HF weights (not under model.)
+    if hk == "lm_head.weight":
+        return hk
     return None
 
 
