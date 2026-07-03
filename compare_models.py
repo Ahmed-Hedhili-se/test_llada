@@ -1,9 +1,13 @@
 """
 Compare our LLaDA-MoE implementation vs the HF reference on identical inputs.
 
+LLaDA-MoE is a diffusion LM: meaningful logits come from feeding sequences
+that contain MASK tokens. We test by building [prompt | MASK...MASK] inputs
+and comparing the logits at the first masked position.
+
 Tests:
-  1. Per-token logit cosine similarity across 6 prompts (with mask tokens)
-  2. Top-1 token match rate
+  1. Logit cosine similarity at the first masked position (6 prompts)
+  2. Top-1 token match rate at that position
   3. Full generation comparison (diffusion decode, same steps/seed)
 
 Usage:
@@ -17,9 +21,10 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
 MASK_ID = 156895
+GEN_LEN = 32   # short generation suffix appended for logit comparison
 
 
 def load_ours(weight_dir: str):
@@ -31,7 +36,8 @@ def load_ours(weight_dir: str):
 
 
 def load_hf(weight_dir: str):
-    return AutoModel.from_pretrained(
+    # AutoModelForCausalLM maps to LLaDAMoEModelLM which has .lm_head and returns .logits
+    return AutoModelForCausalLM.from_pretrained(
         weight_dir,
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
@@ -43,19 +49,17 @@ def topk_tokens(logits: torch.Tensor, tok, k: int = 5) -> list[str]:
     return [repr(tok.decode([i])) for i in logits.topk(k).indices.tolist()]
 
 
-def gen_ours(model, prompt_ids, tok, gen_length=64, steps=64, block_length=32):
-    sys.path.insert(0, str(Path(__file__).parent))
-    from src.generate import generate
-    out = generate(model, prompt_ids, gen_length=gen_length, steps=steps,
-                   block_length=block_length, temperature=0.0)
-    ids = out[0].tolist()
-    if tok.eos_token_id in ids:
-        ids = ids[: ids.index(tok.eos_token_id)]
-    return tok.decode(ids, skip_special_tokens=True)
+def make_diffusion_input(prompt_ids: torch.Tensor, gen_length: int) -> tuple[torch.Tensor, int]:
+    """Build [prompt | MASK * gen_length]. Returns (input_ids, prompt_len)."""
+    P = prompt_ids.shape[1]
+    x = torch.full((1, P + gen_length), MASK_ID, dtype=torch.long, device=prompt_ids.device)
+    x[:, :P] = prompt_ids
+    return x, P
 
 
-def gen_hf(model, prompt_ids, tok, gen_length=64, steps=64, block_length=32):
-    """Run HF model's own diffusion generation (same algorithm)."""
+def diffusion_generate(model, prompt_ids, gen_length=64, steps=64, block_length=32,
+                        temperature=0.0, is_hf=False):
+    """Run the masked diffusion decode loop, works for both our model and HF."""
     import numpy as np
 
     device = prompt_ids.device
@@ -80,13 +84,13 @@ def gen_hf(model, prompt_ids, tok, gen_length=64, steps=64, block_length=32):
         for step in range(steps_per_block):
             mask_index = (x == MASK_ID)
             with torch.no_grad():
-                logits = model(x).logits
+                logits = model(x).logits if is_hf else model(x)
             x0 = logits.argmax(dim=-1)
             p = F.softmax(logits.float(), dim=-1)
             x0_p = p.gather(-1, x0.unsqueeze(-1)).squeeze(-1)
-            x0_p[:, be:] = -torch.inf
+            x0_p[:, be:] = -np.inf
             x0 = torch.where(mask_index, x0, x)
-            conf = torch.where(mask_index, x0_p, torch.full_like(x0_p, -torch.inf))
+            conf = torch.where(mask_index, x0_p, torch.tensor(-np.inf, device=device))
             transfer = torch.zeros_like(x0, dtype=torch.bool)
             k = ntok[0, step].item()
             if k > 0:
@@ -94,14 +98,9 @@ def gen_hf(model, prompt_ids, tok, gen_length=64, steps=64, block_length=32):
                 transfer[0, sel] = True
             x[transfer] = x0[transfer]
 
-    ids = x[0, P:].tolist()
-    if tok.eos_token_id in ids:
-        ids = ids[: ids.index(tok.eos_token_id)]
-    return tok.decode(ids, skip_special_tokens=True)
+    return x[0, P:]
 
 
-# Test inputs: each is a (prompt_text, mask_positions_hint) pair
-# We inject MASK_ID into the prompt to test full-sequence logit matching
 PROMPTS = [
     "The chemical symbol for gold is",
     "def fibonacci(n):\n    if n <= 1: return n\n    return",
@@ -110,16 +109,6 @@ PROMPTS = [
     "Water boils at 100 degrees",
     "The largest planet in the solar system is",
 ]
-
-
-def make_masked_input(prompt_ids: torch.Tensor, mask_frac: float = 0.15) -> torch.Tensor:
-    """Replace ~15% of non-first tokens with MASK_ID to simulate diffusion input."""
-    ids = prompt_ids.clone()
-    T = ids.shape[1]
-    n_mask = max(1, int(T * mask_frac))
-    positions = torch.randperm(T - 1)[:n_mask] + 1   # skip position 0
-    ids[0, positions] = MASK_ID
-    return ids
 
 
 def main():
@@ -147,16 +136,19 @@ def main():
 
     torch.manual_seed(42)
     for prompt_text in PROMPTS:
-        ids = tok(prompt_text, return_tensors="pt")["input_ids"].to("cuda:0")
-        masked_ids = make_masked_input(ids)   # both models see same masked input
+        prompt_ids = tok(prompt_text, return_tensors="pt")["input_ids"].to("cuda:0")
+
+        # Build diffusion input: [prompt | MASK * GEN_LEN]
+        # Both models see exactly the same tensor — compare logits at first masked pos
+        x, P = make_diffusion_input(prompt_ids, GEN_LEN)
+        first_mask_pos = P   # index of first MASK token
 
         with torch.no_grad():
-            our_logits = ours(masked_ids)           # [1, T, V]
-            hf_logits  = hf(masked_ids).logits      # [1, T, V]
+            our_logits = ours(x)            # [1, P+GEN_LEN, V]
+            hf_logits  = hf(x).logits       # [1, P+GEN_LEN, V]
 
-        # Compare logits at last token position
-        ol = our_logits[0, -1].float()
-        hl = hf_logits[0, -1].float()
+        ol = our_logits[0, first_mask_pos].float()
+        hl = hf_logits[0, first_mask_pos].float()
         cos = F.cosine_similarity(ol.unsqueeze(0), hl.unsqueeze(0)).item()
         our_top5 = topk_tokens(ol, tok)
         hf_top5  = topk_tokens(hl, tok)
@@ -167,15 +159,22 @@ def main():
 
         print(sep)
         print(f"PROMPT : {repr(prompt_text[:80])}")
+        print(f"  input  : [prompt({P} tok) | MASK×{GEN_LEN}], comparing logits @ pos {first_mask_pos}")
         print(f"  cosine={cos:.4f}  top1_match={match}")
         print(f"  ours top-5 : {our_top5}")
         print(f"  HF   top-5 : {hf_top5}")
 
         if not args.no_gen:
-            our_gen = gen_ours(ours, ids, tok, args.gen_length, args.steps, args.block_length)
-            hf_gen  = gen_hf(hf,   ids, tok, args.gen_length, args.steps, args.block_length)
-            print(f"  ours gen   : {repr(our_gen[:200])}")
-            print(f"  HF   gen   : {repr(hf_gen[:200])}")
+            our_gen = diffusion_generate(ours, prompt_ids, args.gen_length, args.steps,
+                                          args.block_length, is_hf=False)
+            hf_gen  = diffusion_generate(hf,   prompt_ids, args.gen_length, args.steps,
+                                          args.block_length, is_hf=True)
+            our_ids = our_gen.tolist()
+            hf_ids  = hf_gen.tolist()
+            if tok.eos_token_id in our_ids: our_ids = our_ids[:our_ids.index(tok.eos_token_id)]
+            if tok.eos_token_id in hf_ids:  hf_ids  = hf_ids[:hf_ids.index(tok.eos_token_id)]
+            print(f"  ours gen : {repr(tok.decode(our_ids, skip_special_tokens=True)[:200])}")
+            print(f"  HF   gen : {repr(tok.decode(hf_ids, skip_special_tokens=True)[:200])}")
         print()
 
     print(sep)
