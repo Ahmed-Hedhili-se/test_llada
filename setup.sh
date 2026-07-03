@@ -63,7 +63,7 @@ fi
 
 "$PIP" install -q \
     safetensors \
-    "transformers>=4.45" \
+    "transformers==4.53.2" \
     accelerate \
     fastapi \
     "uvicorn[standard]" \

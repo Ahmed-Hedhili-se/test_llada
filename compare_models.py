@@ -36,7 +36,7 @@ def load_ours(weight_dir: str):
 
 
 def load_hf(weight_dir: str):
-    # AutoModelForCausalLM maps to LLaDAMoEModelLM which has .lm_head and returns .logits
+    """Load HF reference model. Requires transformers==4.53.x (not 5.x)."""
     return AutoModelForCausalLM.from_pretrained(
         weight_dir,
         trust_remote_code=True,
@@ -128,7 +128,7 @@ def main():
     print("Loading our model...")
     ours = load_ours(args.weight_dir)
     print("Loading HF model...")
-    hf = load_hf(args.weight_dir)
+    hf = load_hf(args.weight_dir)  # noqa: requires transformers==4.53.x
     print()
 
     sep = "=" * 72
