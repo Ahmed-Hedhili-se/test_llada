@@ -101,14 +101,38 @@ def diffusion_generate(model, prompt_ids, gen_length=64, steps=64, block_length=
     return x[0, P:]
 
 
+# Longer, more demanding prompts that produce non-trivial multi-token completions
 PROMPTS = [
-    "The chemical symbol for gold is",
-    "def fibonacci(n):\n    if n <= 1: return n\n    return",
-    "The capital of Japan is",
-    "Compute: 7 × 8 =",
-    "Water boils at 100 degrees",
-    "The largest planet in the solar system is",
+    # factual
+    "The chemical symbol for gold is Au and for silver is",
+    "The capital of Japan is Tokyo and the capital of France is",
+    # math reasoning
+    "If a train travels at 80 km/h for 2.5 hours, it covers a distance of",
+    "The area of a circle with radius 7 is pi times 7 squared, which equals approximately",
+    # code completion (longer context)
+    "def quicksort(arr):\n    if len(arr) <= 1:\n        return arr\n    pivot = arr[len(arr) // 2]\n    left  = [x for x in arr if x < pivot]\n    mid   = [x for x in arr if x == pivot]\n    right = [x for x in arr if x > pivot]\n    return",
+    # multi-sentence context
+    "Einstein proposed that energy and mass are equivalent, expressed as E=mc². This means that a small amount of mass can be converted into",
+    # longer instruction-style
+    "Translate the following English sentence to French: 'The sun rises in the east and sets in the west.'",
+    "Write a Python function that returns the nth prime number. def nth_prime(n):",
 ]
+
+
+def compare_all_masked_positions(our_logits, hf_logits, P, gen_len, tok):
+    """
+    Compare logits at EVERY masked position (positions P..P+gen_len-1).
+    Returns per-position cosine similarity and top-1 match, plus aggregates.
+    """
+    cos_scores, matches = [], []
+    for pos in range(P, P + gen_len):
+        ol = our_logits[0, pos].float()
+        hl = hf_logits[0, pos].float()
+        cos = F.cosine_similarity(ol.unsqueeze(0), hl.unsqueeze(0)).item()
+        match = ol.argmax().item() == hl.argmax().item()
+        cos_scores.append(cos)
+        matches.append(match)
+    return cos_scores, matches
 
 
 def main():
@@ -132,37 +156,34 @@ def main():
     print()
 
     sep = "=" * 72
-    total_cos, top1_match, n_prompts = 0.0, 0, 0
+    all_cos, all_matches = [], []
 
     torch.manual_seed(42)
     for prompt_text in PROMPTS:
         prompt_ids = tok(prompt_text, return_tensors="pt")["input_ids"].to("cuda:0")
-
-        # Build diffusion input: [prompt | MASK * GEN_LEN]
-        # Both models see exactly the same tensor — compare logits at first masked pos
         x, P = make_diffusion_input(prompt_ids, GEN_LEN)
-        first_mask_pos = P   # index of first MASK token
 
         with torch.no_grad():
-            our_logits = ours(x)            # [1, P+GEN_LEN, V]
-            hf_logits  = hf(x).logits       # [1, P+GEN_LEN, V]
+            our_logits = ours(x)         # [1, P+GEN_LEN, V]
+            hf_logits  = hf(x).logits   # [1, P+GEN_LEN, V]
 
-        ol = our_logits[0, first_mask_pos].float()
-        hl = hf_logits[0, first_mask_pos].float()
-        cos = F.cosine_similarity(ol.unsqueeze(0), hl.unsqueeze(0)).item()
-        our_top5 = topk_tokens(ol, tok)
-        hf_top5  = topk_tokens(hl, tok)
-        match = our_top5[0] == hf_top5[0]
-        total_cos += cos
-        top1_match += int(match)
-        n_prompts += 1
+        cos_scores, matches = compare_all_masked_positions(our_logits, hf_logits, P, GEN_LEN, tok)
+        avg_cos   = sum(cos_scores) / len(cos_scores)
+        top1_rate = sum(matches) / len(matches)
+        all_cos.extend(cos_scores)
+        all_matches.extend(matches)
+
+        # Show first-mask-pos top-5 for qualitative check
+        ol0 = our_logits[0, P].float()
+        hl0 = hf_logits[0, P].float()
 
         print(sep)
-        print(f"PROMPT : {repr(prompt_text[:80])}")
-        print(f"  input  : [prompt({P} tok) | MASK×{GEN_LEN}], comparing logits @ pos {first_mask_pos}")
-        print(f"  cosine={cos:.4f}  top1_match={match}")
-        print(f"  ours top-5 : {our_top5}")
-        print(f"  HF   top-5 : {hf_top5}")
+        print(f"PROMPT : {repr(prompt_text[:90])}")
+        print(f"  input  : [prompt({P} tok) | MASK×{GEN_LEN}]  — comparing all {GEN_LEN} masked positions")
+        print(f"  avg_cosine={avg_cos:.4f}  top1_match={sum(matches)}/{GEN_LEN} ({top1_rate*100:.0f}%)")
+        print(f"  cosine range : [{min(cos_scores):.4f}, {max(cos_scores):.4f}]")
+        print(f"  pos[0] ours top-5 : {topk_tokens(ol0, tok)}")
+        print(f"  pos[0] HF   top-5 : {topk_tokens(hl0, tok)}")
 
         if not args.no_gen:
             our_gen = diffusion_generate(ours, prompt_ids, args.gen_length, args.steps,
@@ -178,7 +199,11 @@ def main():
         print()
 
     print(sep)
-    print(f"SUMMARY  avg_cosine={total_cos/n_prompts:.4f}  top1_match={top1_match}/{n_prompts}")
+    overall_cos   = sum(all_cos) / len(all_cos)
+    overall_top1  = sum(all_matches) / len(all_matches)
+    print(f"OVERALL  positions={len(all_cos)}")
+    print(f"         avg_cosine={overall_cos:.4f}")
+    print(f"         top1_match={sum(all_matches)}/{len(all_matches)} ({overall_top1*100:.1f}%)")
 
 
 if __name__ == "__main__":
