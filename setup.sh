@@ -1,3 +1,35 @@
+#!/usr/bin/env bash
+# One-shot setup for LLaDA-MoE-7B-A1B-Instruct inference engine.
+# Creates a dedicated venv at $SCRIPT_DIR/.venv
+# Requires transformers==4.53.2 (5.x removed ROPE_INIT_FUNCTIONS['default'])
+#
+# Usage:
+#   bash setup.sh                        # install deps + download weights
+#   bash setup.sh --skip-weights         # install deps only
+#   bash setup.sh --weight-dir /path     # custom weight dir (default: ./weights)
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WEIGHT_DIR="$SCRIPT_DIR/weights"
+SKIP_WEIGHTS=0
+VENV="${VENV:-$SCRIPT_DIR/.venv}"
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --skip-weights) SKIP_WEIGHTS=1; shift ;;
+        --weight-dir)   WEIGHT_DIR="$2"; shift 2 ;;
+        *) echo "Unknown arg: $1"; exit 1 ;;
+    esac
+done
+
+echo "================================================================"
+echo " LLaDA-MoE-7B-A1B-Instruct Inference Engine — Setup"
+echo "================================================================"
+echo "  Script dir : $SCRIPT_DIR"
+echo "  Weight dir : $WEIGHT_DIR"
+echo "  Venv       : $VENV"
+echo ""
+
 # ── 1. Python venv + deps ─────────────────────────────────────────────────────
 echo "[1/3] Setting up Python venv and dependencies..."
 
@@ -61,3 +93,31 @@ echo "  Installing project dependencies..."
 "$PIP" install -r "$SCRIPT_DIR/requirements.txt"
 
 echo "  Done."
+echo ""
+
+# ── 2. Verify CUDA ────────────────────────────────────────────────────────────
+echo "[2/3] Verifying CUDA..."
+"$PY" -c "
+import torch
+assert torch.cuda.is_available(), 'CUDA not available!'
+n = torch.cuda.device_count()
+print(f'  {n} GPU(s) available:')
+for i in range(n):
+    p = torch.cuda.get_device_properties(i)
+    print(f'    [{i}] {p.name}  {p.total_memory//1024**3} GB')
+"
+echo ""
+
+# ── 3. Download weights ───────────────────────────────────────────────────────
+if [[ "$SKIP_WEIGHTS" -eq 1 ]]; then
+    echo "[3/3] Skipping weight download (--skip-weights)"
+else
+    echo "[3/3] Downloading inclusionAI/LLaDA-MoE-7B-A1B-Instruct weights (~15 GB)..."
+    echo "  Destination: $WEIGHT_DIR"
+    "$PY" "$SCRIPT_DIR/download_weights.py" --dest "$WEIGHT_DIR"
+fi
+
+echo ""
+echo "================================================================"
+echo " Setup complete."
+echo "================================================================"
