@@ -183,7 +183,7 @@ def main():
     tok = AutoTokenizer.from_pretrained(args.weight_dir, trust_remote_code=True)
     print("Done.\n")
 
-    # 1. Benchmark Loading Time
+    # 1. Load and Benchmark Custom Model
     print("Benchmarking model loading time...")
     print("  Loading our custom model implementation...")
     ours, ours_load_time = load_ours(args.weight_dir, args.device)
@@ -195,6 +195,46 @@ def main():
         ours_peak_mem = torch.cuda.max_memory_allocated(device=args.device) / (1024 ** 3)
         torch.cuda.reset_peak_memory_stats(device=args.device)
 
+    # 2. Benchmark Single Forward Pass Latency for Ours
+    seq_lengths = [128, 256, 512, 1024]
+    forward_results = {seq_len: {} for seq_len in seq_lengths}
+    
+    print("Benchmarking single forward pass latency for custom model...")
+    for seq_len in seq_lengths:
+        print(f"  Running sequence length {seq_len}...")
+        ours_lats = benchmark_forward(ours, args.device, seq_len, args.num_warmup, args.num_runs, is_hf=False)
+        ours_mean, ours_med, ours_p95 = get_stats(ours_lats)
+        forward_results[seq_len]["ours"] = (ours_mean * 1000, ours_med * 1000, ours_p95 * 1000)
+    print("Done.\n")
+
+    # 3. Benchmark Iterative Generation Latency for Ours
+    test_prompt = "The chemical symbol for gold is Au and for silver is"
+    prompt_ids = tok(test_prompt, return_tensors="pt")["input_ids"].to(args.device)
+    
+    print("Benchmarking full generation (diffusion decode) for custom model...")
+    print(f"  Prompt: {repr(test_prompt)}")
+    print(f"  Config: Gen Length={args.gen_length}, Steps={args.steps}, Block Length={args.block_length}")
+    
+    ours_gen_lats = benchmark_generation(
+        ours, args.device, prompt_ids, args.gen_length, args.steps, 
+        args.block_length, args.num_warmup, args.num_runs, is_hf=False
+    )
+    ours_gen_mean, ours_gen_med, ours_gen_p95 = get_stats(ours_gen_lats)
+    ours_tok_per_sec = args.gen_length / ours_gen_mean
+    ours_ms_per_step = (ours_gen_mean * 1000) / args.steps
+    print("Done.\n")
+
+    # UNLOAD OURS TO FREE MEMORY
+    print("Unloading custom model to free memory for Hugging Face model...")
+    del ours
+    import gc
+    gc.collect()
+    if "cuda" in args.device:
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device=args.device)
+    print("Done.\n")
+
+    # 4. Load and Benchmark HF Model
     print("  Loading Hugging Face model implementation...")
     hf, hf_load_time = load_hf(args.weight_dir, args.device)
     print(f"  HF loaded in {hf_load_time:.2f} seconds.")
@@ -204,50 +244,16 @@ def main():
     if "cuda" in args.device:
         hf_peak_mem = torch.cuda.max_memory_allocated(device=args.device) / (1024 ** 3)
         torch.cuda.reset_peak_memory_stats(device=args.device)
-    print("Done.\n")
 
-    # 2. Benchmark Single Forward Pass Latency at different sequence lengths
-    seq_lengths = [128, 256, 512, 1024]
-    forward_results = {}
-    
-    print("Benchmarking single forward pass latency...")
+    print("Benchmarking single forward pass latency for HF model...")
     for seq_len in seq_lengths:
         print(f"  Running sequence length {seq_len}...")
-        
-        # Ours
-        ours_lats = benchmark_forward(ours, args.device, seq_len, args.num_warmup, args.num_runs, is_hf=False)
-        ours_mean, ours_med, ours_p95 = get_stats(ours_lats)
-        
-        # HF
         hf_lats = benchmark_forward(hf, args.device, seq_len, args.num_warmup, args.num_runs, is_hf=True)
         hf_mean, hf_med, hf_p95 = get_stats(hf_lats)
-        
-        forward_results[seq_len] = {
-            "ours": (ours_mean * 1000, ours_med * 1000, ours_p95 * 1000), # to ms
-            "hf": (hf_mean * 1000, hf_med * 1000, hf_p95 * 1000)
-        }
+        forward_results[seq_len]["hf"] = (hf_mean * 1000, hf_med * 1000, hf_p95 * 1000)
     print("Done.\n")
 
-    # 3. Benchmark Iterative Generation Latency & Throughput
-    test_prompt = "The chemical symbol for gold is Au and for silver is"
-    prompt_ids = tok(test_prompt, return_tensors="pt")["input_ids"].to(args.device)
-    
-    print("Benchmarking full generation (diffusion decode)...")
-    print(f"  Prompt: {repr(test_prompt)}")
-    print(f"  Config: Gen Length={args.gen_length}, Steps={args.steps}, Block Length={args.block_length}")
-    
-    # Ours
-    print("  Measuring our model generation speed...")
-    ours_gen_lats = benchmark_generation(
-        ours, args.device, prompt_ids, args.gen_length, args.steps, 
-        args.block_length, args.num_warmup, args.num_runs, is_hf=False
-    )
-    ours_gen_mean, ours_gen_med, ours_gen_p95 = get_stats(ours_gen_lats)
-    ours_tok_per_sec = args.gen_length / ours_gen_mean
-    ours_ms_per_step = (ours_gen_mean * 1000) / args.steps
-    
-    # HF
-    print("  Measuring Hugging Face model generation speed...")
+    print("Benchmarking full generation (diffusion decode) for HF model...")
     hf_gen_lats = benchmark_generation(
         hf, args.device, prompt_ids, args.gen_length, args.steps, 
         args.block_length, args.num_warmup, args.num_runs, is_hf=True
