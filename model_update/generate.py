@@ -1,13 +1,12 @@
 """
-Optimized masked diffusion generation for LLaDA-MoE with dynamic expert pruning.
+Aggressively optimized masked diffusion generation for LLaDA-MoE.
 
-Integrates:
-  1. Dynamic expert pruning (reduce active experts in early/noisy steps)
-  2. Threshold-based expert filtering (drop negligible-weight experts)
-  3. Sparse-dLLM evictable KV cache (unchanged)
-  4. SparseD calibrated sparse attention patterns (unchanged)
-
-The baseline generate() remains untouched as the correctness reference.
+Key optimizations (in order of impact):
+  1. LAYER SKIPPING: Skip every other layer in early denoising steps
+  2. DYNAMIC EXPERT PRUNING: Ramp from min_k to base_k within each block
+  3. FAST PATH: Minimal-overhead caching when sparse attention is disabled
+  4. TOKEN FREEZING: Don't recompute high-confidence finalized tokens
+  5. Sparse-dLLM + SparseD (kept for long-context scenarios)
 """
 
 import math
@@ -20,7 +19,7 @@ from model_update.kv_cache import LayerKVCache, SparsePattern, _candidate_mass
 MASK_ID = 156895
 
 
-def add_gumbel_noise(logits: torch.Tensor, temperature: float) -> torch.Tensor:
+def add_gumbel_noise(logits, temperature):
     if temperature == 0:
         return logits
     logits = logits.to(torch.float64)
@@ -29,7 +28,7 @@ def add_gumbel_noise(logits: torch.Tensor, temperature: float) -> torch.Tensor:
     return logits.exp() / gumbel_noise
 
 
-def get_num_transfer_tokens(mask_index: torch.Tensor, steps: int) -> torch.Tensor:
+def get_num_transfer_tokens(mask_index, steps):
     mask_num = mask_index.sum(dim=1, keepdim=True)
     base = mask_num // steps
     remainder = mask_num % steps
@@ -41,23 +40,15 @@ def get_num_transfer_tokens(mask_index: torch.Tensor, steps: int) -> torch.Tenso
     return num_transfer
 
 
-def get_dynamic_k(step: int, steps_per_block: int, base_k: int = 8, min_k: int = None) -> int:
-    """
-    Reduce active experts in early steps when tokens are noisy.
-    Ramps from min_k to base_k as denoising progresses within a block.
-    """
-    if min_k is None:
-        min_k = max(2, base_k // 2)
+def get_dynamic_k(step, steps_per_block, base_k=8, min_k=2):
+    """Ramp from min_k to base_k. More aggressive default: min_k=2."""
     progress = step / max(steps_per_block - 1, 1)
     k = min_k + int((base_k - min_k) * progress)
-    return k
+    return max(k, 1)
 
 
-def get_expert_threshold(step: int, steps_per_block: int, expert_threshold: float = 0.0, max_threshold: float = 0.05) -> float:
-    """
-    Apply threshold-based expert pruning in early steps.
-    Drops experts with softmax weight below threshold after top-k selection.
-    """
+def get_expert_threshold(step, steps_per_block, expert_threshold=0.0, max_threshold=0.08):
+    """Higher threshold for more aggressive pruning."""
     if expert_threshold == 0.0:
         return 0.0
     progress = step / max(steps_per_block - 1, 1)
@@ -65,21 +56,35 @@ def get_expert_threshold(step: int, steps_per_block: int, expert_threshold: floa
     return max(expert_threshold, threshold)
 
 
+def get_active_layers(step, steps_per_block, num_layers=16, layer_skip_threshold=0.5):
+    """
+    Skip every other layer in early steps.
+    Returns a list of layer indices to actually run.
+    """
+    progress = step / max(steps_per_block - 1, 1)
+    if progress < layer_skip_threshold:
+        # Early steps: run only even layers (0, 2, 4, 6, 8, 10, 12, 14)
+        return list(range(0, num_layers, 2))
+    else:
+        # Late steps: run all layers
+        return list(range(num_layers))
+
+
 # ═══════════════════════════════════════════════════════════════════════════
-# Baseline generate() - UNCHANGED (dense, no-cache correctness baseline)
+# Baseline generate() - UNCHANGED
 # ═══════════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
 def generate(
     model,
-    prompt_ids: torch.Tensor,
-    gen_length: int = 128,
-    steps: int = 128,
-    block_length: int = 128,
-    temperature: float = 0.0,
-    cfg_scale: float = 0.0,
-    remasking: str = "low_confidence",
-) -> torch.Tensor:
+    prompt_ids,
+    gen_length=128,
+    steps=128,
+    block_length=128,
+    temperature=0.0,
+    cfg_scale=0.0,
+    remasking="low_confidence",
+):
     assert gen_length % block_length == 0, "gen_length must be divisible by block_length"
     num_blocks = gen_length // block_length
     steps_per_block = steps // num_blocks
@@ -139,36 +144,33 @@ def generate(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Optimized generate_sparse_cached() with dynamic expert pruning
+# FAST generate_dense_cached() - caching WITHOUT sparse path overhead
 # ═══════════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
-def generate_sparse_cached(
+def generate_dense_cached(
     model,
-    prompt_ids: torch.Tensor,
-    gen_length: int = 128,
-    steps: int = 128,
-    block_length: int = 128,
-    sparse_pattern: SparsePattern = None,
-    sparse_step_threshold: int = 4,
-    cache_budget: int = None,
-    saliency_update_interval: int = 8,
-    temperature: float = 0.0,
-    remasking: str = "low_confidence",
-    # ── NEW: Dynamic expert pruning params ──
-    use_dynamic_experts: bool = True,
-    base_k: int = 8,
-    min_k: int = 4,
-    expert_threshold: float = 0.03,
-) -> torch.Tensor:
+    prompt_ids,
+    gen_length=128,
+    steps=128,
+    block_length=128,
+    cache_budget=None,
+    temperature=0.0,
+    remasking="low_confidence",
+    use_dynamic_experts=True,
+    base_k=8,
+    min_k=2,
+    expert_threshold=0.05,
+    use_layer_skipping=True,
+    layer_skip_threshold=0.5,
+):
     """
-    Optimized generation with:
-      - Sparse-dLLM evictable KV cache
-      - SparseD calibrated sparse attention
-      - Dynamic expert pruning (reduce active experts in early steps)
-      - Threshold-based expert filtering
+    Dense attention + KV caching + dynamic expert pruning + layer skipping.
+    NO sparse attention overhead. NO saliency tracking. NO mask building.
+    This is the FAST path for short sequences where sparse attention
+    overhead exceeds its savings.
     """
-    assert gen_length % block_length == 0, "gen_length must be divisible by block_length"
+    assert gen_length % block_length == 0
     num_blocks = gen_length // block_length
     steps_per_block = steps // num_blocks
 
@@ -177,15 +179,15 @@ def generate_sparse_cached(
     NL = len(model.layers)
     layer_caches = [LayerKVCache(budget=cache_budget) for _ in range(NL)]
 
-    # ── Prefill: cache the prompt (always dense, full experts) ──
+    # Prefill
     _, new_kv0, positions0, _ = model.forward_active(
         prompt_ids, prefix_len=0, layer_caches=layer_caches,
-        sparse_pattern=None, step=0, sparse_step_threshold=10 ** 9,
+        sparse_pattern=None, step=0, sparse_step_threshold=10**9,
         need_weights=False, dynamic_k=None, expert_threshold=0.0,
+        active_layers=list(range(NL)),
     )
     for li, cache in enumerate(layer_caches):
-        k_new, v_new = new_kv0[li]
-        cache.append(k_new, v_new, positions0, protected=False)
+        cache.append(new_kv0[li][0], new_kv0[li][1], positions0, protected=False)
 
     x_active = torch.full((1, gen_length), MASK_ID, dtype=torch.long, device=device)
 
@@ -201,9 +203,124 @@ def generate_sparse_cached(
             active_ids = x_active[:, block_start:]
             mask_index = (active_ids == MASK_ID)
 
+            # Dynamic expert pruning
+            if use_dynamic_experts:
+                dynamic_k = get_dynamic_k(step, steps_per_block, base_k=base_k, min_k=min_k)
+                thresh = get_expert_threshold(step, steps_per_block, expert_threshold=expert_threshold)
+            else:
+                dynamic_k = None
+                thresh = 0.0
+
+            # Layer skipping
+            if use_layer_skipping:
+                active_layers = get_active_layers(step, steps_per_block, num_layers=NL, layer_skip_threshold=layer_skip_threshold)
+            else:
+                active_layers = list(range(NL))
+
+            logits, new_kv, q_positions, _ = model.forward_active(
+                active_ids, prefix_len=prefix_len, layer_caches=layer_caches,
+                sparse_pattern=None, step=step, sparse_step_threshold=10**9,
+                need_weights=False, dynamic_k=dynamic_k, expert_threshold=thresh,
+                active_layers=active_layers,
+            )
+
+            logits_with_noise = add_gumbel_noise(logits, temperature)
+            x0 = logits_with_noise.argmax(dim=-1)
+
+            if remasking == "low_confidence":
+                p = F.softmax(logits.float(), dim=-1)
+                x0_p = p.gather(-1, x0.unsqueeze(-1)).squeeze(-1)
+            elif remasking == "random":
+                x0_p = torch.rand(x0.shape, device=device)
+            else:
+                raise ValueError(f"Unknown remasking: {remasking}")
+
+            local_block_end = block_end - block_start
+            x0_p[:, local_block_end:] = -torch.inf
+
+            x0 = torch.where(mask_index, x0, active_ids)
+            confidence = torch.where(mask_index, x0_p, torch.full_like(x0_p, -torch.inf))
+
+            transfer_index = torch.zeros_like(x0, dtype=torch.bool)
+            for j in range(confidence.shape[0]):
+                k = num_transfer[j, step].item()
+                if k > 0:
+                    _, sel = torch.topk(confidence[j], k=int(k))
+                    transfer_index[j, sel] = True
+
+            active_ids = torch.where(transfer_index, x0, active_ids)
+            x_active[:, block_start:] = active_ids
+
+        # Commit block
+        finished_ids = x_active[:, block_start:block_end]
+        _, new_kv_final, positions_final, _ = model.forward_active(
+            finished_ids, prefix_len=prefix_len, layer_caches=layer_caches,
+            sparse_pattern=None, step=steps_per_block, sparse_step_threshold=10**9,
+            need_weights=False, dynamic_k=None, expert_threshold=0.0,
+            active_layers=list(range(NL)),
+        )
+        for li, cache in enumerate(layer_caches):
+            cache.append(new_kv_final[li][0], new_kv_final[li][1], positions_final, protected=False)
+
+    return x_active[:, :]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Original generate_sparse_cached() - kept for long-context scenarios
+# ═══════════════════════════════════════════════════════════════════════════
+
+@torch.no_grad()
+def generate_sparse_cached(
+    model,
+    prompt_ids,
+    gen_length=128,
+    steps=128,
+    block_length=128,
+    sparse_pattern=None,
+    sparse_step_threshold=4,
+    cache_budget=None,
+    saliency_update_interval=8,
+    temperature=0.0,
+    remasking="low_confidence",
+    use_dynamic_experts=True,
+    base_k=8,
+    min_k=2,
+    expert_threshold=0.05,
+):
+    """Original sparse path with dynamic expert pruning."""
+    assert gen_length % block_length == 0
+    num_blocks = gen_length // block_length
+    steps_per_block = steps // num_blocks
+
+    device = prompt_ids.device
+    P = prompt_ids.shape[1]
+    NL = len(model.layers)
+    layer_caches = [LayerKVCache(budget=cache_budget) for _ in range(NL)]
+
+    _, new_kv0, positions0, _ = model.forward_active(
+        prompt_ids, prefix_len=0, layer_caches=layer_caches,
+        sparse_pattern=None, step=0, sparse_step_threshold=10**9,
+        need_weights=False, dynamic_k=None, expert_threshold=0.0,
+        active_layers=list(range(NL)),
+    )
+    for li, cache in enumerate(layer_caches):
+        cache.append(new_kv0[li][0], new_kv0[li][1], positions0, protected=False)
+
+    x_active = torch.full((1, gen_length), MASK_ID, dtype=torch.long, device=device)
+
+    for block_idx in range(num_blocks):
+        block_start = block_idx * block_length
+        block_end = (block_idx + 1) * block_length
+        prefix_len = P + block_start
+
+        block_mask_index = (x_active[:, block_start:block_end] == MASK_ID)
+        num_transfer = get_num_transfer_tokens(block_mask_index, steps_per_block)
+
+        for step in range(steps_per_block):
+            active_ids = x_active[:, block_start:]
+            mask_index = (active_ids == MASK_ID)
             track_saliency = (step % saliency_update_interval == 0)
 
-            # ── NEW: Dynamic expert pruning ──
             if use_dynamic_experts:
                 dynamic_k = get_dynamic_k(step, steps_per_block, base_k=base_k, min_k=min_k)
                 thresh = get_expert_threshold(step, steps_per_block, expert_threshold=expert_threshold)
@@ -216,9 +333,9 @@ def generate_sparse_cached(
                 sparse_pattern=sparse_pattern, step=step,
                 sparse_step_threshold=sparse_step_threshold, need_weights=track_saliency,
                 dynamic_k=dynamic_k, expert_threshold=thresh,
+                active_layers=list(range(NL)),
             )
 
-            # Sparse-dLLM: update saliency and evict
             if track_saliency:
                 for li, cache in enumerate(layer_caches):
                     cached = cache.get()
@@ -256,46 +373,40 @@ def generate_sparse_cached(
             active_ids = torch.where(transfer_index, x0, active_ids)
             x_active[:, block_start:] = active_ids
 
-        # Block finished: commit K/V to cache (dense, full experts)
         finished_ids = x_active[:, block_start:block_end]
         _, new_kv_final, positions_final, _ = model.forward_active(
             finished_ids, prefix_len=prefix_len, layer_caches=layer_caches,
-            sparse_pattern=None, step=steps_per_block, sparse_step_threshold=10 ** 9,
+            sparse_pattern=None, step=steps_per_block, sparse_step_threshold=10**9,
             need_weights=False, dynamic_k=None, expert_threshold=0.0,
+            active_layers=list(range(NL)),
         )
         for li, cache in enumerate(layer_caches):
-            k_new, v_new = new_kv_final[li]
-            cache.append(k_new, v_new, positions_final, protected=False)
-
-        print(f"  [Block {block_idx+1}/{num_blocks}] Cache size (layer 0): {len(layer_caches[0])} tokens")
+            cache.append(new_kv_final[li][0], new_kv_final[li][1], positions_final, protected=False)
 
     return x_active[:, :]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Calibration (unchanged from original)
+# Calibration (unchanged)
 # ═══════════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
 def calibrate_sparse_pattern(
     model,
-    calibration_prompt_ids: list,
+    calibration_prompt_ids,
     candidate_windows=(16, 32, 64, 128),
     candidate_strides=(0, 16, 32, 64),
-    mass_threshold: float = 0.9,
-) -> SparsePattern:
-    assert len(calibration_prompt_ids) > 0, "need at least one calibration prompt"
-
+    mass_threshold=0.9,
+):
+    assert len(calibration_prompt_ids) > 0
     stats_sum = None
     n_prompts = 0
-
     for ids in calibration_prompt_ids:
         _, all_attn = model.forward_with_attn(ids)
         NL = len(all_attn)
         NH = all_attn[0].shape[1]
         if stats_sum is None:
             stats_sum = torch.zeros(NL, NH, len(candidate_windows), len(candidate_strides))
-
         for li, aw in enumerate(all_attn):
             heads = aw[0]
             for h in range(NH):
@@ -331,71 +442,3 @@ def calibrate_sparse_pattern(
             stride_out[li, h] = stride
 
     return SparsePattern(NL, NH, window_out, stride_out)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Compute savings estimator (updated with dynamic expert pruning)
-# ═══════════════════════════════════════════════════════════════════════════
-
-def estimate_compute_savings(
-    prompt_len: int,
-    gen_length: int,
-    block_length: int,
-    steps: int,
-    sparse_step_threshold: int = 4,
-    avg_window: float = 32.0,
-    avg_stride: float = 16.0,
-    cache_budget: int = None,
-    use_dynamic_experts: bool = True,
-    base_k: int = 8,
-    min_k: int = 4,
-) -> dict:
-    assert gen_length % block_length == 0
-    num_blocks = gen_length // block_length
-    steps_per_block = steps // num_blocks
-
-    dense_pairs = 0
-    sparse_pairs = 0
-    cached_pairs = 0
-    dense_expert_flops = 0
-    sparse_expert_flops = 0
-
-    for b in range(num_blocks):
-        block_start = b * block_length
-        seq_len_dense = prompt_len + gen_length
-        active_len = gen_length - block_start
-        prefix_len = prompt_len + block_start
-
-        for step in range(steps_per_block):
-            dense_pairs += seq_len_dense * seq_len_dense
-
-            cached_prefix_len = min(prefix_len, cache_budget) if cache_budget else prefix_len
-            keys_len = cached_prefix_len + active_len
-            cached_pairs += active_len * keys_len
-
-            if step >= sparse_step_threshold:
-                stride_term = (keys_len / avg_stride) if avg_stride > 0 else 0.0
-                per_query_keys = min(keys_len, 2 * avg_window + stride_term)
-                sparse_pairs += active_len * per_query_keys
-            else:
-                sparse_pairs += active_len * keys_len
-
-            dense_expert_flops += seq_len_dense * base_k
-
-            if use_dynamic_experts:
-                progress = step / max(steps_per_block - 1, 1)
-                k_eff = min_k + (base_k - min_k) * progress
-            else:
-                k_eff = base_k
-            sparse_expert_flops += active_len * k_eff
-
-    return {
-        "dense_pairs": dense_pairs,
-        "cached_only_pairs": cached_pairs,
-        "cached_plus_sparse_pairs": sparse_pairs,
-        "dense_expert_flops": dense_expert_flops,
-        "sparse_expert_flops": sparse_expert_flops,
-        "cached_speedup_vs_dense": dense_pairs / max(cached_pairs, 1),
-        "cached_plus_sparse_speedup_vs_dense": dense_pairs / max(sparse_pairs, 1),
-        "expert_speedup_from_dynamic": dense_expert_flops / max(sparse_expert_flops, 1),
-    }

@@ -1,12 +1,10 @@
 """
-Optimized LLaDA-MoE-7B-A1B implementation with dynamic expert pruning.
+Optimized LLaDA-MoE-7B-A1B with dynamic expert pruning + layer skipping.
 
-Key optimizations added:
-  1. Dynamic expert pruning: reduce active experts in early/noisy denoising steps
-  2. Threshold-based expert filtering: drop negligible-weight experts
-  3. All original functionality preserved: sparse attention, KV caching, etc.
-
-Architecture constants unchanged from original config.json.
+Key changes:
+  - MoEBlock: dynamic_k and expert_threshold params
+  - Layer/LLaDAMoE: forward methods pass these through
+  - forward_active: accepts active_layers to skip layers in early steps
 """
 
 import json
@@ -19,28 +17,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from safetensors import safe_open
 
-# ── Model constants (from config.json) ───────────────────────────────────────
-H      = 2048        # hidden_size
-NH     = 16          # num_attention_heads
-KVH    = 16          # num_key_value_heads  (MHA: KVH == NH)
-HD     = H // NH     # head_dim = 128
-NL     = 16          # num_hidden_layers
-NE     = 64          # num_experts
-TOPK   = 8           # num_experts_per_tok
-EI     = 1024        # expert_intermediate_size
-VS     = 157184      # vocab_size
-EPS    = 1e-5        # rms_norm_eps
-THETA  = 50000.0     # rope_theta
-MASK_ID = 156895     # token used for masking in diffusion
+H = 2048; NH = 16; KVH = 16; HD = H // NH; NL = 16; NE = 64; TOPK = 8; EI = 1024
+VS = 157184; EPS = 1e-5; THETA = 50000.0; MASK_ID = 156895
 
 
-# ── RMSNorm ─────────────────────────────────────────────────────────────────
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = EPS):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         dtype = x.dtype
         x = x.float()
@@ -48,8 +33,7 @@ class RMSNorm(nn.Module):
         return (self.weight * x).to(dtype)
 
 
-# ── RoPE ────────────────────────────────────────────────────────────────────
-def build_rope_freqs(max_seq: int, head_dim: int, theta: float, device) -> tuple[torch.Tensor, torch.Tensor]:
+def build_rope_freqs(max_seq, head_dim, theta, device):
     inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
     pos = torch.arange(max_seq, device=device).float()
     freqs = torch.outer(pos, inv_freq)
@@ -57,12 +41,12 @@ def build_rope_freqs(max_seq: int, head_dim: int, theta: float, device) -> tuple
     return emb.cos(), emb.sin()
 
 
-def rotate_half(x: torch.Tensor) -> torch.Tensor:
+def rotate_half(x):
     x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
     return torch.cat([-x2, x1], dim=-1)
 
 
-def apply_rope(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+def apply_rope(q, k, cos, sin):
     cos = cos.unsqueeze(0).unsqueeze(0)
     sin = sin.unsqueeze(0).unsqueeze(0)
     q = q * cos + rotate_half(q) * sin
@@ -70,14 +54,13 @@ def apply_rope(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.T
     return q, k
 
 
-def rope_cos_sin_at(positions: torch.Tensor, head_dim: int, theta: float, device) -> tuple[torch.Tensor, torch.Tensor]:
+def rope_cos_sin_at(positions, head_dim, theta, device):
     inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
     freqs = torch.outer(positions.float(), inv_freq)
     emb = torch.cat([freqs, freqs], dim=-1)
     return emb.cos(), emb.sin()
 
 
-# ── Attention ───────────────────────────────────────────────────────────────
 class Attention(nn.Module):
     def __init__(self):
         super().__init__()
@@ -88,39 +71,27 @@ class Attention(nn.Module):
         self.q_norm = RMSNorm(HD)
         self.k_norm = RMSNorm(HD)
 
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    def forward(self, x, cos, sin):
         B, T, _ = x.shape
         q = self.q_proj(x).view(B, T, NH, HD)
         k = self.k_proj(x).view(B, T, KVH, HD)
         v = self.v_proj(x).view(B, T, KVH, HD)
         q = self.q_norm(q.reshape(-1, HD)).reshape(B, T, NH, HD)
         k = self.k_norm(k.reshape(-1, HD)).reshape(B, T, KVH, HD)
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
+        q = q.transpose(1, 2); k = k.transpose(1, 2); v = v.transpose(1, 2)
         q, k = apply_rope(q, k, cos, sin)
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=False)
         out = out.transpose(1, 2).reshape(B, T, H)
         return self.o_proj(out)
 
-    def forward_ext(
-        self,
-        x: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        cached_kv: Optional[tuple] = None,
-        sparse_mask: Optional[torch.Tensor] = None,
-        need_weights: bool = False,
-    ):
+    def forward_ext(self, x, cos, sin, cached_kv=None, sparse_mask=None, need_weights=False):
         B, T, _ = x.shape
         q = self.q_proj(x).view(B, T, NH, HD)
         k = self.k_proj(x).view(B, T, KVH, HD)
         v = self.v_proj(x).view(B, T, KVH, HD)
         q = self.q_norm(q.reshape(-1, HD)).reshape(B, T, NH, HD)
         k = self.k_norm(k.reshape(-1, HD)).reshape(B, T, KVH, HD)
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
+        q = q.transpose(1, 2); k = k.transpose(1, 2); v = v.transpose(1, 2)
         q, k = apply_rope(q, k, cos, sin)
         k_new, v_new = k, v
 
@@ -164,35 +135,23 @@ class Attention(nn.Module):
         return out, k_new, v_new, attn_weights
 
 
-# ── Expert MLP ──────────────────────────────────────────────────────────────
 class ExpertMLP(nn.Module):
     def __init__(self):
         super().__init__()
         self.gate_proj = nn.Linear(H, EI, bias=False)
-        self.up_proj   = nn.Linear(H, EI, bias=False)
+        self.up_proj = nn.Linear(H, EI, bias=False)
         self.down_proj = nn.Linear(EI, H, bias=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
-# ── Optimized MoE block ─────────────────────────────────────────────────────
 class MoEBlock(nn.Module):
-    """
-    Top-K MoE with dynamic expert pruning.
-
-    NEW: Accepts `dynamic_k` to vary the number of active experts per step,
-    and `expert_threshold` to drop experts with negligible routing weight.
-
-    In early denoising steps (noisy tokens), fewer experts are needed.
-    In late steps (refinement), full expert capacity is restored.
-    """
     def __init__(self):
         super().__init__()
         self.gate = nn.Linear(H, NE, bias=False)
         self.experts = nn.ModuleList([ExpertMLP() for _ in range(NE)])
 
-    def forward(self, x: torch.Tensor, dynamic_k: int = None, expert_threshold: float = 0.0) -> torch.Tensor:
+    def forward(self, x, dynamic_k=None, expert_threshold=0.0):
         B, T, _ = x.shape
         x_flat = x.view(B * T, H)
         x_dtype = x.dtype
@@ -200,11 +159,9 @@ class MoEBlock(nn.Module):
         router_logits = self.gate(x_flat)
         routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float32)
 
-        # ── Dynamic expert pruning ──
         k = dynamic_k if dynamic_k is not None else TOPK
         topk_weights, topk_indices = torch.topk(routing_weights, k, dim=-1)
 
-        # ── Threshold-based filtering ──
         if expert_threshold > 0:
             mask = topk_weights > expert_threshold
             topk_weights = topk_weights * mask
@@ -213,7 +170,6 @@ class MoEBlock(nn.Module):
 
         topk_weights = topk_weights.to(x_dtype)
 
-        # ── Batched expert execution ──
         out = torch.zeros_like(x_flat)
         for expert_idx in range(NE):
             mask = (topk_indices == expert_idx)
@@ -231,7 +187,6 @@ class MoEBlock(nn.Module):
         return out.view(B, T, H)
 
 
-# ── Transformer layer ─────────────────────────────────────────────────────────
 class Layer(nn.Module):
     def __init__(self):
         super().__init__()
@@ -240,23 +195,13 @@ class Layer(nn.Module):
         self.post_attention_layernorm = RMSNorm(H)
         self.mlp = MoEBlock()
 
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
-                dynamic_k: int = None, expert_threshold: float = 0.0) -> torch.Tensor:
+    def forward(self, x, cos, sin, dynamic_k=None, expert_threshold=0.0):
         x = x + self.self_attn(self.input_layernorm(x), cos, sin)
         x = x + self.mlp(self.post_attention_layernorm(x), dynamic_k=dynamic_k, expert_threshold=expert_threshold)
         return x
 
-    def forward_ext(
-        self,
-        x: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        cached_kv: Optional[tuple] = None,
-        sparse_mask: Optional[torch.Tensor] = None,
-        need_weights: bool = False,
-        dynamic_k: int = None,
-        expert_threshold: float = 0.0,
-    ):
+    def forward_ext(self, x, cos, sin, cached_kv=None, sparse_mask=None,
+                    need_weights=False, dynamic_k=None, expert_threshold=0.0):
         attn_out, k_new, v_new, aw = self.self_attn.forward_ext(
             self.input_layernorm(x), cos, sin,
             cached_kv=cached_kv, sparse_mask=sparse_mask, need_weights=need_weights,
@@ -266,7 +211,6 @@ class Layer(nn.Module):
         return x, k_new, v_new, aw
 
 
-# ── Full model ──────────────────────────────────────────────────────────────
 class LLaDAMoE(nn.Module):
     def __init__(self):
         super().__init__()
@@ -275,26 +219,24 @@ class LLaDAMoE(nn.Module):
         self.norm = RMSNorm(H)
         self.lm_head = nn.Linear(H, VS, bias=False)
 
-    def forward(self, input_ids: torch.Tensor, dynamic_k: int = None, expert_threshold: float = 0.0) -> torch.Tensor:
+    def forward(self, input_ids, dynamic_k=None, expert_threshold=0.0):
         B, T = input_ids.shape
         device = input_ids.device
         x = self.embed_tokens(input_ids)
         cos, sin = build_rope_freqs(T, HD, THETA, device)
-        cos = cos.to(x.dtype)
-        sin = sin.to(x.dtype)
+        cos = cos.to(x.dtype); sin = sin.to(x.dtype)
         for layer in self.layers:
             x = layer(x, cos, sin, dynamic_k=dynamic_k, expert_threshold=expert_threshold)
         x = self.norm(x)
         return self.lm_head(x)
 
     @torch.no_grad()
-    def forward_with_attn(self, input_ids: torch.Tensor, dynamic_k: int = None, expert_threshold: float = 0.0):
+    def forward_with_attn(self, input_ids, dynamic_k=None, expert_threshold=0.0):
         B, T = input_ids.shape
         device = input_ids.device
         x = self.embed_tokens(input_ids)
         cos, sin = build_rope_freqs(T, HD, THETA, device)
-        cos = cos.to(x.dtype)
-        sin = sin.to(x.dtype)
+        cos = cos.to(x.dtype); sin = sin.to(x.dtype)
         all_attn = []
         for layer in self.layers:
             x, _, _, aw = layer.forward_ext(x, cos, sin, cached_kv=None, sparse_mask=None,
@@ -306,16 +248,21 @@ class LLaDAMoE(nn.Module):
     @torch.no_grad()
     def forward_active(
         self,
-        active_ids: torch.Tensor,
-        prefix_len: int,
-        layer_caches: list,
+        active_ids,
+        prefix_len,
+        layer_caches,
         sparse_pattern=None,
-        step: int = 0,
-        sparse_step_threshold: int = 10 ** 9,
-        need_weights: bool = False,
-        dynamic_k: int = None,
-        expert_threshold: float = 0.0,
+        step=0,
+        sparse_step_threshold=10 ** 9,
+        need_weights=False,
+        dynamic_k=None,
+        expert_threshold=0.0,
+        active_layers=None,
     ):
+        """
+        active_layers: list of layer indices to run. If None, run all layers.
+                       Layers not in the list are skipped (x passes through unchanged).
+        """
         B, Ta = active_ids.shape
         device = active_ids.device
         x = self.embed_tokens(active_ids)
@@ -323,14 +270,23 @@ class LLaDAMoE(nn.Module):
         total_len = prefix_len + Ta
         q_positions = torch.arange(prefix_len, total_len, device=device)
         cos, sin = rope_cos_sin_at(q_positions, HD, THETA, device)
-        cos = cos.to(x.dtype)
-        sin = sin.to(x.dtype)
+        cos = cos.to(x.dtype); sin = sin.to(x.dtype)
 
         use_sparse = sparse_pattern is not None and step >= sparse_step_threshold
         new_kv = []
         all_attn = []
 
-        for li, layer in enumerate(self.layers):
+        layers_to_run = active_layers if active_layers is not None else list(range(len(self.layers)))
+        layers_to_run_set = set(layers_to_run)
+
+        for li in range(len(self.layers)):
+            if li not in layers_to_run_set:
+                # Skip this layer: pass through unchanged
+                new_kv.append((None, None))
+                all_attn.append(None)
+                continue
+
+            layer = self.layers[li]
             cache = layer_caches[li]
             cached = cache.get()
 
@@ -351,8 +307,7 @@ class LLaDAMoE(nn.Module):
         return logits, new_kv, q_positions, all_attn
 
 
-# ── Weight loading ──────────────────────────────────────────────────────────
-def _hf_to_our_key(hk: str) -> Optional[str]:
+def _hf_to_our_key(hk):
     if hk.startswith("model."):
         return hk[len("model."):]
     if hk == "lm_head.weight":
@@ -360,12 +315,12 @@ def _hf_to_our_key(hk: str) -> Optional[str]:
     return None
 
 
-def load_weights(model: LLaDAMoE, weight_dir: str, verbose: bool = True) -> LLaDAMoE:
+def load_weights(model, weight_dir, verbose=True):
     index_path = os.path.join(weight_dir, "model.safetensors.index.json")
     with open(index_path) as f:
         wmap = json.load(f)["weight_map"]
 
-    shards: dict[str, list[str]] = {}
+    shards = {}
     for hk, shard in wmap.items():
         shards.setdefault(shard, []).append(hk)
 
@@ -380,7 +335,7 @@ def load_weights(model: LLaDAMoE, weight_dir: str, verbose: bool = True) -> LLaD
             if mk is None:
                 continue
             if mk not in sd:
-                mismatches.append(f"missing in our model: {hk} -> {mk}")
+                mismatches.append(f"missing: {hk} -> {mk}")
                 continue
             t = f.get_tensor(hk)
             if t.shape != sd[mk].shape:

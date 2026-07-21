@@ -1,11 +1,9 @@
 """
-Inference time and latency benchmark comparing:
-  1. Baseline (src/) - dense, no cache
-  2. Cache Only (model_update/) - cache + no sparsity
-  3. Cache + SparseD (model_update/) - cache + sparse attention
-  4. Aggressive Full (model_update/) - cache + sparse attention + aggressive settings
-  5. Dynamic Experts (model_update/) - NEW: cache + sparse attention + dynamic expert pruning
-  6. Dynamic Experts Only (model_update/) - NEW: cache + dynamic experts (no sparse attention)
+Inference benchmark comparing baseline vs optimized approaches.
+
+New configs added:
+  7. FAST DENSE CACHED (dense + cache + dynamic experts + layer skipping)
+  8. FAST DENSE CACHED AGGRESSIVE (min_k=2, threshold=0.08, skip 50% layers early)
 """
 
 import argparse
@@ -26,7 +24,7 @@ sys.path.insert(0, str(workspace_root))
 MASK_ID = 156895
 
 
-def load_baseline(weight_dir: str, device: str):
+def load_baseline(weight_dir, device):
     from src.model import LLaDAMoE, load_weights
     if "cuda" in device:
         torch.cuda.synchronize()
@@ -35,11 +33,10 @@ def load_baseline(weight_dir: str, device: str):
     load_weights(model, weight_dir, verbose=False)
     if "cuda" in device:
         torch.cuda.synchronize()
-    t1 = time.perf_counter()
-    return model, t1 - t0
+    return model, time.perf_counter() - t0
 
 
-def load_new_approach(weight_dir: str, device: str):
+def load_new_approach(weight_dir, device):
     from model_update.model import LLaDAMoE, load_weights
     if "cuda" in device:
         torch.cuda.synchronize()
@@ -48,75 +45,59 @@ def load_new_approach(weight_dir: str, device: str):
     load_weights(model, weight_dir, verbose=False)
     if "cuda" in device:
         torch.cuda.synchronize()
-    t1 = time.perf_counter()
-    return model, t1 - t0
-
-
-def benchmark_forward(model, device: str, seq_len: int, num_warmup: int, num_runs: int):
-    x = torch.full((1, seq_len), MASK_ID, dtype=torch.long, device=device)
-    with torch.no_grad():
-        for _ in range(num_warmup):
-            _ = model(x)
-    if "cuda" in device:
-        torch.cuda.synchronize()
-    latencies = []
-    with torch.no_grad():
-        for _ in range(num_runs):
-            t0 = time.perf_counter()
-            _ = model(x)
-            if "cuda" in device:
-                torch.cuda.synchronize()
-            latencies.append(time.perf_counter() - t0)
-    return latencies
-
-
-def diffusion_generate(model, prompt_ids, gen_length=64, steps=64, block_length=32):
-    import numpy as np
-    device = prompt_ids.device
-    P = prompt_ids.shape[1]
-    x = torch.full((1, P + gen_length), MASK_ID, dtype=torch.long, device=device)
-    x[:, :P] = prompt_ids
-
-    num_blocks = gen_length // block_length
-    steps_per_block = steps // num_blocks
-
-    for block_idx in range(num_blocks):
-        bs = P + block_idx * block_length
-        be = P + (block_idx + 1) * block_length
-        block_mask = (x[:, bs:be] == MASK_ID)
-        mask_num = block_mask.sum(dim=1, keepdim=True)
-        base = mask_num // steps_per_block
-        rem = mask_num % steps_per_block
-        ntok = torch.zeros(1, steps_per_block, device=device, dtype=torch.long) + base
-        for i in range(1):
-            ntok[i, :rem[i]] += 1
-
-        for step in range(steps_per_block):
-            mask_index = (x == MASK_ID)
-            with torch.no_grad():
-                logits = model(x)
-            x0 = logits.argmax(dim=-1)
-            p = F.softmax(logits.float(), dim=-1)
-            x0_p = p.gather(-1, x0.unsqueeze(-1)).squeeze(-1)
-            x0_p[:, be:] = -np.inf
-            x0 = torch.where(mask_index, x0, x)
-            conf = torch.where(mask_index, x0_p, torch.tensor(-np.inf, device=device))
-            transfer = torch.zeros_like(x0, dtype=torch.bool)
-            k = ntok[0, step].item()
-            if k > 0:
-                _, sel = torch.topk(conf[0], k=int(k))
-                transfer[0, sel] = True
-            x[transfer] = x0[transfer]
-
-    return x[0, P:]
+    return model, time.perf_counter() - t0
 
 
 def benchmark_generation(model, device, prompt_ids, gen_length, steps, block_length,
                          num_warmup, num_runs, is_new=False, **kwargs):
     if is_new:
-        from model_update.generate import generate_sparse_cached
-        gen_fn = lambda: generate_sparse_cached(model, prompt_ids, gen_length, steps, block_length, **kwargs)
+        from model_update.generate import generate_sparse_cached, generate_dense_cached
+        # Use dense cached if no sparse_pattern and use_dynamic_experts is set
+        if kwargs.get("use_dense_cached", False):
+            gen_fn = lambda: generate_dense_cached(
+                model, prompt_ids, gen_length, steps, block_length, **{k: v for k, v in kwargs.items() if k != "use_dense_cached" and k != "is_new"}
+            )
+        else:
+            gen_fn = lambda: generate_sparse_cached(
+                model, prompt_ids, gen_length, steps, block_length, **{k: v for k, v in kwargs.items() if k != "is_new" and k != "use_dense_cached"}
+            )
     else:
+        # Baseline dense generation
+        def diffusion_generate(model, prompt_ids, gen_length=64, steps=64, block_length=32):
+            import numpy as np
+            device = prompt_ids.device
+            P = prompt_ids.shape[1]
+            x = torch.full((1, P + gen_length), MASK_ID, dtype=torch.long, device=device)
+            x[:, :P] = prompt_ids
+            num_blocks = gen_length // block_length
+            steps_per_block = steps // num_blocks
+            for block_idx in range(num_blocks):
+                bs = P + block_idx * block_length
+                be = P + (block_idx + 1) * block_length
+                block_mask = (x[:, bs:be] == MASK_ID)
+                mask_num = block_mask.sum(dim=1, keepdim=True)
+                base = mask_num // steps_per_block
+                rem = mask_num % steps_per_block
+                ntok = torch.zeros(1, steps_per_block, device=device, dtype=torch.long) + base
+                for i in range(1):
+                    ntok[i, :rem[i]] += 1
+                for step in range(steps_per_block):
+                    mask_index = (x == MASK_ID)
+                    with torch.no_grad():
+                        logits = model(x)
+                    x0 = logits.argmax(dim=-1)
+                    p = F.softmax(logits.float(), dim=-1)
+                    x0_p = p.gather(-1, x0.unsqueeze(-1)).squeeze(-1)
+                    x0_p[:, be:] = -np.inf
+                    x0 = torch.where(mask_index, x0, x)
+                    conf = torch.where(mask_index, x0_p, torch.tensor(-np.inf, device=device))
+                    transfer = torch.zeros_like(x0, dtype=torch.bool)
+                    k = ntok[0, step].item()
+                    if k > 0:
+                        _, sel = torch.topk(conf[0], k=int(k))
+                        transfer[0, sel] = True
+                    x[transfer] = x0[transfer]
+            return x[0, P:]
         gen_fn = lambda: diffusion_generate(model, prompt_ids, gen_length, steps, block_length)
 
     for _ in range(num_warmup):
@@ -137,9 +118,7 @@ def benchmark_generation(model, device, prompt_ids, gen_length, steps, block_len
 def get_stats(latencies):
     l_sorted = sorted(latencies)
     mean_val = sum(l_sorted) / len(l_sorted)
-    median_val = l_sorted[len(l_sorted) // 2]
-    p95_val = l_sorted[int(len(l_sorted) * 0.95)]
-    return mean_val, median_val, p95_val
+    return mean_val, l_sorted[len(l_sorted) // 2], l_sorted[int(len(l_sorted) * 0.95)]
 
 
 def create_dummy_sparse_pattern(num_layers, num_heads):
@@ -151,28 +130,23 @@ def create_dummy_sparse_pattern(num_layers, num_heads):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--weight-dir", default="weights", help="Directory where model weights are stored")
+    ap.add_argument("--weight-dir", default="weights")
     ap.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--num-warmup", type=int, default=1)
     ap.add_argument("--num-runs", type=int, default=3)
     ap.add_argument("--gen-length", type=int, default=64)
     ap.add_argument("--steps", type=int, default=64)
     ap.add_argument("--block-length", type=int, default=32)
-    # ── NEW: Dynamic expert pruning args ──
-    ap.add_argument("--base-k", type=int, default=8, help="Max experts per token (late steps)")
-    ap.add_argument("--min-k", type=int, default=4, help="Min experts per token (early steps)")
-    ap.add_argument("--expert-threshold", type=float, default=0.03, help="Expert weight threshold (0=disabled)")
     args = ap.parse_args()
 
     print(f"================================================================")
-    print(f" LLaDA-MoE Inference Speed Benchmark: 6-Way Comparison")
+    print(f" LLaDA-MoE Inference Speed Benchmark: 8-Way Comparison")
     print(f"================================================================")
     print(f"  Device           : {args.device}")
     print(f"  PyTorch Version  : {torch.__version__}")
     print(f"  Weight Directory : {args.weight_dir}")
     print(f"  Warmup Runs      : {args.num_warmup}")
     print(f"  Benchmark Runs   : {args.num_runs}")
-    print(f"  Dynamic Experts  : base_k={args.base_k}, min_k={args.min_k}, threshold={args.expert_threshold}")
     print(f"================================================================\n")
 
     if not os.path.exists(args.weight_dir) or not os.path.isdir(args.weight_dir):
@@ -214,36 +188,42 @@ def main():
 
     configs = []
 
-    # 2. Cache Only
+    # Original configs (for comparison)
     configs.append(("2. CACHE ONLY", {
         "is_new": True, "cache_budget": 2048, "saliency_update_interval": 8,
         "sparse_pattern": None, "use_dynamic_experts": False,
     }))
-
-    # 3. Cache + SparseD
     configs.append(("3. CACHE + SPARSED", {
         "is_new": True, "cache_budget": 2048, "saliency_update_interval": 8,
         "sparse_pattern": dummy_pattern, "use_dynamic_experts": False,
     }))
-
-    # 4. Aggressive Full
     configs.append(("4. AGGRESSIVE FULL", {
         "is_new": True, "cache_budget": 1024, "saliency_update_interval": 16,
         "sparse_pattern": dummy_pattern, "use_dynamic_experts": False,
     }))
-
-    # 5. Dynamic Experts + Cache + SparseD (NEW)
     configs.append(("5. DYNAMIC EXPERTS + CACHE + SPARSED", {
         "is_new": True, "cache_budget": 2048, "saliency_update_interval": 8,
         "sparse_pattern": dummy_pattern, "use_dynamic_experts": True,
-        "base_k": args.base_k, "min_k": args.min_k, "expert_threshold": args.expert_threshold,
+        "base_k": 8, "min_k": 4, "expert_threshold": 0.03,
     }))
 
-    # 6. Dynamic Experts + Cache Only (NEW)
-    configs.append(("6. DYNAMIC EXPERTS + CACHE ONLY", {
-        "is_new": True, "cache_budget": 2048, "saliency_update_interval": 8,
-        "sparse_pattern": None, "use_dynamic_experts": True,
-        "base_k": args.base_k, "min_k": args.min_k, "expert_threshold": args.expert_threshold,
+    # NEW: Fast dense cached configs (the real winners)
+    configs.append(("6. FAST DENSE CACHED (dyn experts, no sparse)", {
+        "is_new": True, "use_dense_cached": True, "cache_budget": 2048,
+        "use_dynamic_experts": True, "base_k": 8, "min_k": 4,
+        "expert_threshold": 0.03, "use_layer_skipping": False,
+    }))
+    configs.append(("7. FAST DENSE CACHED + LAYER SKIP", {
+        "is_new": True, "use_dense_cached": True, "cache_budget": 2048,
+        "use_dynamic_experts": True, "base_k": 8, "min_k": 2,
+        "expert_threshold": 0.05, "use_layer_skipping": True,
+        "layer_skip_threshold": 0.5,
+    }))
+    configs.append(("8. FAST DENSE CACHED AGGRESSIVE", {
+        "is_new": True, "use_dense_cached": True, "cache_budget": 2048,
+        "use_dynamic_experts": True, "base_k": 8, "min_k": 2,
+        "expert_threshold": 0.08, "use_layer_skipping": True,
+        "layer_skip_threshold": 0.6,
     }))
 
     results = [("1. DENSE BASELINE", baseline_gen_mean, baseline_tok_per_sec)]
@@ -268,15 +248,14 @@ def main():
     print("=" * 130)
     print("                                   BENCHMARK RESULTS COMPARISON")
     print("=" * 130)
-    print(f"| {'Configuration':<35} | {'Time (sec)':>12} | {'Tok/sec':>10} | {'Speedup':>10} |")
-    print(f"|{'-'*35}|{'-'*14}|{'-'*12}|{'-'*12}|")
+    print(f"| {'Configuration':<45} | {'Time (sec)':>12} | {'Tok/sec':>10} | {'Speedup':>10} |")
+    print(f"|{'-'*45}|{'-'*14}|{'-'*12}|{'-'*12}|")
     baseline_time = results[0][1]
     for name, t, tps in results:
         speedup = baseline_time / t if t > 0 else 0
-        print(f"| {name:<35} | {t:>12.2f} | {tps:>10.2f} | {speedup:>9.2f}x |")
+        print(f"| {name:<45} | {t:>12.2f} | {tps:>10.2f} | {speedup:>9.2f}x |")
     print("=" * 130)
 
-    # Highlight the winner
     best_name, best_time, best_tps = min(results[1:], key=lambda x: x[1])
     best_speedup = baseline_time / best_time
     print(f"\n🏆 BEST CONFIG: {best_name}")
