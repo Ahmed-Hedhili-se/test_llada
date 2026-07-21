@@ -53,16 +53,16 @@ def get_dynamic_k(step: int, steps_per_block: int, base_k: int = 8, min_k: int =
     return k
 
 
-def get_expert_threshold(step: int, steps_per_block: int, base_threshold: float = 0.0, max_threshold: float = 0.05) -> float:
+def get_expert_threshold(step: int, steps_per_block: int, expert_threshold: float = 0.0, max_threshold: float = 0.05) -> float:
     """
     Apply threshold-based expert pruning in early steps.
     Drops experts with softmax weight below threshold after top-k selection.
     """
-    if base_threshold == 0.0:
+    if expert_threshold == 0.0:
         return 0.0
     progress = step / max(steps_per_block - 1, 1)
     threshold = max_threshold * (1.0 - progress)
-    return max(base_threshold, threshold)
+    return max(expert_threshold, threshold)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
