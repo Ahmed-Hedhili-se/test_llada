@@ -121,7 +121,6 @@ def chat_completions(req: ChatRequest):
     t0 = time.time()
     with torch.no_grad():
         if BACKEND == "ours":
-            from src.model import LLaDAMoE, load_weights
             from src.generate import generate
             out_ids = generate(
                 MODEL,
@@ -134,7 +133,6 @@ def chat_completions(req: ChatRequest):
                 remasking=req.remasking,
             )
         elif BACKEND == "ours_kv":
-            from src.Model_KVcache import LLaDAMoEKV
             from src.generate_KVcache import generate_cached as generate_kv
             out_ids = generate_kv(
                 MODEL,
@@ -148,7 +146,6 @@ def chat_completions(req: ChatRequest):
             )
         elif BACKEND == "fast_dense":
             # Option A: Fast dense cached + conservative dynamic experts
-            from model_update.model import LLaDAMoE, load_weights
             from model_update.generate import generate_dense_cached
             out_ids = generate_dense_cached(
                 MODEL,
@@ -165,7 +162,6 @@ def chat_completions(req: ChatRequest):
             )
         elif BACKEND == "dyn_experts":
             # Sparse path + dynamic expert pruning
-            from model_update.model import LLaDAMoE, load_weights
             from model_update.generate import generate_sparse_cached
             out_ids = generate_sparse_cached(
                 MODEL,
@@ -183,7 +179,6 @@ def chat_completions(req: ChatRequest):
                 expert_threshold=0.03,
             )
         elif BACKEND == "hf":
-            from transformers import AutoModelForCausalLM
             from eval.check_time_inference import diffusion_generate
             out_ids = diffusion_generate(
                 MODEL,
@@ -236,9 +231,12 @@ def load_model(weight_dir: str, device: str, backend: str):
     TOKENIZER = AutoTokenizer.from_pretrained(weight_dir, trust_remote_code=True)
 
     print(f"Loading model with backend '{backend}'...")
-    if backend in ("ours", "fast_dense", "dyn_experts"):
-        # All "ours" variants use the same model class (generate function differs)
+    if backend == "ours":
         from src.model import LLaDAMoE, load_weights
+        MODEL = LLaDAMoE().to(torch.bfloat16).to(device).eval()
+        load_weights(MODEL, weight_dir, verbose=True)
+    elif backend in ("fast_dense", "dyn_experts"):
+        from model_update.model import LLaDAMoE, load_weights
         MODEL = LLaDAMoE().to(torch.bfloat16).to(device).eval()
         load_weights(MODEL, weight_dir, verbose=True)
     elif backend == "ours_kv":
