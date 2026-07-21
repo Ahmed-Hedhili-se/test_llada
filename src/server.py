@@ -179,15 +179,16 @@ def chat_completions(req: ChatRequest):
                 expert_threshold=0.03,
             )
         elif BACKEND == "hf":
-            from eval.check_time_inference import diffusion_generate
-            out_ids = diffusion_generate(
-                MODEL,
+            # Use standard HuggingFace generate
+            out_ids = MODEL.generate(
                 input_ids,
-                gen_length=gen_length,
-                steps=steps,
-                block_length=block_length,
-                is_hf=True
-            ).unsqueeze(0)
+                max_new_tokens=gen_length,
+                do_sample=False,
+                temperature=req.temperature if req.temperature > 0 else None,
+                top_p=req.top_p if req.temperature > 0 else None,
+                pad_token_id=TOKENIZER.pad_token_id,
+                eos_token_id=TOKENIZER.eos_token_id,
+            )
     elapsed = time.time() - t0
 
     generated = out_ids[0].tolist()
