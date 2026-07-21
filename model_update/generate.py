@@ -231,6 +231,7 @@ def generate_sparse_cached(
     sparse_pattern: SparsePattern = None,
     sparse_step_threshold: int = 4,
     cache_budget: int = None,
+    saliency_update_interval: int = 8,
     temperature: float = 0.0,
     remasking: str = "low_confidence",
 ) -> torch.Tensor:
@@ -296,22 +297,25 @@ def generate_sparse_cached(
         for step in range(steps_per_block):
             active_ids = x_active[:, block_start:]   # current block onward, not yet committed
             mask_index = (active_ids == MASK_ID)
+            
+            track_saliency = (step % saliency_update_interval == 0)
 
             logits, new_kv, q_positions, all_attn = model.forward_active(
                 active_ids, prefix_len=prefix_len, layer_caches=layer_caches,
                 sparse_pattern=sparse_pattern, step=step,
-                sparse_step_threshold=sparse_step_threshold, need_weights=True,
+                sparse_step_threshold=sparse_step_threshold, need_weights=track_saliency,
             )
 
             # Sparse-dLLM: update saliency of the cached prefix, then evict.
-            for li, cache in enumerate(layer_caches):
-                cached = cache.get()
-                if cached is None or all_attn[li] is None:
-                    continue
-                prefix_n = cached[2].shape[0]
-                aw_prefix = all_attn[li][:, :, :, :prefix_n]
-                cache.update_saliency(aw_prefix, cached[2])
-                cache.evict()
+            if track_saliency:
+                for li, cache in enumerate(layer_caches):
+                    cached = cache.get()
+                    if cached is None or all_attn[li] is None:
+                        continue
+                    prefix_n = cached[2].shape[0]
+                    aw_prefix = all_attn[li][:, :, :, :prefix_n]
+                    cache.update_saliency(aw_prefix, cached[2])
+                    cache.evict()
 
             logits_with_noise = add_gumbel_noise(logits, temperature)
             x0 = logits_with_noise.argmax(dim=-1)
@@ -351,6 +355,8 @@ def generate_sparse_cached(
         for li, cache in enumerate(layer_caches):
             k_new, v_new = new_kv_final[li]
             cache.append(k_new, v_new, positions_final, protected=False)
+            
+        print(f"  [Block {block_idx+1}/{num_blocks}] Cache size (layer 0): {len(layer_caches[0])} tokens")
 
     return x_active[:, :]   # full x_active IS the generated tokens (no prompt prefix in it)
 

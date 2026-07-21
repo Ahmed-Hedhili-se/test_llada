@@ -1,5 +1,5 @@
 """
-Inference time and latency benchmark comparing Baseline (src/) vs New Approach (model_update/).
+Inference time and latency benchmark comparing Baseline (src/) vs multiple Sparse-dLLM configurations (model_update/).
 """
 
 import argparse
@@ -117,10 +117,16 @@ def diffusion_generate(model, prompt_ids, gen_length=64, steps=64, block_length=
     return x[0, P:]
 
 
-def benchmark_generation(model, device: str, prompt_ids, gen_length: int, steps: int, block_length: int, num_warmup: int, num_runs: int, is_new: bool = False):
+def benchmark_generation(model, device: str, prompt_ids, gen_length: int, steps: int, block_length: int, num_warmup: int, num_runs: int, 
+                         is_new: bool = False, cache_budget: int = None, saliency_update_interval: int = 8, sparse_pattern = None):
     if is_new:
         from model_update.generate import generate_sparse_cached
-        gen_fn = lambda: generate_sparse_cached(model, prompt_ids, gen_length, steps, block_length, temperature=0.0)
+        gen_fn = lambda: generate_sparse_cached(
+            model, prompt_ids, gen_length, steps, block_length, 
+            temperature=0.0, cache_budget=cache_budget, 
+            saliency_update_interval=saliency_update_interval, 
+            sparse_pattern=sparse_pattern
+        )
     else:
         gen_fn = lambda: diffusion_generate(model, prompt_ids, gen_length, steps, block_length)
 
@@ -150,19 +156,26 @@ def get_stats(latencies):
     return mean_val, median_val, p95_val
 
 
+def create_dummy_sparse_pattern(num_layers, num_heads):
+    from model_update.kv_cache import SparsePattern
+    window = torch.full((num_layers, num_heads), 64, dtype=torch.long)
+    stride = torch.full((num_layers, num_heads), 16, dtype=torch.long)
+    return SparsePattern(num_layers, num_heads, window, stride)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--weight-dir", default="weights", help="Directory where model weights are stored")
     ap.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu", help="Device to run benchmark on")
-    ap.add_argument("--num-warmup", type=int, default=3, help="Number of warmup iterations")
-    ap.add_argument("--num-runs", type=int, default=10, help="Number of measured benchmark iterations")
+    ap.add_argument("--num-warmup", type=int, default=1, help="Number of warmup iterations")
+    ap.add_argument("--num-runs", type=int, default=3, help="Number of measured benchmark iterations")
     ap.add_argument("--gen-length", type=int, default=64, help="Tokens to generate in generation benchmark")
     ap.add_argument("--steps", type=int, default=64, help="Steps for diffusion generation benchmark")
     ap.add_argument("--block-length", type=int, default=32, help="Block length for generation benchmark")
     args = ap.parse_args()
 
     print(f"================================================================")
-    print(f" LLaDA-MoE Inference Speed Benchmark: Baseline vs New")
+    print(f" LLaDA-MoE Inference Speed Benchmark: 4-Way Comparison")
     print(f"================================================================")
     print(f"  Device           : {args.device}")
     print(f"  PyTorch Version  : {torch.__version__}")
@@ -180,121 +193,93 @@ def main():
     tok = AutoTokenizer.from_pretrained(args.weight_dir, trust_remote_code=True)
     print("Done.\n")
 
-    seq_lengths = [128, 256, 512, 1024]
-    forward_results = {seq_len: {} for seq_len in seq_lengths}
-
     test_prompt = "The chemical symbol for gold is Au and for silver is"
     prompt_ids = tok(test_prompt, return_tensors="pt")["input_ids"].to(args.device)
 
     # 1. Load and Benchmark Baseline Model
-    print("Benchmarking model loading time...")
-    print("  Loading baseline model (src/)...")
+    print("================ 1. DENSE BASELINE ================")
     baseline, baseline_load_time = load_baseline(args.weight_dir, args.device)
     print(f"  Baseline loaded in {baseline_load_time:.2f} seconds.")
     
-    baseline_peak_mem = 0
-    if "cuda" in args.device:
-        baseline_peak_mem = torch.cuda.max_memory_allocated(device=args.device) / (1024 ** 3)
-        torch.cuda.reset_peak_memory_stats(device=args.device)
-
-    print("Benchmarking single forward pass latency for baseline model...")
-    for seq_len in seq_lengths:
-        print(f"  Running sequence length {seq_len}...")
-        baseline_lats = benchmark_forward(baseline, args.device, seq_len, args.num_warmup, args.num_runs)
-        baseline_mean, baseline_med, baseline_p95 = get_stats(baseline_lats)
-        forward_results[seq_len]["baseline"] = (baseline_mean * 1000, baseline_med * 1000, baseline_p95 * 1000)
-    print("Done.\n")
-
-    print("Benchmarking full generation (diffusion decode) for baseline model...")
-    print(f"  Prompt: {repr(test_prompt)}")
-    print(f"  Config: Gen Length={args.gen_length}, Steps={args.steps}, Block Length={args.block_length}")
-    
+    print("Benchmarking full generation (diffusion decode)...")
     baseline_gen_lats = benchmark_generation(
         baseline, args.device, prompt_ids, args.gen_length, args.steps, 
         args.block_length, args.num_warmup, args.num_runs, is_new=False
     )
-    baseline_gen_mean, baseline_gen_med, baseline_gen_p95 = get_stats(baseline_gen_lats)
+    baseline_gen_mean, _, _ = get_stats(baseline_gen_lats)
     baseline_tok_per_sec = args.gen_length / baseline_gen_mean
     baseline_ms_per_step = (baseline_gen_mean * 1000) / args.steps
-    print("Done.\n")
+    print(f"  Mean latency: {baseline_gen_mean:.2f}s ({baseline_tok_per_sec:.2f} tok/s)\n")
 
-    # UNLOAD BASELINE TO FREE MEMORY
     print("Unloading baseline model to free memory...")
     del baseline
     import gc
     gc.collect()
     if "cuda" in args.device:
         torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats(device=args.device)
     print("Done.\n")
 
-    # 2. Load and Benchmark New Approach Model
-    print("Benchmarking model loading time...")
-    print("  Loading new approach model (model_update/)...")
+    # 2. Load New Approach Model
+    print("================ LOADING NEW APPROACH ================")
     new_model, new_load_time = load_new_approach(args.weight_dir, args.device)
-    print(f"  New Approach loaded in {new_load_time:.2f} seconds.")
-    
-    new_peak_mem = 0
-    if "cuda" in args.device:
-        new_peak_mem = torch.cuda.max_memory_allocated(device=args.device) / (1024 ** 3)
-        torch.cuda.reset_peak_memory_stats(device=args.device)
+    print(f"  New Approach loaded in {new_load_time:.2f} seconds.\n")
 
-    print("Benchmarking single forward pass latency for new approach model...")
-    for seq_len in seq_lengths:
-        print(f"  Running sequence length {seq_len}...")
-        new_lats = benchmark_forward(new_model, args.device, seq_len, args.num_warmup, args.num_runs)
-        new_mean, new_med, new_p95 = get_stats(new_lats)
-        forward_results[seq_len]["new"] = (new_mean * 1000, new_med * 1000, new_p95 * 1000)
-    print("Done.\n")
+    NL = len(new_model.layers)
+    dummy_pattern = create_dummy_sparse_pattern(NL, 16)
 
-    print("Benchmarking full generation (diffusion decode) for new approach model...")
-    new_gen_lats = benchmark_generation(
+    # Cache Only
+    print("================ 2. CACHE ONLY (NO SPARSITY) ================")
+    print("  Settings: cache_budget=2048, saliency_update_interval=8")
+    cache_only_gen_lats = benchmark_generation(
         new_model, args.device, prompt_ids, args.gen_length, args.steps, 
-        args.block_length, args.num_warmup, args.num_runs, is_new=True
+        args.block_length, args.num_warmup, args.num_runs, is_new=True, 
+        cache_budget=2048, saliency_update_interval=8, sparse_pattern=None
     )
-    new_gen_mean, new_gen_med, new_gen_p95 = get_stats(new_gen_lats)
-    new_tok_per_sec = args.gen_length / new_gen_mean
-    new_ms_per_step = (new_gen_mean * 1000) / args.steps
-    print("Done.\n")
+    cache_only_gen_mean, _, _ = get_stats(cache_only_gen_lats)
+    cache_only_tok_per_sec = args.gen_length / cache_only_gen_mean
+    print(f"  Mean latency: {cache_only_gen_mean:.2f}s ({cache_only_tok_per_sec:.2f} tok/s)\n")
+
+    # Cache + SparseD
+    print("================ 3. CACHE + SPARSED ================")
+    print("  Settings: cache_budget=2048, saliency_update_interval=8, sparse_pattern=dummy")
+    cache_sparse_gen_lats = benchmark_generation(
+        new_model, args.device, prompt_ids, args.gen_length, args.steps, 
+        args.block_length, args.num_warmup, args.num_runs, is_new=True, 
+        cache_budget=2048, saliency_update_interval=8, sparse_pattern=dummy_pattern
+    )
+    cache_sparse_gen_mean, _, _ = get_stats(cache_sparse_gen_lats)
+    cache_sparse_tok_per_sec = args.gen_length / cache_sparse_gen_mean
+    print(f"  Mean latency: {cache_sparse_gen_mean:.2f}s ({cache_sparse_tok_per_sec:.2f} tok/s)\n")
+
+    # Full Aggressive
+    print("================ 4. AGGRESSIVE (FULL COMBO) ================")
+    print("  Settings: cache_budget=1024, saliency_update_interval=16, sparse_pattern=dummy")
+    full_combo_gen_lats = benchmark_generation(
+        new_model, args.device, prompt_ids, args.gen_length, args.steps, 
+        args.block_length, args.num_warmup, args.num_runs, is_new=True, 
+        cache_budget=1024, saliency_update_interval=16, sparse_pattern=dummy_pattern
+    )
+    full_combo_gen_mean, _, _ = get_stats(full_combo_gen_lats)
+    full_combo_tok_per_sec = args.gen_length / full_combo_gen_mean
+    print(f"  Mean latency: {full_combo_gen_mean:.2f}s ({full_combo_tok_per_sec:.2f} tok/s)\n")
 
     print("Unloading new approach model to free memory...")
     del new_model
     gc.collect()
     if "cuda" in args.device:
         torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats(device=args.device)
     print("Done.\n")
 
     # Output Results Table
-    print("=" * 85)
-    print("                           BENCHMARK RESULTS COMPARISON")
-    print("=" * 85)
-    print(f"| Metric / Test Case                | Baseline (src)        | New (model_update)    | Speedup |")
-    print(f"|-----------------------------------|-----------------------|-----------------------|---------|")
-    print(f"| Model Loading Time (sec)          | {baseline_load_time:21.2f} | {new_load_time:21.2f} | {baseline_load_time/new_load_time:6.2f}x |")
-    if "cuda" in args.device:
-        print(f"| Peak GPU Memory Usage (GB)        | {baseline_peak_mem:21.2f} | {new_peak_mem:21.2f} | {baseline_peak_mem/new_peak_mem:6.2f}x |")
-    
-    print(f"|-----------------------------------|-----------------------|-----------------------|---------|")
-    
-    # Forward passes
-    for seq_len in seq_lengths:
-        b_mean, b_med, b_p95 = forward_results[seq_len]["baseline"]
-        n_mean, n_med, n_p95 = forward_results[seq_len]["new"]
-        print(f"| Fwd Pass Latency ({seq_len:4d} tokens)   |                       |                       |         |")
-        print(f"|   - Mean (ms)                     | {b_mean:21.2f} | {n_mean:21.2f} | {b_mean/n_mean:6.2f}x |")
-        print(f"|   - Median / p50 (ms)             | {b_med:21.2f} | {n_med:21.2f} | {b_med/n_med:6.2f}x |")
-        print(f"|   - p95 (ms)                      | {b_p95:21.2f} | {n_p95:21.2f} | {b_p95/n_p95:6.2f}x |")
-        print(f"|-----------------------------------|-----------------------|-----------------------|---------|")
-
-    # Generation metrics
-    print(f"| Generation Benchmark              |                       |                       |         |")
-    print(f"|   - Total Time (sec)              | {baseline_gen_mean:21.2f} | {new_gen_mean:21.2f} | {baseline_gen_mean/new_gen_mean:6.2f}x |")
-    print(f"|   - Time per Step (ms)            | {baseline_ms_per_step:21.2f} | {new_ms_per_step:21.2f} | {baseline_ms_per_step/new_ms_per_step:6.2f}x |")
-    print(f"|   - Throughput (tokens/sec)       | {baseline_tok_per_sec:21.2f} | {new_tok_per_sec:21.2f} | {new_tok_per_sec/baseline_tok_per_sec:6.2f}x |")
-    print("=" * 85)
-    print("\nNote: Speedup > 1.0x indicates that the New approach is faster than the Baseline.")
-
+    print("=" * 115)
+    print("                                   BENCHMARK RESULTS COMPARISON")
+    print("=" * 115)
+    print(f"| Metric                      | Baseline       | Cache Only     | Cache + SparseD | Aggressive Full |")
+    print(f"|-----------------------------|----------------|----------------|-----------------|-----------------|")
+    print(f"| Total Time (sec)            | {baseline_gen_mean:14.2f} | {cache_only_gen_mean:14.2f} | {cache_sparse_gen_mean:15.2f} | {full_combo_gen_mean:15.2f} |")
+    print(f"| Throughput (tokens/sec)     | {baseline_tok_per_sec:14.2f} | {cache_only_tok_per_sec:14.2f} | {cache_sparse_tok_per_sec:15.2f} | {full_combo_tok_per_sec:15.2f} |")
+    print(f"| Speedup vs Baseline         |           1.0x | {baseline_gen_mean/cache_only_gen_mean:13.2f}x | {baseline_gen_mean/cache_sparse_gen_mean:14.2f}x | {baseline_gen_mean/full_combo_gen_mean:14.2f}x |")
+    print("=" * 115)
 
 if __name__ == "__main__":
     main()

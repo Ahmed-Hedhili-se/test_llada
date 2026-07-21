@@ -172,6 +172,26 @@ class SparsePattern:
             masks.append(m)
         return torch.stack(masks, dim=0)
 
+    def build_block_mask(self, layer_idx: int, q_positions: torch.Tensor,
+                         k_positions: torch.Tensor, device):
+        """Builds a flex_attention BlockMask for PyTorch 2.5+"""
+        from torch.nn.attention.flex_attention import create_block_mask
+        
+        window_t = self.window[layer_idx].to(device)
+        stride_t = self.stride[layer_idx].to(device)
+        
+        def mask_mod(b, h, q_idx, kv_idx):
+            q = q_positions[q_idx]
+            k = k_positions[kv_idx]
+            w = window_t[h]
+            s = stride_t[h]
+            
+            local_mask = (q - k).abs() <= w
+            glob_mask = torch.where(s > 0, k % torch.clamp(s, min=1) == 0, torch.tensor(False, device=q.device))
+            return local_mask | glob_mask
+            
+        return create_block_mask(mask_mod, 1, self.num_heads, len(q_positions), len(k_positions), device=device)
+
     def save(self, path: str):
         torch.save({"window": self.window, "stride": self.stride}, path)
 

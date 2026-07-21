@@ -176,13 +176,37 @@ class Attention(nn.Module):
             k_full, v_full = k, v
 
         attn_weights = None
-        if sparse_mask is not None or need_weights:
+        if need_weights:
             scale = 1.0 / math.sqrt(HD)
             scores = torch.matmul(q, k_full.transpose(-2, -1)) * scale   # [B,NH,T,Nk]
             if sparse_mask is not None:
-                scores = scores.masked_fill(~sparse_mask.unsqueeze(0), float("-inf"))
+                if hasattr(sparse_mask, "materialize"):
+                    m = sparse_mask.materialize((1, NH, T, k_full.size(2)))
+                    scores = scores.masked_fill(~m, float("-inf"))
+                else:
+                    scores = scores.masked_fill(~sparse_mask.unsqueeze(0), float("-inf"))
             attn_weights = torch.softmax(scores.float(), dim=-1).to(q.dtype)
             out = torch.matmul(attn_weights, v_full)
+        elif sparse_mask is not None:
+            if hasattr(sparse_mask, "materialize"):
+                from torch.nn.attention.flex_attention import flex_attention
+                out = flex_attention(q, k_full, v_full, block_mask=sparse_mask)
+            else:
+                out_list = []
+                for t in range(T):
+                    out_t_heads = []
+                    for h in range(NH):
+                        m = sparse_mask[h, t, :]
+                        k_sel = k_full[:, h:h+1, m, :]
+                        v_sel = v_full[:, h:h+1, m, :]
+                        q_sel = q[:, h:h+1, t:t+1, :]
+                        if m.any():
+                            out_t_h = F.scaled_dot_product_attention(q_sel, k_sel, v_sel)
+                        else:
+                            out_t_h = torch.zeros_like(q_sel)
+                        out_t_heads.append(out_t_h)
+                    out_list.append(torch.cat(out_t_heads, dim=1))
+                out = torch.cat(out_list, dim=2)
         else:
             out = F.scaled_dot_product_attention(q, k_full, v_full, attn_mask=None, is_causal=False)
 
@@ -375,7 +399,10 @@ class LLaDAMoE(nn.Module):
             sparse_mask = None
             if use_sparse:
                 k_positions = torch.cat([cached[2], q_positions]) if cached is not None else q_positions
-                sparse_mask = sparse_pattern.build_mask(li, q_positions, k_positions, device)
+                try:
+                    sparse_mask = sparse_pattern.build_block_mask(li, q_positions, k_positions, device)
+                except Exception:
+                    sparse_mask = sparse_pattern.build_mask(li, q_positions, k_positions, device)
 
             x, k_new, v_new, aw = layer.forward_ext(
                 x, cos, sin, cached_kv=cached, sparse_mask=sparse_mask, need_weights=need_weights
