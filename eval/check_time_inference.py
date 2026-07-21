@@ -40,6 +40,25 @@ def load_ours(weight_dir: str, device: str):
     return model, t1 - t0
 
 
+def load_ours_kv(weight_dir: str, device: str):
+    from src.Model_KVcache import LLaDAMoEKV
+    from src.model import load_weights
+    
+    if "cuda" in device:
+        torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    
+    # Load model
+    model = LLaDAMoEKV().to(torch.bfloat16).to(device).eval()
+    load_weights(model, weight_dir, verbose=False)
+    
+    if "cuda" in device:
+        torch.cuda.synchronize()
+    t1 = time.perf_counter()
+    
+    return model, t1 - t0
+
+
 def load_hf(weight_dir: str, device: str):
     if "cuda" in device:
         torch.cuda.synchronize()
@@ -125,10 +144,16 @@ def diffusion_generate(model, prompt_ids, gen_length=64, steps=64, block_length=
     return x[0, P:]
 
 
-def benchmark_generation(model, device: str, prompt_ids, gen_length: int, steps: int, block_length: int, num_warmup: int, num_runs: int, is_hf: bool):
+def benchmark_generation(model, device: str, prompt_ids, gen_length: int, steps: int, block_length: int, num_warmup: int, num_runs: int, is_hf: bool, is_kv: bool = False):
+    if is_kv:
+        from src.generate_KVcache import generate as generate_kv
+        gen_fn = lambda: generate_kv(model, prompt_ids, gen_length, steps, block_length, temperature=0.0)
+    else:
+        gen_fn = lambda: diffusion_generate(model, prompt_ids, gen_length, steps, block_length, is_hf=is_hf)
+
     # Warmup
     for _ in range(num_warmup):
-        _ = diffusion_generate(model, prompt_ids, gen_length, steps, block_length, is_hf=is_hf)
+        _ = gen_fn()
         
     if "cuda" in device:
         torch.cuda.synchronize()
@@ -136,7 +161,7 @@ def benchmark_generation(model, device: str, prompt_ids, gen_length: int, steps:
     latencies = []
     for _ in range(num_runs):
         t0 = time.perf_counter()
-        _ = diffusion_generate(model, prompt_ids, gen_length, steps, block_length, is_hf=is_hf)
+        _ = gen_fn()
         if "cuda" in device:
             torch.cuda.synchronize()
         latencies.append(time.perf_counter() - t0)
@@ -225,9 +250,45 @@ def main():
     print("Done.\n")
 
     # UNLOAD OURS TO FREE MEMORY
-    print("Unloading custom model to free memory for Hugging Face model...")
+    print("Unloading custom model to free memory...")
     del ours
     import gc
+    gc.collect()
+    if "cuda" in args.device:
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device=args.device)
+    print("Done.\n")
+
+    # 3.5 Load and Benchmark KV Custom Model
+    print("Benchmarking model loading time for KV model...")
+    ours_kv, ours_kv_load_time = load_ours_kv(args.weight_dir, args.device)
+    print(f"  Ours KV loaded in {ours_kv_load_time:.2f} seconds.")
+    
+    ours_kv_peak_mem = 0
+    if "cuda" in args.device:
+        ours_kv_peak_mem = torch.cuda.max_memory_allocated(device=args.device) / (1024 ** 3)
+        torch.cuda.reset_peak_memory_stats(device=args.device)
+
+    print("Benchmarking single forward pass latency for KV custom model...")
+    for seq_len in seq_lengths:
+        print(f"  Running sequence length {seq_len}...")
+        ours_kv_lats = benchmark_forward(ours_kv, args.device, seq_len, args.num_warmup, args.num_runs, is_hf=False)
+        ours_kv_mean, ours_kv_med, ours_kv_p95 = get_stats(ours_kv_lats)
+        forward_results[seq_len]["ours_kv"] = (ours_kv_mean * 1000, ours_kv_med * 1000, ours_kv_p95 * 1000)
+    print("Done.\n")
+
+    print("Benchmarking full generation (diffusion decode) for KV custom model...")
+    ours_kv_gen_lats = benchmark_generation(
+        ours_kv, args.device, prompt_ids, args.gen_length, args.steps, 
+        args.block_length, args.num_warmup, args.num_runs, is_hf=False, is_kv=True
+    )
+    ours_kv_gen_mean, ours_kv_gen_med, ours_kv_gen_p95 = get_stats(ours_kv_gen_lats)
+    ours_kv_tok_per_sec = args.gen_length / ours_kv_gen_mean
+    ours_kv_ms_per_step = (ours_kv_gen_mean * 1000) / args.steps
+    print("Done.\n")
+
+    print("Unloading KV custom model to free memory for Hugging Face model...")
+    del ours_kv
     gc.collect()
     if "cuda" in args.device:
         torch.cuda.empty_cache()
@@ -264,34 +325,35 @@ def main():
     print("Done.\n")
 
     # Output Results Table
-    print("=" * 80)
+    print("=" * 110)
     print("                           BENCHMARK RESULTS COMPARISON")
-    print("=" * 80)
-    print(f"| Metric / Test Case                | Custom Implementation | Hugging Face Ref  | Speedup  |")
-    print(f"|-----------------------------------|-----------------------|-------------------|----------|")
-    print(f"| Model Loading Time (sec)          | {ours_load_time:21.2f} | {hf_load_time:17.2f} | {hf_load_time/ours_load_time:7.2f}x |")
+    print("=" * 110)
+    print(f"| Metric / Test Case                | Custom Implementation | Custom w/ KV Cache | Hugging Face Ref  | Speedup (KV vs HF)|")
+    print(f"|-----------------------------------|-----------------------|--------------------|-------------------|-------------------|")
+    print(f"| Model Loading Time (sec)          | {ours_load_time:21.2f} | {ours_kv_load_time:18.2f} | {hf_load_time:17.2f} | {hf_load_time/ours_kv_load_time:16.2f}x |")
     if "cuda" in args.device:
-        print(f"| Peak GPU Memory Usage (GB)        | {ours_peak_mem:21.2f} | {hf_peak_mem:17.2f} | {hf_peak_mem/ours_peak_mem:7.2f}x |")
+        print(f"| Peak GPU Memory Usage (GB)        | {ours_peak_mem:21.2f} | {ours_kv_peak_mem:18.2f} | {hf_peak_mem:17.2f} | {hf_peak_mem/ours_kv_peak_mem:16.2f}x |")
     
-    print(f"|-----------------------------------|-----------------------|-------------------|----------|")
+    print(f"|-----------------------------------|-----------------------|--------------------|-------------------|-------------------|")
     
     # Forward passes
     for seq_len in seq_lengths:
         ours_mean, ours_med, ours_p95 = forward_results[seq_len]["ours"]
+        ours_kv_mean, ours_kv_med, ours_kv_p95 = forward_results[seq_len]["ours_kv"]
         hf_mean, hf_med, hf_p95 = forward_results[seq_len]["hf"]
-        print(f"| Fwd Pass Latency ({seq_len:4d} tokens)   |                       |                   |          |")
-        print(f"|   - Mean (ms)                     | {ours_mean:21.2f} | {hf_mean:17.2f} | {hf_mean/ours_mean:7.2f}x |")
-        print(f"|   - Median / p50 (ms)             | {ours_med:21.2f} | {hf_med:17.2f} | {hf_med/ours_med:7.2f}x |")
-        print(f"|   - p95 (ms)                      | {ours_p95:21.2f} | {hf_p95:17.2f} | {hf_p95/ours_p95:7.2f}x |")
-        print(f"|-----------------------------------|-----------------------|-------------------|----------|")
+        print(f"| Fwd Pass Latency ({seq_len:4d} tokens)   |                       |                    |                   |                   |")
+        print(f"|   - Mean (ms)                     | {ours_mean:21.2f} | {ours_kv_mean:18.2f} | {hf_mean:17.2f} | {hf_mean/ours_kv_mean:16.2f}x |")
+        print(f"|   - Median / p50 (ms)             | {ours_med:21.2f} | {ours_kv_med:18.2f} | {hf_med:17.2f} | {hf_med/ours_kv_med:16.2f}x |")
+        print(f"|   - p95 (ms)                      | {ours_p95:21.2f} | {ours_kv_p95:18.2f} | {hf_p95:17.2f} | {hf_p95/ours_kv_p95:16.2f}x |")
+        print(f"|-----------------------------------|-----------------------|--------------------|-------------------|-------------------|")
 
     # Generation metrics
-    print(f"| Generation Benchmark              |                       |                   |          |")
-    print(f"|   - Total Time (sec)              | {ours_gen_mean:21.2f} | {hf_gen_mean:17.2f} | {hf_gen_mean/ours_gen_mean:7.2f}x |")
-    print(f"|   - Time per Step (ms)            | {ours_ms_per_step:21.2f} | {hf_ms_per_step:17.2f} | {hf_ms_per_step/ours_ms_per_step:7.2f}x |")
-    print(f"|   - Throughput (tokens/sec)       | {ours_tok_per_sec:21.2f} | {hf_tok_per_sec:17.2f} | {ours_tok_per_sec/hf_tok_per_sec:7.2f}x |")
-    print("=" * 80)
-    print("\nNote: Speedup > 1.0x indicates that the custom implementation is faster.")
+    print(f"| Generation Benchmark              |                       |                    |                   |                   |")
+    print(f"|   - Total Time (sec)              | {ours_gen_mean:21.2f} | {ours_kv_gen_mean:18.2f} | {hf_gen_mean:17.2f} | {hf_gen_mean/ours_kv_gen_mean:16.2f}x |")
+    print(f"|   - Time per Step (ms)            | {ours_ms_per_step:21.2f} | {ours_kv_ms_per_step:18.2f} | {hf_ms_per_step:17.2f} | {hf_ms_per_step/ours_kv_ms_per_step:16.2f}x |")
+    print(f"|   - Throughput (tokens/sec)       | {ours_tok_per_sec:21.2f} | {ours_kv_tok_per_sec:18.2f} | {hf_tok_per_sec:17.2f} | {ours_kv_tok_per_sec/hf_tok_per_sec:16.2f}x |")
+    print("=" * 110)
+    print("\nNote: Speedup > 1.0x indicates that the Custom KV implementation is faster than HF.")
 
 
 if __name__ == "__main__":

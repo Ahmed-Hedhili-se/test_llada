@@ -108,16 +108,39 @@ def chat_completions(req: ChatRequest):
 
     t0 = time.time()
     with torch.no_grad():
-        out_ids = generate(
-            MODEL,
-            input_ids,
-            gen_length=gen_length,
-            steps=steps,
-            block_length=block_length,
-            temperature=req.temperature,
-            cfg_scale=req.cfg_scale,
-            remasking=req.remasking,
-        )
+        if BACKEND == "ours":
+            out_ids = generate(
+                MODEL,
+                input_ids,
+                gen_length=gen_length,
+                steps=steps,
+                block_length=block_length,
+                temperature=req.temperature,
+                cfg_scale=req.cfg_scale,
+                remasking=req.remasking,
+            )
+        elif BACKEND == "ours_kv":
+            from src.generate_KVcache import generate as generate_kv
+            out_ids = generate_kv(
+                MODEL,
+                input_ids,
+                gen_length=gen_length,
+                steps=steps,
+                block_length=block_length,
+                temperature=req.temperature,
+                cfg_scale=req.cfg_scale,
+                remasking=req.remasking,
+            )
+        elif BACKEND == "hf":
+            from eval.check_time_inference import diffusion_generate
+            out_ids = diffusion_generate(
+                MODEL,
+                input_ids,
+                gen_length=gen_length,
+                steps=steps,
+                block_length=block_length,
+                is_hf=True
+            ).unsqueeze(0)
     elapsed = time.time() - t0
 
     # Decode — stop at first EOS if present, trim trailing masks
@@ -154,16 +177,32 @@ def chat_completions(req: ChatRequest):
 
 
 # ── Startup ────────────────────────────────────────────────────────────────────
-def load_model(weight_dir: str, device: str):
-    global MODEL, TOKENIZER, DEVICE
+def load_model(weight_dir: str, device: str, backend: str):
+    global MODEL, TOKENIZER, DEVICE, BACKEND
     DEVICE = device
+    BACKEND = backend
 
     print(f"Loading tokenizer from {weight_dir}...")
     TOKENIZER = AutoTokenizer.from_pretrained(weight_dir, trust_remote_code=True)
 
-    print(f"Loading LLaDA-MoE model...")
-    MODEL = LLaDAMoE().to(torch.bfloat16).to(device).eval()
-    load_weights(MODEL, weight_dir, verbose=True)
+    print(f"Loading model with backend '{backend}'...")
+    if backend == "ours":
+        MODEL = LLaDAMoE().to(torch.bfloat16).to(device).eval()
+        load_weights(MODEL, weight_dir, verbose=True)
+    elif backend == "ours_kv":
+        from src.Model_KVcache import LLaDAMoEKV
+        MODEL = LLaDAMoEKV().to(torch.bfloat16).to(device).eval()
+        load_weights(MODEL, weight_dir, verbose=True)
+    elif backend == "hf":
+        from transformers import AutoModelForCausalLM
+        MODEL = AutoModelForCausalLM.from_pretrained(
+            weight_dir,
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16,
+            attn_implementation="eager",
+        ).to(device).eval()
+    else:
+        raise ValueError(f"Unknown backend: {backend}")
     print("Model ready.\n")
 
 
@@ -173,9 +212,10 @@ def main():
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--backend", choices=["ours", "ours_kv", "hf"], default="ours")
     args = ap.parse_args()
 
-    load_model(args.weight_dir, args.device)
+    load_model(args.weight_dir, args.device, args.backend)
     uvicorn.run(app, host=args.host, port=args.port)
 
 
