@@ -183,8 +183,11 @@ class Attention(nn.Module):
             scores = torch.matmul(q, k_full.transpose(-2, -1)) * scale   # [B,NH,T,Nk]
             if sparse_mask is not None:
                 if is_block_mask:
-                    # Materialize BlockMask to a boolean tensor for the manual path
-                    bool_mask = sparse_mask.to_dense()  # [1, NH, Tq, Tk] or similar
+                    # Materialize BlockMask to a boolean tensor for the manual path.
+                    # NOTE: BlockMask.to_dense() returns an int32 (0/1) tensor on
+                    # PyTorch 2.5.1, not bool — masked_fill requires an actual bool
+                    # mask, so cast explicitly (non-zero -> True == "attend").
+                    bool_mask = sparse_mask.to_dense().bool()  # [1, NH, Tq, Tk] or similar
                     if bool_mask.dim() == 4:
                         scores = scores.masked_fill(~bool_mask, float("-inf"))
                     else:
