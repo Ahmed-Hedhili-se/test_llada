@@ -189,24 +189,15 @@ class Attention(nn.Module):
             out = torch.matmul(attn_weights, v_full)
         elif sparse_mask is not None:
             if hasattr(sparse_mask, "materialize"):
+                # flex_attention: real block-level FLOP savings
                 from torch.nn.attention.flex_attention import flex_attention
                 out = flex_attention(q, k_full, v_full, block_mask=sparse_mask)
             else:
-                out_list = []
-                for t in range(T):
-                    out_t_heads = []
-                    for h in range(NH):
-                        m = sparse_mask[h, t, :]
-                        k_sel = k_full[:, h:h+1, m, :]
-                        v_sel = v_full[:, h:h+1, m, :]
-                        q_sel = q[:, h:h+1, t:t+1, :]
-                        if m.any():
-                            out_t_h = F.scaled_dot_product_attention(q_sel, k_sel, v_sel)
-                        else:
-                            out_t_h = torch.zeros_like(q_sel)
-                        out_t_heads.append(out_t_h)
-                    out_list.append(torch.cat(out_t_heads, dim=1))
-                out = torch.cat(out_list, dim=2)
+                # Fallback: use SDPA with an additive float mask from the boolean mask.
+                # This keeps the fused kernel while zeroing out masked positions.
+                float_mask = torch.zeros(1, NH, T, k_full.size(2), dtype=q.dtype, device=q.device)
+                float_mask.masked_fill_(~sparse_mask.unsqueeze(0), float("-inf"))
+                out = F.scaled_dot_product_attention(q, k_full, v_full, attn_mask=float_mask, is_causal=False)
         else:
             out = F.scaled_dot_product_attention(q, k_full, v_full, attn_mask=None, is_causal=False)
 

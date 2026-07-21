@@ -174,23 +174,37 @@ class SparsePattern:
 
     def build_block_mask(self, layer_idx: int, q_positions: torch.Tensor,
                          k_positions: torch.Tensor, device):
-        """Builds a flex_attention BlockMask for PyTorch 2.5+"""
+        """Builds a flex_attention BlockMask for PyTorch 2.5+.
+        
+        create_block_mask pads Q/KV lengths to block boundaries, so mask_mod
+        can receive indices beyond the actual sequence length. We use modular
+        wrapping to keep indexing safe and an explicit bounds gate to mask out
+        the padded region.
+        """
         from torch.nn.attention.flex_attention import create_block_mask
         
+        Q = len(q_positions)
+        K = len(k_positions)
+        q_pos = q_positions.to(device)
+        k_pos = k_positions.to(device)
         window_t = self.window[layer_idx].to(device)
         stride_t = self.stride[layer_idx].to(device)
         
         def mask_mod(b, h, q_idx, kv_idx):
-            q = q_positions[q_idx]
-            k = k_positions[kv_idx]
+            in_bounds = (q_idx < Q) & (kv_idx < K)
+            q_safe = q_idx % Q
+            kv_safe = kv_idx % K
+            
+            q_val = q_pos[q_safe]
+            k_val = k_pos[kv_safe]
             w = window_t[h]
             s = stride_t[h]
             
-            local_mask = (q - k).abs() <= w
-            glob_mask = torch.where(s > 0, k % torch.clamp(s, min=1) == 0, torch.tensor(False, device=q.device))
-            return local_mask | glob_mask
+            local_mask = (q_val - k_val).abs() <= w
+            stride_mask = (s > 0) & (k_val % torch.clamp(s, min=1) == 0)
+            return in_bounds & (local_mask | stride_mask)
             
-        return create_block_mask(mask_mod, 1, self.num_heads, len(q_positions), len(k_positions), device=device)
+        return create_block_mask(mask_mod, 1, self.num_heads, Q, K, device=device)
 
     def save(self, path: str):
         torch.save({"window": self.window, "stride": self.stride}, path)
