@@ -120,7 +120,7 @@ def chat_completions(req: ChatRequest):
                 remasking=req.remasking,
             )
         elif BACKEND == "ours_kv":
-            from src.generate_KVcache import generate as generate_kv
+            from src.generate_KVcache import generate_cached as generate_kv
             out_ids = generate_kv(
                 MODEL,
                 input_ids,

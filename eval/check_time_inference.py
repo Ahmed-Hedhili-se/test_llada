@@ -146,7 +146,7 @@ def diffusion_generate(model, prompt_ids, gen_length=64, steps=64, block_length=
 
 def benchmark_generation(model, device: str, prompt_ids, gen_length: int, steps: int, block_length: int, num_warmup: int, num_runs: int, is_hf: bool, is_kv: bool = False):
     if is_kv:
-        from src.generate_KVcache import generate as generate_kv
+        from src.generate_KVcache import generate_cached as generate_kv
         gen_fn = lambda: generate_kv(model, prompt_ids, gen_length, steps, block_length, temperature=0.0)
     else:
         gen_fn = lambda: diffusion_generate(model, prompt_ids, gen_length, steps, block_length, is_hf=is_hf)
