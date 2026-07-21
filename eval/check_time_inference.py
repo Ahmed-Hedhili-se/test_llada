@@ -1,5 +1,5 @@
 """
-Inference time and latency benchmark comparing our LLaDA-MoE implementation vs Hugging Face reference.
+Inference time and latency benchmark comparing Baseline (src/) vs New Approach (model_update/).
 """
 
 import argparse
@@ -10,26 +10,40 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer
 
 # Set unbuffered output
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
 
-# Add the workspace root to sys.path to import src.model
+# Add the workspace root to sys.path
 workspace_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(workspace_root))
 
 MASK_ID = 156895
 
-
-def load_ours(weight_dir: str, device: str):
+def load_baseline(weight_dir: str, device: str):
     from src.model import LLaDAMoE, load_weights
     
     if "cuda" in device:
         torch.cuda.synchronize()
     t0 = time.perf_counter()
     
-    # Load model
+    model = LLaDAMoE().to(torch.bfloat16).to(device).eval()
+    load_weights(model, weight_dir, verbose=False)
+    
+    if "cuda" in device:
+        torch.cuda.synchronize()
+    t1 = time.perf_counter()
+    
+    return model, t1 - t0
+
+def load_new_approach(weight_dir: str, device: str):
+    from model_update.model import LLaDAMoE, load_weights
+    
+    if "cuda" in device:
+        torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    
     model = LLaDAMoE().to(torch.bfloat16).to(device).eval()
     load_weights(model, weight_dir, verbose=False)
     
@@ -40,51 +54,12 @@ def load_ours(weight_dir: str, device: str):
     return model, t1 - t0
 
 
-def load_ours_kv(weight_dir: str, device: str):
-    from src.Model_KVcache import LLaDAMoEKV
-    from src.model import load_weights
-    
-    if "cuda" in device:
-        torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    
-    # Load model
-    model = LLaDAMoEKV().to(torch.bfloat16).to(device).eval()
-    load_weights(model, weight_dir, verbose=False)
-    
-    if "cuda" in device:
-        torch.cuda.synchronize()
-    t1 = time.perf_counter()
-    
-    return model, t1 - t0
-
-
-def load_hf(weight_dir: str, device: str):
-    if "cuda" in device:
-        torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    
-    model = AutoModelForCausalLM.from_pretrained(
-        weight_dir,
-        trust_remote_code=True,
-        torch_dtype=torch.bfloat16,
-        attn_implementation="eager",
-    ).to(device).eval()
-    
-    if "cuda" in device:
-        torch.cuda.synchronize()
-    t1 = time.perf_counter()
-    
-    return model, t1 - t0
-
-
-def benchmark_forward(model, device: str, seq_len: int, num_warmup: int, num_runs: int, is_hf: bool):
+def benchmark_forward(model, device: str, seq_len: int, num_warmup: int, num_runs: int):
     x = torch.full((1, seq_len), MASK_ID, dtype=torch.long, device=device)
     
-    # Warmup
     with torch.no_grad():
         for _ in range(num_warmup):
-            _ = model(x).logits if is_hf else model(x)
+            _ = model(x)
             
     if "cuda" in device:
         torch.cuda.synchronize()
@@ -93,7 +68,7 @@ def benchmark_forward(model, device: str, seq_len: int, num_warmup: int, num_run
     with torch.no_grad():
         for _ in range(num_runs):
             t0 = time.perf_counter()
-            _ = model(x).logits if is_hf else model(x)
+            _ = model(x)
             if "cuda" in device:
                 torch.cuda.synchronize()
             latencies.append(time.perf_counter() - t0)
@@ -101,10 +76,8 @@ def benchmark_forward(model, device: str, seq_len: int, num_warmup: int, num_run
     return latencies
 
 
-def diffusion_generate(model, prompt_ids, gen_length=64, steps=64, block_length=32, is_hf=False):
-    """Run the masked diffusion decode loop, works for both our model and HF."""
+def diffusion_generate(model, prompt_ids, gen_length=64, steps=64, block_length=32):
     import numpy as np
-
     device = prompt_ids.device
     P = prompt_ids.shape[1]
     x = torch.full((1, P + gen_length), MASK_ID, dtype=torch.long, device=device)
@@ -127,7 +100,7 @@ def diffusion_generate(model, prompt_ids, gen_length=64, steps=64, block_length=
         for step in range(steps_per_block):
             mask_index = (x == MASK_ID)
             with torch.no_grad():
-                logits = model(x).logits if is_hf else model(x)
+                logits = model(x)
             x0 = logits.argmax(dim=-1)
             p = F.softmax(logits.float(), dim=-1)
             x0_p = p.gather(-1, x0.unsqueeze(-1)).squeeze(-1)
@@ -144,12 +117,12 @@ def diffusion_generate(model, prompt_ids, gen_length=64, steps=64, block_length=
     return x[0, P:]
 
 
-def benchmark_generation(model, device: str, prompt_ids, gen_length: int, steps: int, block_length: int, num_warmup: int, num_runs: int, is_hf: bool, is_kv: bool = False):
-    if is_kv:
-        from src.generate_KVcache import generate_cached as generate_kv
-        gen_fn = lambda: generate_kv(model, prompt_ids, gen_length, steps, block_length, temperature=0.0)
+def benchmark_generation(model, device: str, prompt_ids, gen_length: int, steps: int, block_length: int, num_warmup: int, num_runs: int, is_new: bool = False):
+    if is_new:
+        from model_update.generate import generate_sparse_cached
+        gen_fn = lambda: generate_sparse_cached(model, prompt_ids, gen_length, steps, block_length, temperature=0.0)
     else:
-        gen_fn = lambda: diffusion_generate(model, prompt_ids, gen_length, steps, block_length, is_hf=is_hf)
+        gen_fn = lambda: diffusion_generate(model, prompt_ids, gen_length, steps, block_length)
 
     # Warmup
     for _ in range(num_warmup):
@@ -189,7 +162,7 @@ def main():
     args = ap.parse_args()
 
     print(f"================================================================")
-    print(f" LLaDA-MoE Inference Speed & Latency Benchmark")
+    print(f" LLaDA-MoE Inference Speed Benchmark: Baseline vs New")
     print(f"================================================================")
     print(f"  Device           : {args.device}")
     print(f"  PyTorch Version  : {torch.__version__}")
@@ -201,57 +174,53 @@ def main():
     # Verify weights directory
     if not os.path.exists(args.weight_dir) or not os.path.isdir(args.weight_dir):
         print(f"Error: Weight directory '{args.weight_dir}' does not exist.")
-        print(f"Please run setup.sh or specify the correct weight directory via --weight-dir")
         sys.exit(1)
 
     print("Loading tokenizer...")
     tok = AutoTokenizer.from_pretrained(args.weight_dir, trust_remote_code=True)
     print("Done.\n")
 
-    # 1. Load and Benchmark Custom Model
-    print("Benchmarking model loading time...")
-    print("  Loading our custom model implementation...")
-    ours, ours_load_time = load_ours(args.weight_dir, args.device)
-    print(f"  Ours loaded in {ours_load_time:.2f} seconds.")
-    
-    # Measure memory after loading ours
-    ours_peak_mem = 0
-    if "cuda" in args.device:
-        ours_peak_mem = torch.cuda.max_memory_allocated(device=args.device) / (1024 ** 3)
-        torch.cuda.reset_peak_memory_stats(device=args.device)
-
-    # 2. Benchmark Single Forward Pass Latency for Ours
     seq_lengths = [128, 256, 512, 1024]
     forward_results = {seq_len: {} for seq_len in seq_lengths}
-    
-    print("Benchmarking single forward pass latency for custom model...")
-    for seq_len in seq_lengths:
-        print(f"  Running sequence length {seq_len}...")
-        ours_lats = benchmark_forward(ours, args.device, seq_len, args.num_warmup, args.num_runs, is_hf=False)
-        ours_mean, ours_med, ours_p95 = get_stats(ours_lats)
-        forward_results[seq_len]["ours"] = (ours_mean * 1000, ours_med * 1000, ours_p95 * 1000)
-    print("Done.\n")
 
-    # 3. Benchmark Iterative Generation Latency for Ours
     test_prompt = "The chemical symbol for gold is Au and for silver is"
     prompt_ids = tok(test_prompt, return_tensors="pt")["input_ids"].to(args.device)
+
+    # 1. Load and Benchmark Baseline Model
+    print("Benchmarking model loading time...")
+    print("  Loading baseline model (src/)...")
+    baseline, baseline_load_time = load_baseline(args.weight_dir, args.device)
+    print(f"  Baseline loaded in {baseline_load_time:.2f} seconds.")
     
-    print("Benchmarking full generation (diffusion decode) for custom model...")
+    baseline_peak_mem = 0
+    if "cuda" in args.device:
+        baseline_peak_mem = torch.cuda.max_memory_allocated(device=args.device) / (1024 ** 3)
+        torch.cuda.reset_peak_memory_stats(device=args.device)
+
+    print("Benchmarking single forward pass latency for baseline model...")
+    for seq_len in seq_lengths:
+        print(f"  Running sequence length {seq_len}...")
+        baseline_lats = benchmark_forward(baseline, args.device, seq_len, args.num_warmup, args.num_runs)
+        baseline_mean, baseline_med, baseline_p95 = get_stats(baseline_lats)
+        forward_results[seq_len]["baseline"] = (baseline_mean * 1000, baseline_med * 1000, baseline_p95 * 1000)
+    print("Done.\n")
+
+    print("Benchmarking full generation (diffusion decode) for baseline model...")
     print(f"  Prompt: {repr(test_prompt)}")
     print(f"  Config: Gen Length={args.gen_length}, Steps={args.steps}, Block Length={args.block_length}")
     
-    ours_gen_lats = benchmark_generation(
-        ours, args.device, prompt_ids, args.gen_length, args.steps, 
-        args.block_length, args.num_warmup, args.num_runs, is_hf=False
+    baseline_gen_lats = benchmark_generation(
+        baseline, args.device, prompt_ids, args.gen_length, args.steps, 
+        args.block_length, args.num_warmup, args.num_runs, is_new=False
     )
-    ours_gen_mean, ours_gen_med, ours_gen_p95 = get_stats(ours_gen_lats)
-    ours_tok_per_sec = args.gen_length / ours_gen_mean
-    ours_ms_per_step = (ours_gen_mean * 1000) / args.steps
+    baseline_gen_mean, baseline_gen_med, baseline_gen_p95 = get_stats(baseline_gen_lats)
+    baseline_tok_per_sec = args.gen_length / baseline_gen_mean
+    baseline_ms_per_step = (baseline_gen_mean * 1000) / args.steps
     print("Done.\n")
 
-    # UNLOAD OURS TO FREE MEMORY
-    print("Unloading custom model to free memory...")
-    del ours
+    # UNLOAD BASELINE TO FREE MEMORY
+    print("Unloading baseline model to free memory...")
+    del baseline
     import gc
     gc.collect()
     if "cuda" in args.device:
@@ -259,101 +228,72 @@ def main():
         torch.cuda.reset_peak_memory_stats(device=args.device)
     print("Done.\n")
 
-    # 3.5 Load and Benchmark KV Custom Model
-    print("Benchmarking model loading time for KV model...")
-    ours_kv, ours_kv_load_time = load_ours_kv(args.weight_dir, args.device)
-    print(f"  Ours KV loaded in {ours_kv_load_time:.2f} seconds.")
+    # 2. Load and Benchmark New Approach Model
+    print("Benchmarking model loading time...")
+    print("  Loading new approach model (model_update/)...")
+    new_model, new_load_time = load_new_approach(args.weight_dir, args.device)
+    print(f"  New Approach loaded in {new_load_time:.2f} seconds.")
     
-    ours_kv_peak_mem = 0
+    new_peak_mem = 0
     if "cuda" in args.device:
-        ours_kv_peak_mem = torch.cuda.max_memory_allocated(device=args.device) / (1024 ** 3)
+        new_peak_mem = torch.cuda.max_memory_allocated(device=args.device) / (1024 ** 3)
         torch.cuda.reset_peak_memory_stats(device=args.device)
 
-    print("Benchmarking single forward pass latency for KV custom model...")
+    print("Benchmarking single forward pass latency for new approach model...")
     for seq_len in seq_lengths:
         print(f"  Running sequence length {seq_len}...")
-        ours_kv_lats = benchmark_forward(ours_kv, args.device, seq_len, args.num_warmup, args.num_runs, is_hf=False)
-        ours_kv_mean, ours_kv_med, ours_kv_p95 = get_stats(ours_kv_lats)
-        forward_results[seq_len]["ours_kv"] = (ours_kv_mean * 1000, ours_kv_med * 1000, ours_kv_p95 * 1000)
+        new_lats = benchmark_forward(new_model, args.device, seq_len, args.num_warmup, args.num_runs)
+        new_mean, new_med, new_p95 = get_stats(new_lats)
+        forward_results[seq_len]["new"] = (new_mean * 1000, new_med * 1000, new_p95 * 1000)
     print("Done.\n")
 
-    print("Benchmarking full generation (diffusion decode) for KV custom model...")
-    ours_kv_gen_lats = benchmark_generation(
-        ours_kv, args.device, prompt_ids, args.gen_length, args.steps, 
-        args.block_length, args.num_warmup, args.num_runs, is_hf=False, is_kv=True
+    print("Benchmarking full generation (diffusion decode) for new approach model...")
+    new_gen_lats = benchmark_generation(
+        new_model, args.device, prompt_ids, args.gen_length, args.steps, 
+        args.block_length, args.num_warmup, args.num_runs, is_new=True
     )
-    ours_kv_gen_mean, ours_kv_gen_med, ours_kv_gen_p95 = get_stats(ours_kv_gen_lats)
-    ours_kv_tok_per_sec = args.gen_length / ours_kv_gen_mean
-    ours_kv_ms_per_step = (ours_kv_gen_mean * 1000) / args.steps
+    new_gen_mean, new_gen_med, new_gen_p95 = get_stats(new_gen_lats)
+    new_tok_per_sec = args.gen_length / new_gen_mean
+    new_ms_per_step = (new_gen_mean * 1000) / args.steps
     print("Done.\n")
 
-    print("Unloading KV custom model to free memory for Hugging Face model...")
-    del ours_kv
+    print("Unloading new approach model to free memory...")
+    del new_model
     gc.collect()
     if "cuda" in args.device:
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(device=args.device)
     print("Done.\n")
 
-    # 4. Load and Benchmark HF Model
-    print("  Loading Hugging Face model implementation...")
-    hf, hf_load_time = load_hf(args.weight_dir, args.device)
-    print(f"  HF loaded in {hf_load_time:.2f} seconds.")
-    
-    # Measure memory after loading HF
-    hf_peak_mem = 0
-    if "cuda" in args.device:
-        hf_peak_mem = torch.cuda.max_memory_allocated(device=args.device) / (1024 ** 3)
-        torch.cuda.reset_peak_memory_stats(device=args.device)
-
-    print("Benchmarking single forward pass latency for HF model...")
-    for seq_len in seq_lengths:
-        print(f"  Running sequence length {seq_len}...")
-        hf_lats = benchmark_forward(hf, args.device, seq_len, args.num_warmup, args.num_runs, is_hf=True)
-        hf_mean, hf_med, hf_p95 = get_stats(hf_lats)
-        forward_results[seq_len]["hf"] = (hf_mean * 1000, hf_med * 1000, hf_p95 * 1000)
-    print("Done.\n")
-
-    print("Benchmarking full generation (diffusion decode) for HF model...")
-    hf_gen_lats = benchmark_generation(
-        hf, args.device, prompt_ids, args.gen_length, args.steps, 
-        args.block_length, args.num_warmup, args.num_runs, is_hf=True
-    )
-    hf_gen_mean, hf_gen_med, hf_gen_p95 = get_stats(hf_gen_lats)
-    hf_tok_per_sec = args.gen_length / hf_gen_mean
-    hf_ms_per_step = (hf_gen_mean * 1000) / args.steps
-    print("Done.\n")
-
     # Output Results Table
-    print("=" * 110)
+    print("=" * 85)
     print("                           BENCHMARK RESULTS COMPARISON")
-    print("=" * 110)
-    print(f"| Metric / Test Case                | Custom Implementation | Custom w/ KV Cache | Hugging Face Ref  | Speedup (KV vs HF)|")
-    print(f"|-----------------------------------|-----------------------|--------------------|-------------------|-------------------|")
-    print(f"| Model Loading Time (sec)          | {ours_load_time:21.2f} | {ours_kv_load_time:18.2f} | {hf_load_time:17.2f} | {hf_load_time/ours_kv_load_time:16.2f}x |")
+    print("=" * 85)
+    print(f"| Metric / Test Case                | Baseline (src)        | New (model_update)    | Speedup |")
+    print(f"|-----------------------------------|-----------------------|-----------------------|---------|")
+    print(f"| Model Loading Time (sec)          | {baseline_load_time:21.2f} | {new_load_time:21.2f} | {baseline_load_time/new_load_time:6.2f}x |")
     if "cuda" in args.device:
-        print(f"| Peak GPU Memory Usage (GB)        | {ours_peak_mem:21.2f} | {ours_kv_peak_mem:18.2f} | {hf_peak_mem:17.2f} | {hf_peak_mem/ours_kv_peak_mem:16.2f}x |")
+        print(f"| Peak GPU Memory Usage (GB)        | {baseline_peak_mem:21.2f} | {new_peak_mem:21.2f} | {baseline_peak_mem/new_peak_mem:6.2f}x |")
     
-    print(f"|-----------------------------------|-----------------------|--------------------|-------------------|-------------------|")
+    print(f"|-----------------------------------|-----------------------|-----------------------|---------|")
     
     # Forward passes
     for seq_len in seq_lengths:
-        ours_mean, ours_med, ours_p95 = forward_results[seq_len]["ours"]
-        ours_kv_mean, ours_kv_med, ours_kv_p95 = forward_results[seq_len]["ours_kv"]
-        hf_mean, hf_med, hf_p95 = forward_results[seq_len]["hf"]
-        print(f"| Fwd Pass Latency ({seq_len:4d} tokens)   |                       |                    |                   |                   |")
-        print(f"|   - Mean (ms)                     | {ours_mean:21.2f} | {ours_kv_mean:18.2f} | {hf_mean:17.2f} | {hf_mean/ours_kv_mean:16.2f}x |")
-        print(f"|   - Median / p50 (ms)             | {ours_med:21.2f} | {ours_kv_med:18.2f} | {hf_med:17.2f} | {hf_med/ours_kv_med:16.2f}x |")
-        print(f"|   - p95 (ms)                      | {ours_p95:21.2f} | {ours_kv_p95:18.2f} | {hf_p95:17.2f} | {hf_p95/ours_kv_p95:16.2f}x |")
-        print(f"|-----------------------------------|-----------------------|--------------------|-------------------|-------------------|")
+        b_mean, b_med, b_p95 = forward_results[seq_len]["baseline"]
+        n_mean, n_med, n_p95 = forward_results[seq_len]["new"]
+        print(f"| Fwd Pass Latency ({seq_len:4d} tokens)   |                       |                       |         |")
+        print(f"|   - Mean (ms)                     | {b_mean:21.2f} | {n_mean:21.2f} | {b_mean/n_mean:6.2f}x |")
+        print(f"|   - Median / p50 (ms)             | {b_med:21.2f} | {n_med:21.2f} | {b_med/n_med:6.2f}x |")
+        print(f"|   - p95 (ms)                      | {b_p95:21.2f} | {n_p95:21.2f} | {b_p95/n_p95:6.2f}x |")
+        print(f"|-----------------------------------|-----------------------|-----------------------|---------|")
 
     # Generation metrics
-    print(f"| Generation Benchmark              |                       |                    |                   |                   |")
-    print(f"|   - Total Time (sec)              | {ours_gen_mean:21.2f} | {ours_kv_gen_mean:18.2f} | {hf_gen_mean:17.2f} | {hf_gen_mean/ours_kv_gen_mean:16.2f}x |")
-    print(f"|   - Time per Step (ms)            | {ours_ms_per_step:21.2f} | {ours_kv_ms_per_step:18.2f} | {hf_ms_per_step:17.2f} | {hf_ms_per_step/ours_kv_ms_per_step:16.2f}x |")
-    print(f"|   - Throughput (tokens/sec)       | {ours_tok_per_sec:21.2f} | {ours_kv_tok_per_sec:18.2f} | {hf_tok_per_sec:17.2f} | {ours_kv_tok_per_sec/hf_tok_per_sec:16.2f}x |")
-    print("=" * 110)
-    print("\nNote: Speedup > 1.0x indicates that the Custom KV implementation is faster than HF.")
+    print(f"| Generation Benchmark              |                       |                       |         |")
+    print(f"|   - Total Time (sec)              | {baseline_gen_mean:21.2f} | {new_gen_mean:21.2f} | {baseline_gen_mean/new_gen_mean:6.2f}x |")
+    print(f"|   - Time per Step (ms)            | {baseline_ms_per_step:21.2f} | {new_ms_per_step:21.2f} | {baseline_ms_per_step/new_ms_per_step:6.2f}x |")
+    print(f"|   - Throughput (tokens/sec)       | {baseline_tok_per_sec:21.2f} | {new_tok_per_sec:21.2f} | {new_tok_per_sec/baseline_tok_per_sec:6.2f}x |")
+    print("=" * 85)
+    print("\nNote: Speedup > 1.0x indicates that the New approach is faster than the Baseline.")
 
 
 if __name__ == "__main__":
