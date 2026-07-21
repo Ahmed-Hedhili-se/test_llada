@@ -157,20 +157,24 @@ class SparsePattern:
 
     def build_mask(self, layer_idx: int, q_positions: torch.Tensor,
                    k_positions: torch.Tensor, device) -> torch.Tensor:
-        """Returns bool mask [NH, Tq, Tk], True = attend."""
-        q = q_positions.view(-1, 1).to(device)
-        k = k_positions.view(1, -1).to(device)
-        dist = (q - k).abs()
-        masks = []
-        for h in range(self.num_heads):
-            w = int(self.window[layer_idx, h].item())
-            s = int(self.stride[layer_idx, h].item())
-            m = dist <= w
-            if s > 0:
-                glob = (k_positions.view(1, -1).to(device) % s == 0).expand_as(m)
-                m = m | glob
-            masks.append(m)
-        return torch.stack(masks, dim=0)
+        """Returns bool mask [NH, Tq, Tk], True = attend.
+
+        Fully vectorized across heads (no Python loop) — this runs on the
+        hot path (every denoising step, every layer), so per-call Python
+        overhead matters at the short sequence lengths typical of GSM8K-CoT
+        generation, where the actual attention math is already cheap.
+        """
+        q = q_positions.view(1, -1, 1).to(device)          # [1, Tq, 1]
+        k = k_positions.view(1, 1, -1).to(device)            # [1, 1, Tk]
+        dist = (q - k).abs()                                  # [1, Tq, Tk]
+
+        window = self.window[layer_idx].to(device).view(-1, 1, 1)   # [NH,1,1]
+        stride = self.stride[layer_idx].to(device).view(-1, 1, 1)   # [NH,1,1]
+
+        local = dist <= window                                # [NH, Tq, Tk]
+        stride_safe = torch.clamp(stride, min=1)
+        glob = (stride > 0) & ((k % stride_safe) == 0)         # [NH, 1, Tk] -> broadcasts
+        return local | glob                                    # [NH, Tq, Tk]
 
     def build_block_mask(self, layer_idx: int, q_positions: torch.Tensor,
                          k_positions: torch.Tensor, device):

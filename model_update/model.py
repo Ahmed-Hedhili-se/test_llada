@@ -398,10 +398,18 @@ class LLaDAMoE(nn.Module):
             sparse_mask = None
             if use_sparse:
                 k_positions = torch.cat([cached[2], q_positions]) if cached is not None else q_positions
-                try:
-                    sparse_mask = sparse_pattern.build_block_mask(li, q_positions, k_positions, device)
-                except Exception:
-                    sparse_mask = sparse_pattern.build_mask(li, q_positions, k_positions, device)
+                # NOTE: deliberately NOT using build_block_mask()/flex_attention here.
+                # create_block_mask() recompiles on (almost) every call because Q/K
+                # shapes change every denoising step (active suffix shrinks, cache
+                # grows). At GSM8K-CoT context lengths (~10^2 tokens) that per-step
+                # compile cost is far larger than the attention FLOPs it's meant to
+                # save — it's what was making "Cache + SparseD" slower than dense
+                # baseline. The plain boolean mask + fused SDPA below has no such
+                # overhead and is faster at this scale. Revisit flex_attention only
+                # if/when running at the long-context regime (10k+ tokens) the
+                # papers target, where block-sparse compute savings actually exceed
+                # compile cost.
+                sparse_mask = sparse_pattern.build_mask(li, q_positions, k_positions, device)
 
             x, k_new, v_new, aw = layer.forward_ext(
                 x, cos, sin, cached_kv=cached, sparse_mask=sparse_mask, need_weights=need_weights
