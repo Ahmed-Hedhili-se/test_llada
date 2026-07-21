@@ -1,10 +1,10 @@
 """
-Optimized LLaDA-MoE-7B-A1B with dynamic expert pruning + layer skipping.
+LLaDA-MoE-7B-A1B with dynamic expert pruning (Option A: conservative, accuracy-safe).
 
-Key changes:
-  - MoEBlock: dynamic_k and expert_threshold params
-  - Layer/LLaDAMoE: forward methods pass these through
-  - forward_active: accepts active_layers to skip layers in early steps
+Changes from original:
+  - MoEBlock.forward() accepts dynamic_k and expert_threshold
+  - Layer and LLaDAMoE pass these through to MoEBlock
+  - All other code UNCHANGED (attention, RoPE, weight loading identical)
 """
 
 import json
@@ -257,12 +257,7 @@ class LLaDAMoE(nn.Module):
         need_weights=False,
         dynamic_k=None,
         expert_threshold=0.0,
-        active_layers=None,
     ):
-        """
-        active_layers: list of layer indices to run. If None, run all layers.
-                       Layers not in the list are skipped (x passes through unchanged).
-        """
         B, Ta = active_ids.shape
         device = active_ids.device
         x = self.embed_tokens(active_ids)
@@ -276,17 +271,7 @@ class LLaDAMoE(nn.Module):
         new_kv = []
         all_attn = []
 
-        layers_to_run = active_layers if active_layers is not None else list(range(len(self.layers)))
-        layers_to_run_set = set(layers_to_run)
-
-        for li in range(len(self.layers)):
-            if li not in layers_to_run_set:
-                # Skip this layer: pass through unchanged
-                new_kv.append((None, None))
-                all_attn.append(None)
-                continue
-
-            layer = self.layers[li]
+        for li, layer in enumerate(self.layers):
             cache = layer_caches[li]
             cached = cache.get()
 

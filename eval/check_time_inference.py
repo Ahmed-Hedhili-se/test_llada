@@ -1,9 +1,13 @@
 """
-Inference benchmark comparing baseline vs optimized approaches.
+Option A Benchmark: Conservative speedup with accuracy safety.
 
-New configs added:
-  7. FAST DENSE CACHED (dense + cache + dynamic experts + layer skipping)
-  8. FAST DENSE CACHED AGGRESSIVE (min_k=2, threshold=0.08, skip 50% layers early)
+Compares:
+  1. Dense Baseline (src/)
+  2. Cache Only (model_update/ - original sparse path overhead)
+  3. Cache + SparseD (model_update/ - original sparse path + sparse attention)
+  4. Dynamic Experts + Cache + SparseD (model_update/ - your previous best)
+  5. FAST DENSE CACHED (NEW - no sparse overhead + conservative expert pruning)
+  6. FAST DENSE CACHED (no dynamic experts - pure overhead reduction)
 """
 
 import argparse
@@ -52,17 +56,16 @@ def benchmark_generation(model, device, prompt_ids, gen_length, steps, block_len
                          num_warmup, num_runs, is_new=False, **kwargs):
     if is_new:
         from model_update.generate import generate_sparse_cached, generate_dense_cached
-        # Use dense cached if no sparse_pattern and use_dynamic_experts is set
-        if kwargs.get("use_dense_cached", False):
+        use_dense = kwargs.pop("use_dense_cached", False)
+        if use_dense:
             gen_fn = lambda: generate_dense_cached(
-                model, prompt_ids, gen_length, steps, block_length, **{k: v for k, v in kwargs.items() if k != "use_dense_cached" and k != "is_new"}
+                model, prompt_ids, gen_length, steps, block_length, **kwargs
             )
         else:
             gen_fn = lambda: generate_sparse_cached(
-                model, prompt_ids, gen_length, steps, block_length, **{k: v for k, v in kwargs.items() if k != "is_new" and k != "use_dense_cached"}
+                model, prompt_ids, gen_length, steps, block_length, **kwargs
             )
     else:
-        # Baseline dense generation
         def diffusion_generate(model, prompt_ids, gen_length=64, steps=64, block_length=32):
             import numpy as np
             device = prompt_ids.device
@@ -140,7 +143,7 @@ def main():
     args = ap.parse_args()
 
     print(f"================================================================")
-    print(f" LLaDA-MoE Inference Speed Benchmark: 8-Way Comparison")
+    print(f" Option A Benchmark: Conservative Speedup (Accuracy-Safe)")
     print(f"================================================================")
     print(f"  Device           : {args.device}")
     print(f"  PyTorch Version  : {torch.__version__}")
@@ -188,42 +191,29 @@ def main():
 
     configs = []
 
-    # Original configs (for comparison)
-    configs.append(("2. CACHE ONLY", {
+    # Original configs for comparison
+    configs.append(("2. CACHE ONLY (original overhead)", {
         "is_new": True, "cache_budget": 2048, "saliency_update_interval": 8,
         "sparse_pattern": None, "use_dynamic_experts": False,
     }))
-    configs.append(("3. CACHE + SPARSED", {
+    configs.append(("3. CACHE + SPARSED (original)", {
         "is_new": True, "cache_budget": 2048, "saliency_update_interval": 8,
         "sparse_pattern": dummy_pattern, "use_dynamic_experts": False,
     }))
-    configs.append(("4. AGGRESSIVE FULL", {
-        "is_new": True, "cache_budget": 1024, "saliency_update_interval": 16,
-        "sparse_pattern": dummy_pattern, "use_dynamic_experts": False,
-    }))
-    configs.append(("5. DYNAMIC EXPERTS + CACHE + SPARSED", {
+    configs.append(("4. DYNAMIC EXPERTS + CACHE + SPARSED", {
         "is_new": True, "cache_budget": 2048, "saliency_update_interval": 8,
         "sparse_pattern": dummy_pattern, "use_dynamic_experts": True,
         "base_k": 8, "min_k": 4, "expert_threshold": 0.03,
     }))
 
-    # NEW: Fast dense cached configs (the real winners)
-    configs.append(("6. FAST DENSE CACHED (dyn experts, no sparse)", {
+    # NEW: Fast dense cached configs
+    configs.append(("5. FAST DENSE CACHED (no dyn experts)", {
         "is_new": True, "use_dense_cached": True, "cache_budget": 2048,
-        "use_dynamic_experts": True, "base_k": 8, "min_k": 4,
-        "expert_threshold": 0.03, "use_layer_skipping": False,
+        "use_dynamic_experts": False,
     }))
-    configs.append(("7. FAST DENSE CACHED + LAYER SKIP", {
+    configs.append(("6. FAST DENSE CACHED (conservative dyn experts)", {
         "is_new": True, "use_dense_cached": True, "cache_budget": 2048,
-        "use_dynamic_experts": True, "base_k": 8, "min_k": 2,
-        "expert_threshold": 0.05, "use_layer_skipping": True,
-        "layer_skip_threshold": 0.5,
-    }))
-    configs.append(("8. FAST DENSE CACHED AGGRESSIVE", {
-        "is_new": True, "use_dense_cached": True, "cache_budget": 2048,
-        "use_dynamic_experts": True, "base_k": 8, "min_k": 2,
-        "expert_threshold": 0.08, "use_layer_skipping": True,
-        "layer_skip_threshold": 0.6,
+        "use_dynamic_experts": True, "base_k": 8, "min_k": 4, "expert_threshold": 0.03,
     }))
 
     results = [("1. DENSE BASELINE", baseline_gen_mean, baseline_tok_per_sec)]
@@ -248,12 +238,12 @@ def main():
     print("=" * 130)
     print("                                   BENCHMARK RESULTS COMPARISON")
     print("=" * 130)
-    print(f"| {'Configuration':<45} | {'Time (sec)':>12} | {'Tok/sec':>10} | {'Speedup':>10} |")
-    print(f"|{'-'*45}|{'-'*14}|{'-'*12}|{'-'*12}|")
+    print(f"| {'Configuration':<50} | {'Time (sec)':>12} | {'Tok/sec':>10} | {'Speedup':>10} |")
+    print(f"|{'-'*50}|{'-'*14}|{'-'*12}|{'-'*12}|")
     baseline_time = results[0][1]
     for name, t, tps in results:
         speedup = baseline_time / t if t > 0 else 0
-        print(f"| {name:<45} | {t:>12.2f} | {tps:>10.2f} | {speedup:>9.2f}x |")
+        print(f"| {name:<50} | {t:>12.2f} | {tps:>10.2f} | {speedup:>9.2f}x |")
     print("=" * 130)
 
     best_name, best_time, best_tps = min(results[1:], key=lambda x: x[1])
@@ -261,6 +251,7 @@ def main():
     print(f"\n🏆 BEST CONFIG: {best_name}")
     print(f"   Speedup: {best_speedup:.2f}x vs baseline")
     print(f"   Time: {best_time:.2f}s | Throughput: {best_tps:.2f} tok/s")
+    print(f"\n💡 For accuracy validation, compare config #6 output to baseline on GSM8K.")
 
 if __name__ == "__main__":
     main()

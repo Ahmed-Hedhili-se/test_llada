@@ -1,12 +1,12 @@
 """
-Aggressively optimized masked diffusion generation for LLaDA-MoE.
+Option A: Conservative speedup with accuracy safety.
 
-Key optimizations (in order of impact):
-  1. LAYER SKIPPING: Skip every other layer in early denoising steps
-  2. DYNAMIC EXPERT PRUNING: Ramp from min_k to base_k within each block
-  3. FAST PATH: Minimal-overhead caching when sparse attention is disabled
-  4. TOKEN FREEZING: Don't recompute high-confidence finalized tokens
-  5. Sparse-dLLM + SparseD (kept for long-context scenarios)
+Adds:
+  1. generate_dense_cached() - fast path with NO sparse overhead
+  2. Dynamic expert pruning with SAFE defaults (min_k=4, threshold=0.03)
+  3. NO layer skipping (preserves full model depth)
+
+Original generate() and generate_sparse_cached() are kept unchanged.
 """
 
 import math
@@ -40,34 +40,19 @@ def get_num_transfer_tokens(mask_index, steps):
     return num_transfer
 
 
-def get_dynamic_k(step, steps_per_block, base_k=8, min_k=2):
-    """Ramp from min_k to base_k. More aggressive default: min_k=2."""
+def get_dynamic_k(step, steps_per_block, base_k=8, min_k=4):
+    """Conservative: ramp from 4 to 8 experts."""
     progress = step / max(steps_per_block - 1, 1)
     k = min_k + int((base_k - min_k) * progress)
     return max(k, 1)
 
 
-def get_expert_threshold(step, steps_per_block, expert_threshold=0.0, max_threshold=0.08):
-    """Higher threshold for more aggressive pruning."""
+def get_expert_threshold(step, steps_per_block, expert_threshold=0.0, max_threshold=0.05):
     if expert_threshold == 0.0:
         return 0.0
     progress = step / max(steps_per_block - 1, 1)
     threshold = max_threshold * (1.0 - progress)
     return max(expert_threshold, threshold)
-
-
-def get_active_layers(step, steps_per_block, num_layers=16, layer_skip_threshold=0.5):
-    """
-    Skip every other layer in early steps.
-    Returns a list of layer indices to actually run.
-    """
-    progress = step / max(steps_per_block - 1, 1)
-    if progress < layer_skip_threshold:
-        # Early steps: run only even layers (0, 2, 4, 6, 8, 10, 12, 14)
-        return list(range(0, num_layers, 2))
-    else:
-        # Late steps: run all layers
-        return list(range(num_layers))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -144,7 +129,7 @@ def generate(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# FAST generate_dense_cached() - caching WITHOUT sparse path overhead
+# NEW: generate_dense_cached() - Fast path, no sparse overhead
 # ═══════════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
@@ -159,16 +144,13 @@ def generate_dense_cached(
     remasking="low_confidence",
     use_dynamic_experts=True,
     base_k=8,
-    min_k=2,
-    expert_threshold=0.05,
-    use_layer_skipping=True,
-    layer_skip_threshold=0.5,
+    min_k=4,
+    expert_threshold=0.03,
 ):
     """
-    Dense attention + KV caching + dynamic expert pruning + layer skipping.
-    NO sparse attention overhead. NO saliency tracking. NO mask building.
-    This is the FAST path for short sequences where sparse attention
-    overhead exceeds its savings.
+    Dense attention + KV caching + dynamic expert pruning.
+    NO sparse attention. NO saliency tracking. NO mask building.
+    Minimal Python overhead. Accuracy-safe defaults.
     """
     assert gen_length % block_length == 0
     num_blocks = gen_length // block_length
@@ -179,12 +161,11 @@ def generate_dense_cached(
     NL = len(model.layers)
     layer_caches = [LayerKVCache(budget=cache_budget) for _ in range(NL)]
 
-    # Prefill
+    # Prefill (dense, full experts)
     _, new_kv0, positions0, _ = model.forward_active(
         prompt_ids, prefix_len=0, layer_caches=layer_caches,
         sparse_pattern=None, step=0, sparse_step_threshold=10**9,
         need_weights=False, dynamic_k=None, expert_threshold=0.0,
-        active_layers=list(range(NL)),
     )
     for li, cache in enumerate(layer_caches):
         cache.append(new_kv0[li][0], new_kv0[li][1], positions0, protected=False)
@@ -203,7 +184,7 @@ def generate_dense_cached(
             active_ids = x_active[:, block_start:]
             mask_index = (active_ids == MASK_ID)
 
-            # Dynamic expert pruning
+            # Dynamic expert pruning (conservative: 4->8)
             if use_dynamic_experts:
                 dynamic_k = get_dynamic_k(step, steps_per_block, base_k=base_k, min_k=min_k)
                 thresh = get_expert_threshold(step, steps_per_block, expert_threshold=expert_threshold)
@@ -211,17 +192,11 @@ def generate_dense_cached(
                 dynamic_k = None
                 thresh = 0.0
 
-            # Layer skipping
-            if use_layer_skipping:
-                active_layers = get_active_layers(step, steps_per_block, num_layers=NL, layer_skip_threshold=layer_skip_threshold)
-            else:
-                active_layers = list(range(NL))
-
-            logits, new_kv, q_positions, _ = model.forward_active(
+            # Dense attention, no sparse mask, no saliency tracking
+            logits, _, _, _ = model.forward_active(
                 active_ids, prefix_len=prefix_len, layer_caches=layer_caches,
                 sparse_pattern=None, step=step, sparse_step_threshold=10**9,
                 need_weights=False, dynamic_k=dynamic_k, expert_threshold=thresh,
-                active_layers=active_layers,
             )
 
             logits_with_noise = add_gumbel_noise(logits, temperature)
@@ -251,13 +226,12 @@ def generate_dense_cached(
             active_ids = torch.where(transfer_index, x0, active_ids)
             x_active[:, block_start:] = active_ids
 
-        # Commit block
+        # Commit block (dense, full experts)
         finished_ids = x_active[:, block_start:block_end]
         _, new_kv_final, positions_final, _ = model.forward_active(
             finished_ids, prefix_len=prefix_len, layer_caches=layer_caches,
             sparse_pattern=None, step=steps_per_block, sparse_step_threshold=10**9,
             need_weights=False, dynamic_k=None, expert_threshold=0.0,
-            active_layers=list(range(NL)),
         )
         for li, cache in enumerate(layer_caches):
             cache.append(new_kv_final[li][0], new_kv_final[li][1], positions_final, protected=False)
@@ -266,7 +240,7 @@ def generate_dense_cached(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Original generate_sparse_cached() - kept for long-context scenarios
+# Original generate_sparse_cached() - kept for comparison
 # ═══════════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
@@ -284,10 +258,9 @@ def generate_sparse_cached(
     remasking="low_confidence",
     use_dynamic_experts=True,
     base_k=8,
-    min_k=2,
-    expert_threshold=0.05,
+    min_k=4,
+    expert_threshold=0.03,
 ):
-    """Original sparse path with dynamic expert pruning."""
     assert gen_length % block_length == 0
     num_blocks = gen_length // block_length
     steps_per_block = steps // num_blocks
@@ -301,7 +274,6 @@ def generate_sparse_cached(
         prompt_ids, prefix_len=0, layer_caches=layer_caches,
         sparse_pattern=None, step=0, sparse_step_threshold=10**9,
         need_weights=False, dynamic_k=None, expert_threshold=0.0,
-        active_layers=list(range(NL)),
     )
     for li, cache in enumerate(layer_caches):
         cache.append(new_kv0[li][0], new_kv0[li][1], positions0, protected=False)
@@ -333,7 +305,6 @@ def generate_sparse_cached(
                 sparse_pattern=sparse_pattern, step=step,
                 sparse_step_threshold=sparse_step_threshold, need_weights=track_saliency,
                 dynamic_k=dynamic_k, expert_threshold=thresh,
-                active_layers=list(range(NL)),
             )
 
             if track_saliency:
@@ -378,7 +349,6 @@ def generate_sparse_cached(
             finished_ids, prefix_len=prefix_len, layer_caches=layer_caches,
             sparse_pattern=None, step=steps_per_block, sparse_step_threshold=10**9,
             need_weights=False, dynamic_k=None, expert_threshold=0.0,
-            active_layers=list(range(NL)),
         )
         for li, cache in enumerate(layer_caches):
             cache.append(new_kv_final[li][0], new_kv_final[li][1], positions_final, protected=False)
