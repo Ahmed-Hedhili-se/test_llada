@@ -1,13 +1,13 @@
 """
-Masked diffusion generation for LLaDA-MoE.
+Optimized masked diffusion generation for LLaDA-MoE with dynamic expert pruning.
 
-The model is NOT autoregressive. Generation works by:
-  1. Filling the response slots with MASK_ID tokens
-  2. Running multiple denoising steps, each time unmasking the
-     highest-confidence tokens in the current block
-  3. Iterating block-by-block (block_length tokens at a time)
+Integrates:
+  1. Dynamic expert pruning (reduce active experts in early/noisy steps)
+  2. Threshold-based expert filtering (drop negligible-weight experts)
+  3. Sparse-dLLM evictable KV cache (unchanged)
+  4. SparseD calibrated sparse attention patterns (unchanged)
 
-This mirrors the reference implementation from the HF model card exactly.
+The baseline generate() remains untouched as the correctness reference.
 """
 
 import math
@@ -30,17 +30,44 @@ def add_gumbel_noise(logits: torch.Tensor, temperature: float) -> torch.Tensor:
 
 
 def get_num_transfer_tokens(mask_index: torch.Tensor, steps: int) -> torch.Tensor:
-    """How many tokens to unmask at each step, distributed as evenly as possible."""
-    mask_num = mask_index.sum(dim=1, keepdim=True)           # [B, 1]
-    base      = mask_num // steps
+    mask_num = mask_index.sum(dim=1, keepdim=True)
+    base = mask_num // steps
     remainder = mask_num % steps
     num_transfer = torch.zeros(
         mask_num.size(0), steps, device=mask_index.device, dtype=torch.int64
     ) + base
     for i in range(mask_num.size(0)):
         num_transfer[i, : remainder[i]] += 1
-    return num_transfer                                        # [B, steps]
+    return num_transfer
 
+
+def get_dynamic_k(step: int, steps_per_block: int, base_k: int = 8, min_k: int = None) -> int:
+    """
+    Reduce active experts in early steps when tokens are noisy.
+    Ramps from min_k to base_k as denoising progresses within a block.
+    """
+    if min_k is None:
+        min_k = max(2, base_k // 2)
+    progress = step / max(steps_per_block - 1, 1)
+    k = min_k + int((base_k - min_k) * progress)
+    return k
+
+
+def get_expert_threshold(step: int, steps_per_block: int, base_threshold: float = 0.0, max_threshold: float = 0.05) -> float:
+    """
+    Apply threshold-based expert pruning in early steps.
+    Drops experts with softmax weight below threshold after top-k selection.
+    """
+    if base_threshold == 0.0:
+        return 0.0
+    progress = step / max(steps_per_block - 1, 1)
+    threshold = max_threshold * (1.0 - progress)
+    return max(base_threshold, threshold)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Baseline generate() - UNCHANGED (dense, no-cache correctness baseline)
+# ═══════════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
 def generate(
@@ -53,72 +80,52 @@ def generate(
     cfg_scale: float = 0.0,
     remasking: str = "low_confidence",
 ) -> torch.Tensor:
-    """
-    Args:
-        model        : LLaDAMoE instance (already on device, eval mode)
-        prompt_ids   : [1, P] long tensor of prompt token ids
-        gen_length   : number of tokens to generate
-        steps        : total denoising steps (split across blocks)
-        block_length : tokens per block; gen_length must be divisible by block_length
-        temperature  : Gumbel noise temperature (0 = greedy)
-        cfg_scale    : classifier-free guidance scale (0 = disabled)
-        remasking    : "low_confidence" or "random"
-
-    Returns:
-        generated token ids: [1, gen_length]
-    """
     assert gen_length % block_length == 0, "gen_length must be divisible by block_length"
-    num_blocks   = gen_length // block_length
+    num_blocks = gen_length // block_length
     steps_per_block = steps // num_blocks
 
     device = prompt_ids.device
     P = prompt_ids.shape[1]
 
-    # Full sequence: [prompt | MASK...MASK]
     x = torch.full((1, P + gen_length), MASK_ID, dtype=torch.long, device=device)
     x[:, :P] = prompt_ids
-    prompt_index = (x != MASK_ID)   # boolean mask: True where prompt tokens are
+    prompt_index = (x != MASK_ID)
 
     for block_idx in range(num_blocks):
         block_start = P + block_idx * block_length
-        block_end   = P + (block_idx + 1) * block_length
+        block_end = P + (block_idx + 1) * block_length
 
-        block_mask_index = (x[:, block_start:block_end] == MASK_ID)   # [1, block_length]
-        num_transfer = get_num_transfer_tokens(block_mask_index, steps_per_block)  # [1, steps]
+        block_mask_index = (x[:, block_start:block_end] == MASK_ID)
+        num_transfer = get_num_transfer_tokens(block_mask_index, steps_per_block)
 
         for step in range(steps_per_block):
-            mask_index = (x == MASK_ID)   # [1, L]
+            mask_index = (x == MASK_ID)
 
             if cfg_scale > 0.0:
-                # Classifier-free guidance: run once with prompt, once fully masked
                 un_x = x.clone()
                 un_x[prompt_index] = MASK_ID
-                x_cat = torch.cat([x, un_x], dim=0)          # [2, L]
-                logits = model(x_cat)                          # [2, L, V]
+                x_cat = torch.cat([x, un_x], dim=0)
+                logits = model(x_cat)
                 logits, un_logits = logits.chunk(2, dim=0)
                 logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
             else:
-                logits = model(x)                              # [1, L, V]
+                logits = model(x)
 
             logits_with_noise = add_gumbel_noise(logits, temperature)
-            x0 = logits_with_noise.argmax(dim=-1)             # [1, L]
+            x0 = logits_with_noise.argmax(dim=-1)
 
             if remasking == "low_confidence":
                 p = F.softmax(logits.float(), dim=-1)
-                x0_p = p.gather(-1, x0.unsqueeze(-1)).squeeze(-1)  # [1, L]
+                x0_p = p.gather(-1, x0.unsqueeze(-1)).squeeze(-1)
             elif remasking == "random":
                 x0_p = torch.rand(x0.shape, device=device)
             else:
                 raise ValueError(f"Unknown remasking: {remasking}")
 
-            # Don't consider tokens beyond the current block for transfer
             x0_p[:, block_end:] = -torch.inf
-
-            # Only update currently masked positions
-            x0    = torch.where(mask_index, x0, x)
+            x0 = torch.where(mask_index, x0, x)
             confidence = torch.where(mask_index, x0_p, torch.full_like(x0_p, -torch.inf))
 
-            # Pick the top-k highest-confidence masked tokens to unmask this step
             transfer_index = torch.zeros_like(x0, dtype=torch.bool)
             for j in range(confidence.shape[0]):
                 k = num_transfer[j, step].item()
@@ -128,98 +135,12 @@ def generate(
 
             x[transfer_index] = x0[transfer_index]
 
-    return x[:, P:]   # return only the generated tokens
+    return x[:, P:]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Sparse-dLLM (arXiv 2508.02558) + SparseD (arXiv 2509.24014) integration.
-#
-# generate() above is untouched and remains the fully-dense, no-cache
-# correctness baseline. Everything below is additive.
-#
-# Scoping note (carried over from the integration request): both papers'
-# published wins are largest at long context (tens of thousands of tokens,
-# hundreds+ of steps). GSM8K-CoT generations are short. `estimate_compute_savings`
-# below lets you sanity-check, from arithmetic alone, whether sparsity/eviction
-# are worth it at your *actual* generation lengths before trusting a full run.
+# Optimized generate_sparse_cached() with dynamic expert pruning
 # ═══════════════════════════════════════════════════════════════════════════
-
-
-@torch.no_grad()
-def calibrate_sparse_pattern(
-    model,
-    calibration_prompt_ids: list,
-    candidate_windows=(16, 32, 64, 128),
-    candidate_strides=(0, 16, 32, 64),
-    mass_threshold: float = 0.9,
-) -> SparsePattern:
-    """
-    SparseD-style one-time offline calibration.
-
-    For each (layer, head), sweep a small grid of (local window, global
-    stride) candidates and measure, on `calibration_prompt_ids` (a handful of
-    GSM8K-style prompts, run through the model with full dense attention),
-    what fraction of that head's attention mass each candidate captures.
-    Pick the cheapest candidate that clears `mass_threshold`; if none does,
-    fall back to whichever candidate captured the most mass. The resulting
-    SparsePattern is fixed and reused, unchanged, across every denoising step
-    (past `sparse_step_threshold`) and every future call to
-    generate_sparse_cached() — it is NOT recomputed per request.
-
-    calibration_prompt_ids: list of [1, T] long tensors (can be different T's;
-        calibration is done independently per prompt and averaged per-mass,
-        so mixed lengths are fine).
-    """
-    assert len(calibration_prompt_ids) > 0, "need at least one calibration prompt"
-
-    stats_sum = None
-    n_prompts = 0
-
-    for ids in calibration_prompt_ids:
-        _, all_attn = model.forward_with_attn(ids)   # list[NL] of [1, NH, T, T]
-        NL = len(all_attn)
-        NH = all_attn[0].shape[1]
-        if stats_sum is None:
-            stats_sum = torch.zeros(NL, NH, len(candidate_windows), len(candidate_strides))
-
-        for li, aw in enumerate(all_attn):
-            heads = aw[0]   # [NH, T, T]
-            for h in range(NH):
-                for wi, window in enumerate(candidate_windows):
-                    for si, stride in enumerate(candidate_strides):
-                        stats_sum[li, h, wi, si] += _candidate_mass(heads[h], window, stride)
-        n_prompts += 1
-
-    stats = stats_sum / n_prompts
-    NL, NH = stats.shape[0], stats.shape[1]
-    window_out = torch.zeros(NL, NH, dtype=torch.long)
-    stride_out = torch.zeros(NL, NH, dtype=torch.long)
-    max_stride_cost = max(candidate_windows)  # rough per-token "coverage cost" proxy for stride
-
-    for li in range(NL):
-        for h in range(NH):
-            best = None
-            for wi, window in enumerate(candidate_windows):
-                for si, stride in enumerate(candidate_strides):
-                    mass = stats[li, h, wi, si].item()
-                    if mass >= mass_threshold:
-                        # cheaper (smaller window, sparser stride) is better among
-                        # candidates that already meet the quality bar
-                        cost = window + (max_stride_cost // stride if stride > 0 else 0)
-                        if best is None or cost < best[0]:
-                            best = (cost, window, stride)
-            if best is None:
-                flat = stats[li, h].flatten()
-                idx = int(flat.argmax().item())
-                wi, si = divmod(idx, len(candidate_strides))
-                window, stride = candidate_windows[wi], candidate_strides[si]
-            else:
-                _, window, stride = best
-            window_out[li, h] = window
-            stride_out[li, h] = stride
-
-    return SparsePattern(NL, NH, window_out, stride_out)
-
 
 @torch.no_grad()
 def generate_sparse_cached(
@@ -234,37 +155,18 @@ def generate_sparse_cached(
     saliency_update_interval: int = 8,
     temperature: float = 0.0,
     remasking: str = "low_confidence",
+    # ── NEW: Dynamic expert pruning params ──
+    use_dynamic_experts: bool = True,
+    base_k: int = 8,
+    min_k: int = 4,
+    expert_threshold: float = 0.03,
 ) -> torch.Tensor:
     """
-    Sparse-dLLM (evictable saliency KV cache) + SparseD (calibrated per-head
-    sparse attention) version of generate(). Mirrors generate()'s block-wise
-    denoising algorithm exactly (add_gumbel_noise, get_num_transfer_tokens,
-    low-confidence remasking, block restriction) — only the attention
-    computation and caching differ.
-
-    Args:
-        sparse_pattern: SparsePattern from calibrate_sparse_pattern(), or None
-            to run with Sparse-dLLM eviction only (no SparseD sparsity).
-        sparse_step_threshold: the first `sparse_step_threshold` denoising
-            steps of *every* block use full dense attention (SparseD found
-            this necessary for quality); the calibrated sparse_pattern is
-            only applied from that step onward.
-        cache_budget: max cached (prompt + finalized-block) tokens per layer
-            before Sparse-dLLM eviction kicks in. None disables eviction
-            (plain, unbounded block-wise cache).
-
-    Approximation note (same as any block-wise dLLM cache): once a block is
-    finalized and its K/V committed to the cache, they are frozen — not
-    recomputed when later blocks change — even though exact bidirectional
-    attention would in principle let that happen. Do not expect a bit-exact
-    match with generate(); validate on the real GSM8K accuracy gate instead.
-
-    Note on cost: this path always computes attention with an explicit
-    softmax (not fused SDPA) so it can read off attention weights for
-    Sparse-dLLM's saliency updates and apply SparseD's mask. That is fine for
-    this correctness/accuracy prototype; a production version would need a
-    custom kernel to actually realize the FLOP savings (Phase 4, out of scope
-    here — see the integration notes).
+    Optimized generation with:
+      - Sparse-dLLM evictable KV cache
+      - SparseD calibrated sparse attention
+      - Dynamic expert pruning (reduce active experts in early steps)
+      - Threshold-based expert filtering
     """
     assert gen_length % block_length == 0, "gen_length must be divisible by block_length"
     num_blocks = gen_length // block_length
@@ -275,10 +177,11 @@ def generate_sparse_cached(
     NL = len(model.layers)
     layer_caches = [LayerKVCache(budget=cache_budget) for _ in range(NL)]
 
-    # ---- Prefill: cache the prompt (one-off, always dense) ----
+    # ── Prefill: cache the prompt (always dense, full experts) ──
     _, new_kv0, positions0, _ = model.forward_active(
         prompt_ids, prefix_len=0, layer_caches=layer_caches,
-        sparse_pattern=None, step=0, sparse_step_threshold=10 ** 9, need_weights=False,
+        sparse_pattern=None, step=0, sparse_step_threshold=10 ** 9,
+        need_weights=False, dynamic_k=None, expert_threshold=0.0,
     )
     for li, cache in enumerate(layer_caches):
         k_new, v_new = new_kv0[li]
@@ -289,24 +192,33 @@ def generate_sparse_cached(
     for block_idx in range(num_blocks):
         block_start = block_idx * block_length
         block_end = (block_idx + 1) * block_length
-        prefix_len = P + block_start   # already-cached prompt + finalized blocks
+        prefix_len = P + block_start
 
         block_mask_index = (x_active[:, block_start:block_end] == MASK_ID)
         num_transfer = get_num_transfer_tokens(block_mask_index, steps_per_block)
 
         for step in range(steps_per_block):
-            active_ids = x_active[:, block_start:]   # current block onward, not yet committed
+            active_ids = x_active[:, block_start:]
             mask_index = (active_ids == MASK_ID)
-            
+
             track_saliency = (step % saliency_update_interval == 0)
+
+            # ── NEW: Dynamic expert pruning ──
+            if use_dynamic_experts:
+                dynamic_k = get_dynamic_k(step, steps_per_block, base_k=base_k, min_k=min_k)
+                thresh = get_expert_threshold(step, steps_per_block, expert_threshold=expert_threshold)
+            else:
+                dynamic_k = None
+                thresh = 0.0
 
             logits, new_kv, q_positions, all_attn = model.forward_active(
                 active_ids, prefix_len=prefix_len, layer_caches=layer_caches,
                 sparse_pattern=sparse_pattern, step=step,
                 sparse_step_threshold=sparse_step_threshold, need_weights=track_saliency,
+                dynamic_k=dynamic_k, expert_threshold=thresh,
             )
 
-            # Sparse-dLLM: update saliency of the cached prefix, then evict.
+            # Sparse-dLLM: update saliency and evict
             if track_saliency:
                 for li, cache in enumerate(layer_caches):
                     cached = cache.get()
@@ -329,7 +241,7 @@ def generate_sparse_cached(
                 raise ValueError(f"Unknown remasking: {remasking}")
 
             local_block_end = block_end - block_start
-            x0_p[:, local_block_end:] = -torch.inf   # only the current block may transfer this step
+            x0_p[:, local_block_end:] = -torch.inf
 
             x0 = torch.where(mask_index, x0, active_ids)
             confidence = torch.where(mask_index, x0_p, torch.full_like(x0_p, -torch.inf))
@@ -344,70 +256,123 @@ def generate_sparse_cached(
             active_ids = torch.where(transfer_index, x0, active_ids)
             x_active[:, block_start:] = active_ids
 
-        # Block finished: commit its K/V into the cache (dense, using only the
-        # context available at commit time), then it drops out of "active".
+        # Block finished: commit K/V to cache (dense, full experts)
         finished_ids = x_active[:, block_start:block_end]
         _, new_kv_final, positions_final, _ = model.forward_active(
             finished_ids, prefix_len=prefix_len, layer_caches=layer_caches,
             sparse_pattern=None, step=steps_per_block, sparse_step_threshold=10 ** 9,
-            need_weights=False,
+            need_weights=False, dynamic_k=None, expert_threshold=0.0,
         )
         for li, cache in enumerate(layer_caches):
             k_new, v_new = new_kv_final[li]
             cache.append(k_new, v_new, positions_final, protected=False)
-            
+
         print(f"  [Block {block_idx+1}/{num_blocks}] Cache size (layer 0): {len(layer_caches[0])} tokens")
 
-    return x_active[:, :]   # full x_active IS the generated tokens (no prompt prefix in it)
+    return x_active[:, :]
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Calibration (unchanged from original)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@torch.no_grad()
+def calibrate_sparse_pattern(
+    model,
+    calibration_prompt_ids: list,
+    candidate_windows=(16, 32, 64, 128),
+    candidate_strides=(0, 16, 32, 64),
+    mass_threshold: float = 0.9,
+) -> SparsePattern:
+    assert len(calibration_prompt_ids) > 0, "need at least one calibration prompt"
+
+    stats_sum = None
+    n_prompts = 0
+
+    for ids in calibration_prompt_ids:
+        _, all_attn = model.forward_with_attn(ids)
+        NL = len(all_attn)
+        NH = all_attn[0].shape[1]
+        if stats_sum is None:
+            stats_sum = torch.zeros(NL, NH, len(candidate_windows), len(candidate_strides))
+
+        for li, aw in enumerate(all_attn):
+            heads = aw[0]
+            for h in range(NH):
+                for wi, window in enumerate(candidate_windows):
+                    for si, stride in enumerate(candidate_strides):
+                        stats_sum[li, h, wi, si] += _candidate_mass(heads[h], window, stride)
+        n_prompts += 1
+
+    stats = stats_sum / n_prompts
+    NL, NH = stats.shape[0], stats.shape[1]
+    window_out = torch.zeros(NL, NH, dtype=torch.long)
+    stride_out = torch.zeros(NL, NH, dtype=torch.long)
+    max_stride_cost = max(candidate_windows)
+
+    for li in range(NL):
+        for h in range(NH):
+            best = None
+            for wi, window in enumerate(candidate_windows):
+                for si, stride in enumerate(candidate_strides):
+                    mass = stats[li, h, wi, si].item()
+                    if mass >= mass_threshold:
+                        cost = window + (max_stride_cost // stride if stride > 0 else 0)
+                        if best is None or cost < best[0]:
+                            best = (cost, window, stride)
+            if best is None:
+                flat = stats[li, h].flatten()
+                idx = int(flat.argmax().item())
+                wi, si = divmod(idx, len(candidate_strides))
+                window, stride = candidate_windows[wi], candidate_strides[si]
+            else:
+                _, window, stride = best
+            window_out[li, h] = window
+            stride_out[li, h] = stride
+
+    return SparsePattern(NL, NH, window_out, stride_out)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Compute savings estimator (updated with dynamic expert pruning)
+# ═══════════════════════════════════════════════════════════════════════════
 
 def estimate_compute_savings(
     prompt_len: int,
     gen_length: int,
     block_length: int,
     steps: int,
-    sparse_step_threshold: int,
-    avg_window: float,
-    avg_stride: float,
+    sparse_step_threshold: int = 4,
+    avg_window: float = 32.0,
+    avg_stride: float = 16.0,
     cache_budget: int = None,
+    use_dynamic_experts: bool = True,
+    base_k: int = 8,
+    min_k: int = 4,
 ) -> dict:
-    """
-    Back-of-envelope attention compute-volume comparison (# of query-key pairs
-    scored, summed over all denoising steps) for generate() vs
-    generate_sparse_cached(), at a given (prompt_len, gen_length, block_length,
-    steps) configuration. No model forward passes — pure arithmetic — so you
-    can quickly check, per the integration notes, whether the papers' wins
-    (reported at 64k context / 1024 steps) still show up at your actual
-    GSM8K-CoT lengths before trusting a full run.
-
-    avg_window / avg_stride: rough averages of the calibrated SparsePattern's
-        per-head window/stride (e.g. pattern.window.float().mean().item()).
-    """
     assert gen_length % block_length == 0
     num_blocks = gen_length // block_length
     steps_per_block = steps // num_blocks
 
     dense_pairs = 0
     sparse_pairs = 0
-    cached_pairs = 0   # generate_sparse_cached with caching but no SparseD sparsity
+    cached_pairs = 0
+    dense_expert_flops = 0
+    sparse_expert_flops = 0
 
     for b in range(num_blocks):
         block_start = b * block_length
-        seq_len_dense = prompt_len + gen_length         # generate(): always full sequence
-        active_len = gen_length - block_start            # generate_sparse_cached(): active suffix only
+        seq_len_dense = prompt_len + gen_length
+        active_len = gen_length - block_start
         prefix_len = prompt_len + block_start
 
         for step in range(steps_per_block):
-            # Dense baseline: full [seq_len, seq_len] attention every step.
             dense_pairs += seq_len_dense * seq_len_dense
 
-            # Cached, still-dense-attention version: active queries attend to
-            # (possibly evicted) cached prefix + active keys.
             cached_prefix_len = min(prefix_len, cache_budget) if cache_budget else prefix_len
             keys_len = cached_prefix_len + active_len
             cached_pairs += active_len * keys_len
 
-            # Cached + SparseD sparsity, once the step threshold is passed.
             if step >= sparse_step_threshold:
                 stride_term = (keys_len / avg_stride) if avg_stride > 0 else 0.0
                 per_query_keys = min(keys_len, 2 * avg_window + stride_term)
@@ -415,10 +380,22 @@ def estimate_compute_savings(
             else:
                 sparse_pairs += active_len * keys_len
 
+            dense_expert_flops += seq_len_dense * base_k
+
+            if use_dynamic_experts:
+                progress = step / max(steps_per_block - 1, 1)
+                k_eff = min_k + (base_k - min_k) * progress
+            else:
+                k_eff = base_k
+            sparse_expert_flops += active_len * k_eff
+
     return {
         "dense_pairs": dense_pairs,
         "cached_only_pairs": cached_pairs,
         "cached_plus_sparse_pairs": sparse_pairs,
+        "dense_expert_flops": dense_expert_flops,
+        "sparse_expert_flops": sparse_expert_flops,
         "cached_speedup_vs_dense": dense_pairs / max(cached_pairs, 1),
         "cached_plus_sparse_speedup_vs_dense": dense_pairs / max(sparse_pairs, 1),
+        "expert_speedup_from_dynamic": dense_expert_flops / max(sparse_expert_flops, 1),
     }
