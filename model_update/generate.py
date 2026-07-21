@@ -15,7 +15,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from kv_cache import LayerKVCache, SparsePattern, _candidate_mass
+from model_update.kv_cache import LayerKVCache, SparsePattern, _candidate_mass
 
 MASK_ID = 156895
 
