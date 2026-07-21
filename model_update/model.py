@@ -176,25 +176,30 @@ class Attention(nn.Module):
             k_full, v_full = k, v
 
         attn_weights = None
+        is_block_mask = sparse_mask is not None and not isinstance(sparse_mask, torch.Tensor)
+        
         if need_weights:
             scale = 1.0 / math.sqrt(HD)
             scores = torch.matmul(q, k_full.transpose(-2, -1)) * scale   # [B,NH,T,Nk]
             if sparse_mask is not None:
-                if hasattr(sparse_mask, "materialize"):
-                    m = sparse_mask.materialize((1, NH, T, k_full.size(2)))
-                    scores = scores.masked_fill(~m, float("-inf"))
+                if is_block_mask:
+                    # Materialize BlockMask to a boolean tensor for the manual path
+                    bool_mask = sparse_mask.to_dense()  # [1, NH, Tq, Tk] or similar
+                    if bool_mask.dim() == 4:
+                        scores = scores.masked_fill(~bool_mask, float("-inf"))
+                    else:
+                        scores = scores.masked_fill(~bool_mask.unsqueeze(0), float("-inf"))
                 else:
                     scores = scores.masked_fill(~sparse_mask.unsqueeze(0), float("-inf"))
             attn_weights = torch.softmax(scores.float(), dim=-1).to(q.dtype)
             out = torch.matmul(attn_weights, v_full)
         elif sparse_mask is not None:
-            if hasattr(sparse_mask, "materialize"):
+            if is_block_mask:
                 # flex_attention: real block-level FLOP savings
                 from torch.nn.attention.flex_attention import flex_attention
                 out = flex_attention(q, k_full, v_full, block_mask=sparse_mask)
             else:
                 # Fallback: use SDPA with an additive float mask from the boolean mask.
-                # This keeps the fused kernel while zeroing out masked positions.
                 float_mask = torch.zeros(1, NH, T, k_full.size(2), dtype=q.dtype, device=q.device)
                 float_mask.masked_fill_(~sparse_mask.unsqueeze(0), float("-inf"))
                 out = F.scaled_dot_product_attention(q, k_full, v_full, attn_mask=float_mask, is_causal=False)
