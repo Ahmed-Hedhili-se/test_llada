@@ -157,8 +157,7 @@ def chat_completions(req: ChatRequest):
                 cache_budget=2048,
                 use_dynamic_experts=True,
                 base_k=8,
-                min_k=4,
-                expert_threshold=0.03,
+                min_k=5,
             )
         elif BACKEND == "dyn_experts":
             # Sparse path + dynamic expert pruning
@@ -175,8 +174,7 @@ def chat_completions(req: ChatRequest):
                 sparse_pattern=None,
                 use_dynamic_experts=True,
                 base_k=8,
-                min_k=4,
-                expert_threshold=0.03,
+                min_k=5,
             )
         elif BACKEND == "hf":
             # Use standard HuggingFace generate

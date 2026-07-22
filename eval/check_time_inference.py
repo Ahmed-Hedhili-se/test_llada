@@ -180,13 +180,13 @@ def main():
         "is_new": True, "use_dynamic_experts": False,
     }))
     configs.append(("3. CACHE + DYNAMIC EXPERTS (min_k=4)", {
-        "is_new": True, "use_dynamic_experts": True, "min_k": 4, "base_k": 8, "expert_threshold": 0.0,
+        "is_new": True, "use_dynamic_experts": True, "min_k": 4, "base_k": 8,
     }))
     configs.append(("4. CACHE + DYNAMIC EXPERTS (min_k=5)", {
-        "is_new": True, "use_dynamic_experts": True, "min_k": 5, "base_k": 8, "expert_threshold": 0.0,
+        "is_new": True, "use_dynamic_experts": True, "min_k": 5, "base_k": 8,
     }))
     configs.append(("5. CACHE + DYNAMIC EXPERTS (min_k=6)", {
-        "is_new": True, "use_dynamic_experts": True, "min_k": 6, "base_k": 8, "expert_threshold": 0.0,
+        "is_new": True, "use_dynamic_experts": True, "min_k": 6, "base_k": 8,
     }))
 
     results = [("1. DENSE BASELINE", baseline_gen_mean, baseline_tok_per_sec, "0.00%")]

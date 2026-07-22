@@ -14,25 +14,22 @@ from model_update.generate import generate_cached
 
 
 def run_real_activation_diagnostic():
-    parser = argparse.ArgumentParser(description="Real Activation Expert Pruning Diagnostic")
+    parser = argparse.ArgumentParser(description="Real Activation Routing Diagnostic")
     parser.add_argument("--weight-dir", type=str, default="weights")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--gen-length", type=int, default=64)
     parser.add_argument("--steps", type=int, default=64)
     parser.add_argument("--block-length", type=int, default=32)
     parser.add_argument("--base-k", type=int, default=8)
-    parser.add_argument("--min-k", type=int, default=4)
-    parser.add_argument("--expert-threshold", type=float, default=0.03)
-    parser.add_argument("--max-threshold", type=float, default=0.05)
+    parser.add_argument("--min-k", type=int, default=5)
     args = parser.parse_args()
 
     print("================================================================")
-    print(" Real-Activation Expert Pruning & Zero-Expert Diagnostic")
+    print(" Real-Activation Routing Diagnostic")
     print("================================================================")
     print(f" Device          : {args.device}")
     print(f" Weight Dir      : {args.weight_dir}")
     print(f" Dynamic K Ramp  : min_k={args.min_k} -> base_k={args.base_k}")
-    print(f" Threshold Ramp  : max_thresh={args.max_threshold} -> min_thresh={args.expert_threshold}")
     print("================================================================\n")
 
     if not os.path.exists(args.weight_dir) or not os.path.isdir(args.weight_dir):
@@ -65,29 +62,22 @@ def run_real_activation_diagnostic():
             
             # Retrieve routing weights and top-k selection
             rw = F.softmax(module.gate(x_flat), dim=-1, dtype=torch.float32)
-            # Find current dynamic_k from threshold
-            # Since module doesn't store step, we inspect actual non-zero counts
-            # or calculate from current forward pass
-            k = module.cfg.TOPK # Default top-k fallback or inspect active
+            k = module.cfg.TOPK
             rw_top, sel = torch.topk(rw, k, dim=-1)
             
-            # Apply thresholding
-            keep = rw_top > args.expert_threshold
-            one_hot = F.one_hot(sel, num_classes=module.cfg.NE) * keep.unsqueeze(-1)
-            expert_mask = one_hot.permute(2, 1, 0)
-            
-            # Count experts per token
-            experts_per_token = expert_mask.sum(dim=(0, 1)) # shape [B*T]
-            zero_expert_tokens = (experts_per_token == 0).sum().item()
-            avg_experts = experts_per_token.float().mean().item()
+            # Measure routing weight distribution (no thresholding)
+            avg_top1_weight = rw_top[:, 0].mean().item()
+            avg_topk_weight = rw_top.mean().item()
+            routing_entropy = -(rw * (rw + 1e-10).log()).sum(dim=-1).mean().item()
             total_tokens = B_in * T_in
             
             if layer_idx not in stats_per_layer:
                 stats_per_layer[layer_idx] = []
             stats_per_layer[layer_idx].append({
                 "total_tokens": total_tokens,
-                "zero_expert_tokens": zero_expert_tokens,
-                "avg_experts": avg_experts,
+                "avg_top1_weight": avg_top1_weight,
+                "avg_topk_weight": avg_topk_weight,
+                "routing_entropy": routing_entropy,
             })
         return hook
 
@@ -104,36 +94,36 @@ def run_real_activation_diagnostic():
             use_dynamic_experts=True,
             base_k=args.base_k,
             min_k=args.min_k,
-            expert_threshold=args.expert_threshold,
-            max_threshold=args.max_threshold,
         )
 
     for h in hooks:
         h.remove()
 
     print("\n================ DIAGNOSTIC REPORT ON REAL ACTIVATIONS ================")
-    all_zero_tokens = 0
-    all_total_tokens = 0
-    all_avg_experts = []
+    all_avg_top1 = []
+    all_avg_topk = []
+    all_entropy = []
 
     for l_idx in sorted(stats_per_layer.keys()):
         records = stats_per_layer[l_idx]
-        layer_zero = sum(r["zero_expert_tokens"] for r in records)
-        layer_toks = sum(r["total_tokens"] for r in records)
-        layer_avg_e = sum(r["avg_experts"] for r in records) / len(records)
+        layer_avg_top1 = sum(r["avg_top1_weight"] for r in records) / len(records)
+        layer_avg_topk = sum(r["avg_topk_weight"] for r in records) / len(records)
+        layer_entropy = sum(r["routing_entropy"] for r in records) / len(records)
         
-        all_zero_tokens += layer_zero
-        all_total_tokens += layer_toks
-        all_avg_experts.append(layer_avg_e)
+        all_avg_top1.append(layer_avg_top1)
+        all_avg_topk.append(layer_avg_topk)
+        all_entropy.append(layer_entropy)
         
-        print(f"Layer {l_idx:02d}: Avg Experts/Token = {layer_avg_e:.2f} | Zero-Expert Tokens = {layer_zero}/{layer_toks} ({(layer_zero/layer_toks)*100:.4f}%)")
+        print(f"Layer {l_idx:02d}: Avg Top-1 Wt = {layer_avg_top1:.4f} | Avg Top-k Wt = {layer_avg_topk:.4f} | Routing Entropy = {layer_entropy:.4f}")
 
-    overall_avg_experts = sum(all_avg_experts) / len(all_avg_experts)
-    overall_zero_pct = (all_zero_tokens / max(all_total_tokens, 1)) * 100
+    overall_top1 = sum(all_avg_top1) / len(all_avg_top1)
+    overall_topk = sum(all_avg_topk) / len(all_avg_topk)
+    overall_entropy = sum(all_entropy) / len(all_entropy)
 
     print("----------------------------------------------------------------------")
-    print(f"OVERALL MEAN EXPERTS PER TOKEN : {overall_avg_experts:.2f} / {args.base_k}")
-    print(f"TOTAL ZERO-EXPERT TOKENS       : {all_zero_tokens}/{all_total_tokens} ({overall_zero_pct:.4f}%)")
+    print(f"OVERALL AVG TOP-1 WEIGHT    : {overall_top1:.4f}")
+    print(f"OVERALL AVG TOP-K WEIGHT    : {overall_topk:.4f}")
+    print(f"OVERALL ROUTING ENTROPY     : {overall_entropy:.4f}")
     print("======================================================================\n")
 
     decoded = tok.decode(out[0], skip_special_tokens=True)

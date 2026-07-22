@@ -37,7 +37,7 @@ def get_num_transfer_tokens(mask_index: torch.Tensor, steps: int) -> torch.Tenso
         num_transfer[i, : remainder[i]] += 1
     return num_transfer
 
-def get_dynamic_k(step, steps_per_block, base_k=8, min_k=4):
+def get_dynamic_k(step, steps_per_block, base_k=8, min_k=5):
     """Conservative: ramp from min_k to base_k experts."""
     progress = step / max(steps_per_block - 1, 1)
     k = min_k + (base_k - min_k) * progress
@@ -54,9 +54,7 @@ def _generate_block_cached(
     remasking: str,
     use_dynamic_experts: bool = False,
     base_k: int = 8,
-    min_k: int = 4,
-    expert_threshold: float = 0.0,
-    max_threshold: float = 0.0,
+    min_k: int = 5,
 ):
     block_length = block_end - block_start
     device = x.device
@@ -71,17 +69,14 @@ def _generate_block_cached(
 
         if use_dynamic_experts:
             dynamic_k = get_dynamic_k(step, steps_per_block, base_k, min_k)
-            thresh = 0.0  # expert_threshold disabled per safety mandate
         else:
             dynamic_k = None
-            thresh = 0.0
 
         suffix_logits, _ = model(
             suffix_ids,
             position_offset=block_start,
             past_kv=cache,
             dynamic_k=dynamic_k,
-            expert_threshold=thresh
         )
         logits = suffix_logits[:, :block_length]
 
@@ -116,7 +111,6 @@ def _generate_block_cached(
         position_offset=block_start,
         past_kv=cache,
         dynamic_k=None,
-        expert_threshold=0.0
     )
     cache = concat_kv(cache, new_kv)
     
@@ -134,9 +128,7 @@ def generate_cached(
     remasking: str = "low_confidence",
     use_dynamic_experts: bool = False,
     base_k: int = 8,
-    min_k: int = 4,
-    expert_threshold: float = 0.0,
-    max_threshold: float = 0.0,
+    min_k: int = 5,
 ) -> torch.Tensor:
     """
     Same signature/semantics as generate.generate(), minus cfg_scale
@@ -172,8 +164,6 @@ def generate_cached(
             use_dynamic_experts=use_dynamic_experts,
             base_k=base_k,
             min_k=min_k,
-            expert_threshold=expert_threshold,
-            max_threshold=max_threshold
         )
 
     return x[:, P:]

@@ -149,7 +149,7 @@ class MoEBlock(nn.Module):
         self.gate = nn.Linear(cfg.H, cfg.NE, bias=False)
         self.experts = nn.ModuleList([ExpertMLP(cfg) for _ in range(cfg.NE)])
 
-    def forward(self, x, dynamic_k: Optional[int] = None, expert_threshold: float = 0.0):
+    def forward(self, x, dynamic_k: Optional[int] = None):
         cfg = self.cfg
         B, T, _ = x.shape
         x_flat = x.view(B * T, cfg.H)
@@ -157,21 +157,7 @@ class MoEBlock(nn.Module):
         routing_weights = F.softmax(self.gate(x_flat), dim=-1, dtype=torch.float32)
         k = dynamic_k if dynamic_k is not None else cfg.TOPK
         routing_weights, selected_experts = torch.topk(routing_weights, k, dim=-1)
-        
-        if expert_threshold > 0:
-            keep = routing_weights > expert_threshold
-            # Hard Safety Floor: Ensure every token retains at least 1 expert (highest weighted)
-            zero_expert_tokens = (keep.sum(dim=-1) == 0)
-            if zero_expert_tokens.any():
-                keep[zero_expert_tokens, 0] = True
-
-            routing_weights = routing_weights * keep
-            sum_w = routing_weights.sum(dim=-1, keepdim=True).clamp(min=1e-9)
-            routing_weights = routing_weights / sum_w
-            one_hot = F.one_hot(selected_experts, num_classes=cfg.NE) * keep.unsqueeze(-1)
-            expert_mask = one_hot.permute(2, 1, 0)
-        else:
-            expert_mask = F.one_hot(selected_experts, num_classes=cfg.NE).permute(2, 1, 0)
+        expert_mask = F.one_hot(selected_experts, num_classes=cfg.NE).permute(2, 1, 0)
 
         routing_weights = routing_weights.to(x.dtype)
 
@@ -196,10 +182,10 @@ class Layer(nn.Module):
         self.post_attention_layernorm = RMSNorm(cfg.H, cfg.EPS)
         self.mlp = MoEBlock(cfg)
 
-    def forward(self, x, cos, sin, past_kv=None, dynamic_k: Optional[int] = None, expert_threshold: float = 0.0):
+    def forward(self, x, cos, sin, past_kv=None, dynamic_k: Optional[int] = None):
         attn_out, kv_new = self.self_attn(self.input_layernorm(x), cos, sin, past_kv)
         x = x + attn_out
-        x = x + self.mlp(self.post_attention_layernorm(x), dynamic_k=dynamic_k, expert_threshold=expert_threshold)
+        x = x + self.mlp(self.post_attention_layernorm(x), dynamic_k=dynamic_k)
         return x, kv_new
 
 
@@ -218,7 +204,6 @@ class LLaDAMoEKV(nn.Module):
         position_offset: int = 0,
         past_kv: Optional[KVCache] = None,
         dynamic_k: Optional[int] = None,
-        expert_threshold: float = 0.0,
     ):
         """
         input_ids: [B, T] — either the full sequence (past_kv=None, e.g. prefix
@@ -226,7 +211,7 @@ class LLaDAMoEKV(nn.Module):
         position_offset: absolute starting position of input_ids in the full
                    sequence, for correct RoPE.
         past_kv: list of (k,v) per layer for the prefix, or None.
-        topk_override: override the number of activated experts for this call.
+        dynamic_k: override the number of activated experts for this call.
         Returns: logits [B, T, VS] for input_ids positions only, and
                  new_kv: list of (k,v) per layer for input_ids' own tokens
                  (caller decides whether/when to append these to the cache).
@@ -244,7 +229,7 @@ class LLaDAMoEKV(nn.Module):
         new_kv: KVCache = []
         for i, layer in enumerate(self.layers):
             layer_past = past_kv[i] if past_kv is not None else None
-            x, kv_i = layer(x, cos, sin, layer_past, dynamic_k=dynamic_k, expert_threshold=expert_threshold)
+            x, kv_i = layer(x, cos, sin, layer_past, dynamic_k=dynamic_k)
             new_kv.append(kv_i)
 
         x = self.norm(x)

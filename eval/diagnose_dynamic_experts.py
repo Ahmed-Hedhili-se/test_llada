@@ -23,7 +23,7 @@ def set_seed(seed: int):
 
 
 def run_diagnostic():
-    parser = argparse.ArgumentParser(description="Token-level correctness & real activation diagnostic for Dynamic Experts")
+    parser = argparse.ArgumentParser(description="Token-level correctness & routing diagnostic for Dynamic Experts")
     parser.add_argument("--weight-dir", type=str, default="weights")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--gen-length", type=int, default=128)
@@ -31,19 +31,17 @@ def run_diagnostic():
     parser.add_argument("--block-length", type=int, default=32)
     parser.add_argument("--num-trials", type=int, default=5)
     parser.add_argument("--base-k", type=int, default=8)
-    parser.add_argument("--min-k", type=int, default=4)
-    parser.add_argument("--expert-threshold", type=float, default=0.03)
+    parser.add_argument("--min-k", type=int, default=5)
     args = parser.parse_args()
 
     print("================================================================")
-    print(" Diagnostic: Token Divergence & Real Activation Pruning")
+    print(" Diagnostic: Token Divergence & Routing Statistics")
     print("================================================================")
     print(f" Device          : {args.device}")
     print(f" Generation L    : {args.gen_length}")
     print(f" Block Length    : {args.block_length}")
     print(f" Total Steps     : {args.steps}")
     print(f" Dynamic K Ramp  : min_k={args.min_k} -> base_k={args.base_k}")
-    print(f" Expert Threshold: {args.expert_threshold}")
     print(f" Number of Trials: {args.num_trials}")
     print("================================================================\n")
 
@@ -79,7 +77,7 @@ def run_diagnostic():
     num_blocks = args.gen_length // args.block_length
     trial_divergence_rates = []
 
-    # Real activation pruning statistics hooks
+    # Routing statistics hooks (measure expert distribution without thresholding)
     stats_per_layer = {}
 
     def make_moe_hook(layer_idx):
@@ -92,21 +90,17 @@ def run_diagnostic():
             k = module.cfg.TOPK
             rw_top, sel = torch.topk(rw, k, dim=-1)
             
-            keep = rw_top > args.expert_threshold
-            one_hot = F.one_hot(sel, num_classes=module.cfg.NE) * keep.unsqueeze(-1)
-            expert_mask = one_hot.permute(2, 1, 0)
-            
-            experts_per_token = expert_mask.sum(dim=(0, 1))
-            zero_expert_tokens = (experts_per_token == 0).sum().item()
-            avg_experts = experts_per_token.float().mean().item()
+            avg_experts = k  # All top-k experts are always active (no thresholding)
+            avg_top1_weight = rw_top[:, 0].mean().item()
+            avg_topk_weight = rw_top.mean().item()
             total_tokens = B_in * T_in
             
             if layer_idx not in stats_per_layer:
                 stats_per_layer[layer_idx] = []
             stats_per_layer[layer_idx].append({
                 "total_tokens": total_tokens,
-                "zero_expert_tokens": zero_expert_tokens,
-                "avg_experts": avg_experts,
+                "avg_top1_weight": avg_top1_weight,
+                "avg_topk_weight": avg_topk_weight,
             })
         return hook
 
@@ -129,7 +123,7 @@ def run_diagnostic():
             use_dynamic_experts=False,
         )
 
-        # 2. Dynamic Experts (use_dynamic_experts=True) with activation hooks
+        # 2. Dynamic Experts (use_dynamic_experts=True) with routing hooks
         hooks = [layer.mlp.register_forward_hook(make_moe_hook(i)) for i, layer in enumerate(model.layers)]
         set_seed(seed)
         out_dyn = generate_cached(
@@ -141,7 +135,6 @@ def run_diagnostic():
             use_dynamic_experts=True,
             base_k=args.base_k,
             min_k=args.min_k,
-            expert_threshold=args.expert_threshold,
         )
         for h in hooks:
             h.remove()
@@ -176,29 +169,14 @@ def run_diagnostic():
     print("=========================================================================")
 
     if stats_per_layer:
-        print("\n================ DIAGNOSTIC 2: REAL ACTIVATION PRUNING REPORT ===========")
-        all_zero_tokens = 0
-        all_total_tokens = 0
-        all_avg_experts = []
-
+        print("\n================ DIAGNOSTIC 2: ROUTING WEIGHT DISTRIBUTION ==============")
         for l_idx in sorted(stats_per_layer.keys()):
             records = stats_per_layer[l_idx]
-            layer_zero = sum(r["zero_expert_tokens"] for r in records)
-            layer_toks = sum(r["total_tokens"] for r in records)
-            layer_avg_e = sum(r["avg_experts"] for r in records) / len(records)
+            layer_avg_top1 = sum(r["avg_top1_weight"] for r in records) / len(records)
+            layer_avg_topk = sum(r["avg_topk_weight"] for r in records) / len(records)
             
-            all_zero_tokens += layer_zero
-            all_total_tokens += layer_toks
-            all_avg_experts.append(layer_avg_e)
-            
-            print(f"Layer {l_idx:02d}: Avg Experts/Token = {layer_avg_e:.2f} | Zero-Expert Tokens = {layer_zero}/{layer_toks} ({(layer_zero/max(layer_toks,1))*100:.4f}%)")
+            print(f"Layer {l_idx:02d}: Avg Top-1 Weight = {layer_avg_top1:.4f} | Avg Top-k Weight = {layer_avg_topk:.4f}")
 
-        overall_avg_experts = sum(all_avg_experts) / len(all_avg_experts)
-        overall_zero_pct = (all_zero_tokens / max(all_total_tokens, 1)) * 100
-
-        print("-------------------------------------------------------------------------")
-        print(f"OVERALL MEAN EXPERTS PER TOKEN : {overall_avg_experts:.2f} / {args.base_k}")
-        print(f"TOTAL ZERO-EXPERT TOKENS       : {all_zero_tokens}/{all_total_tokens} ({overall_zero_pct:.4f}%)")
         print("=========================================================================\n")
 
 
