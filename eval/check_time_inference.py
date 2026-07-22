@@ -189,9 +189,8 @@ def main():
         "is_new": True, "use_dynamic_experts": True, "min_k": 6, "base_k": 8, "expert_threshold": 0.0,
     }))
 
-    results = []
+    results = [("1. DENSE BASELINE", baseline_gen_mean, baseline_tok_per_sec, "0.00%")]
 
-    # Compute baseline token output for divergence check
     def set_seed(seed=42):
         import random
         import numpy as np
@@ -201,31 +200,7 @@ def main():
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
 
-    set_seed(42)
-    baseline_out = benchmark_generation(
-        baseline, args.device, prompt_ids, args.gen_length, args.steps,
-        args.block_length, num_warmup=0, num_runs=1, is_new=False
-    )
-    baseline_gen_lats = benchmark_generation(
-        baseline, args.device, prompt_ids, args.gen_length, args.steps,
-        args.block_length, args.num_warmup, args.num_runs, is_new=False
-    )
-    baseline_gen_mean, _, _ = get_stats(baseline_gen_lats)
-    baseline_tok_per_sec = args.gen_length / baseline_gen_mean
-    results.append(("1. DENSE BASELINE", baseline_gen_mean, baseline_tok_per_sec, "0.00%"))
-
-    del baseline
-    import gc
-    gc.collect()
-    if "cuda" in args.device:
-        torch.cuda.empty_cache()
-
-    # 2. New Approach
-    print("================ LOADING NEW APPROACH ================")
-    new_model, new_load_time = load_new_approach(args.weight_dir, args.device)
-    print(f"  New Approach loaded in {new_load_time:.2f} seconds.\n")
-
-    # Baseline output for divergence comparison
+    # Cache-only output for divergence comparison
     set_seed(42)
     from model_update.generate import generate_cached
     ref_tokens = generate_cached(
