@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 workspace_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(workspace_root))
@@ -22,7 +23,7 @@ def set_seed(seed: int):
 
 
 def run_diagnostic():
-    parser = argparse.ArgumentParser(description="Token-level correctness diagnostic for Dynamic Experts")
+    parser = argparse.ArgumentParser(description="Token-level correctness & real activation diagnostic for Dynamic Experts")
     parser.add_argument("--weight-dir", type=str, default="weights")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--gen-length", type=int, default=128)
@@ -35,7 +36,7 @@ def run_diagnostic():
     args = parser.parse_args()
 
     print("================================================================")
-    print(" Token-Level Correctness Diagnostic (Dynamic Experts vs Baseline)")
+    print(" Diagnostic: Token Divergence & Real Activation Pruning")
     print("================================================================")
     print(f" Device          : {args.device}")
     print(f" Generation L    : {args.gen_length}")
@@ -57,6 +58,7 @@ def run_diagnostic():
         model = LLaDAMoEKV(FULL_CFG).to(torch.bfloat16).to(args.device).eval()
         try:
             load_weights(model, args.weight_dir, verbose=False)
+            print("Weights loaded successfully.")
         except Exception as e:
             print(f"Warning: Failed to load weights ({e}), using random weights.")
         vocab_size = FULL_CFG.VS
@@ -77,6 +79,37 @@ def run_diagnostic():
     num_blocks = args.gen_length // args.block_length
     trial_divergence_rates = []
 
+    # Real activation pruning statistics hooks
+    stats_per_layer = {}
+
+    def make_moe_hook(layer_idx):
+        def hook(module, input, output):
+            x_in = input[0]
+            B_in, T_in, _ = x_in.shape
+            x_flat = x_in.view(B_in * T_in, module.cfg.H)
+            
+            rw = F.softmax(module.gate(x_flat), dim=-1, dtype=torch.float32)
+            k = module.cfg.TOPK
+            rw_top, sel = torch.topk(rw, k, dim=-1)
+            
+            keep = rw_top > args.expert_threshold
+            one_hot = F.one_hot(sel, num_classes=module.cfg.NE) * keep.unsqueeze(-1)
+            expert_mask = one_hot.permute(2, 1, 0)
+            
+            experts_per_token = expert_mask.sum(dim=(0, 1))
+            zero_expert_tokens = (experts_per_token == 0).sum().item()
+            avg_experts = experts_per_token.float().mean().item()
+            total_tokens = B_in * T_in
+            
+            if layer_idx not in stats_per_layer:
+                stats_per_layer[layer_idx] = []
+            stats_per_layer[layer_idx].append({
+                "total_tokens": total_tokens,
+                "zero_expert_tokens": zero_expert_tokens,
+                "avg_experts": avg_experts,
+            })
+        return hook
+
     for trial in range(args.num_trials):
         seed = 42 + trial * 100
         if prompts and trial < len(prompts):
@@ -96,7 +129,8 @@ def run_diagnostic():
             use_dynamic_experts=False,
         )
 
-        # 2. Dynamic Experts (use_dynamic_experts=True)
+        # 2. Dynamic Experts (use_dynamic_experts=True) with activation hooks
+        hooks = [layer.mlp.register_forward_hook(make_moe_hook(i)) for i, layer in enumerate(model.layers)]
         set_seed(seed)
         out_dyn = generate_cached(
             model=model,
@@ -109,6 +143,8 @@ def run_diagnostic():
             min_k=args.min_k,
             expert_threshold=args.expert_threshold,
         )
+        for h in hooks:
+            h.remove()
 
         dense_tokens = out_dense[0].cpu()
         dyn_tokens = out_dyn[0].cpu()
@@ -119,7 +155,6 @@ def run_diagnostic():
         pct_diff = (num_diff / total_toks) * 100.0
         trial_divergence_rates.append(pct_diff)
 
-        # Breakdown by block
         block_diffs = []
         for b in range(num_blocks):
             b_start = b * args.block_length
@@ -134,10 +169,37 @@ def run_diagnostic():
 
     avg_div = sum(trial_divergence_rates) / len(trial_divergence_rates)
     max_div = max(trial_divergence_rates)
-    print("\n================ DIAGNOSTIC SUMMARY ================")
+
+    print("\n================ DIAGNOSTIC 1: TOKEN DIVERGENCE SUMMARY ================")
     print(f" Average Token Divergence Rate : {avg_div:.2f}%")
     print(f" Maximum Token Divergence Rate : {max_div:.2f}%")
-    print("====================================================")
+    print("=========================================================================")
+
+    if stats_per_layer:
+        print("\n================ DIAGNOSTIC 2: REAL ACTIVATION PRUNING REPORT ===========")
+        all_zero_tokens = 0
+        all_total_tokens = 0
+        all_avg_experts = []
+
+        for l_idx in sorted(stats_per_layer.keys()):
+            records = stats_per_layer[l_idx]
+            layer_zero = sum(r["zero_expert_tokens"] for r in records)
+            layer_toks = sum(r["total_tokens"] for r in records)
+            layer_avg_e = sum(r["avg_experts"] for r in records) / len(records)
+            
+            all_zero_tokens += layer_zero
+            all_total_tokens += layer_toks
+            all_avg_experts.append(layer_avg_e)
+            
+            print(f"Layer {l_idx:02d}: Avg Experts/Token = {layer_avg_e:.2f} | Zero-Expert Tokens = {layer_zero}/{layer_toks} ({(layer_zero/max(layer_toks,1))*100:.4f}%)")
+
+        overall_avg_experts = sum(all_avg_experts) / len(all_avg_experts)
+        overall_zero_pct = (all_zero_tokens / max(all_total_tokens, 1)) * 100
+
+        print("-------------------------------------------------------------------------")
+        print(f"OVERALL MEAN EXPERTS PER TOKEN : {overall_avg_experts:.2f} / {args.base_k}")
+        print(f"TOTAL ZERO-EXPERT TOKENS       : {all_zero_tokens}/{all_total_tokens} ({overall_zero_pct:.4f}%)")
+        print("=========================================================================\n")
 
 
 if __name__ == "__main__":
