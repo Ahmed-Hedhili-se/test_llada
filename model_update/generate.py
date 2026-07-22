@@ -1,25 +1,23 @@
 """
-Option A: Conservative speedup with accuracy safety.
+Block-wise KV-cached masked diffusion generation for LLaDA-MoE.
 
-Adds:
-  1. generate_dense_cached() - fast path with NO sparse overhead
-  2. Dynamic expert pruning with SAFE defaults (min_k=4, threshold=0.03)
-  3. NO layer skipping (preserves full model depth)
-
-Original generate() and generate_sparse_cached() are kept unchanged.
+Same algorithm as generate.py (add_gumbel_noise, get_num_transfer_tokens,
+low-confidence remasking, block restriction), but:
+  - prompt + finalized blocks are cached once (K/V), never recomputed
+  - each denoising step only runs the model over the ACTIVE block
+  - each block gets one extra "finalize" forward pass after full unmask,
+    purely to compute correct K/V to push into the cache
 """
 
-import math
-import numpy as np
 import torch
 import torch.nn.functional as F
 
-from model_update.kv_cache import LayerKVCache, SparsePattern, _candidate_mass
+from model_kvcache import concat_kv
 
 MASK_ID = 156895
 
 
-def add_gumbel_noise(logits, temperature):
+def add_gumbel_noise(logits: torch.Tensor, temperature: float) -> torch.Tensor:
     if temperature == 0:
         return logits
     logits = logits.to(torch.float64)
@@ -28,7 +26,7 @@ def add_gumbel_noise(logits, temperature):
     return logits.exp() / gumbel_noise
 
 
-def get_num_transfer_tokens(mask_index, steps):
+def get_num_transfer_tokens(mask_index: torch.Tensor, steps: int) -> torch.Tensor:
     mask_num = mask_index.sum(dim=1, keepdim=True)
     base = mask_num // steps
     remainder = mask_num % steps
@@ -40,36 +38,21 @@ def get_num_transfer_tokens(mask_index, steps):
     return num_transfer
 
 
-def get_dynamic_k(step, steps_per_block, base_k=8, min_k=4):
-    """Conservative: ramp from 4 to 8 experts."""
-    progress = step / max(steps_per_block - 1, 1)
-    k = min_k + int((base_k - min_k) * progress)
-    return max(k, 1)
-
-
-def get_expert_threshold(step, steps_per_block, expert_threshold=0.0, max_threshold=0.05):
-    if expert_threshold == 0.0:
-        return 0.0
-    progress = step / max(steps_per_block - 1, 1)
-    threshold = max_threshold * (1.0 - progress)
-    return max(expert_threshold, threshold)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Baseline generate() - UNCHANGED
-# ═══════════════════════════════════════════════════════════════════════════
-
 @torch.no_grad()
-def generate(
+def generate_cached(
     model,
-    prompt_ids,
-    gen_length=128,
-    steps=128,
-    block_length=128,
-    temperature=0.0,
-    cfg_scale=0.0,
-    remasking="low_confidence",
-):
+    prompt_ids: torch.Tensor,
+    gen_length: int = 128,
+    steps: int = 128,
+    block_length: int = 128,
+    temperature: float = 0.0,
+    remasking: str = "low_confidence",
+) -> torch.Tensor:
+    """
+    Same signature/semantics as generate.generate(), minus cfg_scale
+    (CFG doubles the batch and complicates cache bookkeeping; add back
+    once single-sequence caching is verified correct).
+    """
     assert gen_length % block_length == 0, "gen_length must be divisible by block_length"
     num_blocks = gen_length // block_length
     steps_per_block = steps // num_blocks
@@ -81,334 +64,211 @@ def generate(
     x[:, :P] = prompt_ids
     prompt_index = (x != MASK_ID)
 
+    # Prime the cache with the prompt (prefix) once.
+    _, cache = model(prompt_ids, position_offset=0, past_kv=None)
+
+def _generate_block_cached(
+    model,
+    x: torch.Tensor,
+    block_start: int,
+    block_end: int,
+    steps_per_block: int,
+    cache,
+    temperature: float,
+    remasking: str,
+    topk_override: int | None = None,
+):
+    block_length = block_end - block_start
+    device = x.device
+    
+    block_mask_index = (x[:, block_start:block_end] == MASK_ID)
+    num_transfer = get_num_transfer_tokens(block_mask_index, steps_per_block)
+
+    for step in range(steps_per_block):
+        suffix_ids = x[:, block_start:]
+        active_ids = x[:, block_start:block_end]
+        mask_index = (active_ids == MASK_ID)
+
+        suffix_logits, _ = model(
+            suffix_ids,
+            position_offset=block_start,
+            past_kv=cache,
+            topk_override=topk_override
+        )
+        logits = suffix_logits[:, :block_length]
+
+        logits_with_noise = add_gumbel_noise(logits, temperature)
+        x0 = logits_with_noise.argmax(dim=-1)
+
+        if remasking == "low_confidence":
+            p = F.softmax(logits.float(), dim=-1)
+            x0_p = p.gather(-1, x0.unsqueeze(-1)).squeeze(-1)
+        elif remasking == "random":
+            x0_p = torch.rand(x0.shape, device=device)
+        else:
+            raise ValueError(f"Unknown remasking: {remasking}")
+
+        x0 = torch.where(mask_index, x0, active_ids)
+        confidence = torch.where(mask_index, x0_p, torch.full_like(x0_p, -torch.inf))
+
+        transfer_index = torch.zeros_like(x0, dtype=torch.bool)
+        for j in range(confidence.shape[0]):
+            k = num_transfer[j, step].item()
+            if k > 0:
+                _, sel = torch.topk(confidence[j], k=int(k))
+                transfer_index[j, sel] = True
+
+        active_ids = active_ids.clone()
+        active_ids[transfer_index] = x0[transfer_index]
+        x[:, block_start:block_end] = active_ids
+
+    finalized_ids = x[:, block_start:block_end]
+    _, new_kv = model(
+        finalized_ids,
+        position_offset=block_start,
+        past_kv=cache,
+        topk_override=topk_override
+    )
+    cache = concat_kv(cache, new_kv)
+    
+    return x, cache
+
+
+@torch.no_grad()
+def generate_cached(
+    model,
+    prompt_ids: torch.Tensor,
+    gen_length: int = 128,
+    steps: int = 128,
+    block_length: int = 128,
+    temperature: float = 0.0,
+    remasking: str = "low_confidence",
+) -> torch.Tensor:
+    """
+    Same signature/semantics as generate.generate(), minus cfg_scale
+    (CFG doubles the batch and complicates cache bookkeeping; add back
+    once single-sequence caching is verified correct).
+    """
+    assert gen_length % block_length == 0, "gen_length must be divisible by block_length"
+    num_blocks = gen_length // block_length
+    steps_per_block = steps // num_blocks
+
+    device = prompt_ids.device
+    P = prompt_ids.shape[1]
+
+    x = torch.full((1, P + gen_length), MASK_ID, dtype=torch.long, device=device)
+    x[:, :P] = prompt_ids
+
+    # Prime the cache with the prompt (prefix) once.
+    _, cache = model(prompt_ids, position_offset=0, past_kv=None)
+
     for block_idx in range(num_blocks):
         block_start = P + block_idx * block_length
         block_end = P + (block_idx + 1) * block_length
 
-        block_mask_index = (x[:, block_start:block_end] == MASK_ID)
-        num_transfer = get_num_transfer_tokens(block_mask_index, steps_per_block)
-
-        for step in range(steps_per_block):
-            mask_index = (x == MASK_ID)
-
-            if cfg_scale > 0.0:
-                un_x = x.clone()
-                un_x[prompt_index] = MASK_ID
-                x_cat = torch.cat([x, un_x], dim=0)
-                logits = model(x_cat)
-                logits, un_logits = logits.chunk(2, dim=0)
-                logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
-            else:
-                logits = model(x)
-
-            logits_with_noise = add_gumbel_noise(logits, temperature)
-            x0 = logits_with_noise.argmax(dim=-1)
-
-            if remasking == "low_confidence":
-                p = F.softmax(logits.float(), dim=-1)
-                x0_p = p.gather(-1, x0.unsqueeze(-1)).squeeze(-1)
-            elif remasking == "random":
-                x0_p = torch.rand(x0.shape, device=device)
-            else:
-                raise ValueError(f"Unknown remasking: {remasking}")
-
-            x0_p[:, block_end:] = -torch.inf
-            x0 = torch.where(mask_index, x0, x)
-            confidence = torch.where(mask_index, x0_p, torch.full_like(x0_p, -torch.inf))
-
-            transfer_index = torch.zeros_like(x0, dtype=torch.bool)
-            for j in range(confidence.shape[0]):
-                k = num_transfer[j, step].item()
-                if k > 0:
-                    _, sel = torch.topk(confidence[j], k=int(k))
-                    transfer_index[j, sel] = True
-
-            x[transfer_index] = x0[transfer_index]
+        x, cache = _generate_block_cached(
+            model=model,
+            x=x,
+            block_start=block_start,
+            block_end=block_end,
+            steps_per_block=steps_per_block,
+            cache=cache,
+            temperature=temperature,
+            remasking=remasking,
+            topk_override=None
+        )
 
     return x[:, P:]
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# NEW: generate_dense_cached() - Fast path, no sparse overhead
-# ═══════════════════════════════════════════════════════════════════════════
+class Verifier:
+    def score(self, prompt_ids, partial_response_ids) -> float:
+        """Higher = more promising partial solution. Must be implemented by a concrete verifier."""
+        raise NotImplementedError
+
+class LogProbVerifier(Verifier):
+    def __init__(self, model):
+        self.model = model
+
+    def score(self, prompt_ids, partial_response_ids) -> float:
+        """
+        Trivial placeholder for testing the search mechanics without a real PRM.
+        NOT competitive with a trained PRM. Real accuracy gains depend on a real verifier.
+        Scores by the model's own mean token confidence over the partial response.
+        """
+        with torch.no_grad():
+            logits, _ = self.model(partial_response_ids, position_offset=0, past_kv=None)
+            logprobs = F.log_softmax(logits.float(), dim=-1)
+            max_logprobs = logprobs.max(dim=-1).values
+            return max_logprobs.mean().item()
+
 
 @torch.no_grad()
-def generate_dense_cached(
+def generate_des(
     model,
-    prompt_ids,
-    gen_length=128,
-    steps=128,
-    block_length=128,
-    cache_budget=None,
-    temperature=0.0,
-    remasking="low_confidence",
-    use_dynamic_experts=True,
-    base_k=8,
-    min_k=4,
-    expert_threshold=0.03,
+    prompt_ids: torch.Tensor,
+    verifier: Verifier,
+    gen_length: int = 128,
+    steps: int = 128,
+    block_length: int = 128,
+    N: int = 32,
+    M: int | None = None,
+    k_candidates: tuple = (4, 5, 6, 7, 8, 9, 10, 11),
+    max_des_steps: int | None = None,
+    temperature: float = 0.8,
 ):
-    """
-    Dense attention + KV caching + dynamic expert pruning.
-    NO sparse attention. NO saliency tracking. NO mask building.
-    Minimal Python overhead. Accuracy-safe defaults.
-    """
+    if M is None:
+        M = max(1, N // 4)
+    if max_des_steps is None:
+        max_des_steps = gen_length // block_length
+        
     assert gen_length % block_length == 0
-    num_blocks = gen_length // block_length
-    steps_per_block = steps // num_blocks
-
+    steps_per_block = steps // (gen_length // block_length)
     device = prompt_ids.device
     P = prompt_ids.shape[1]
-    NL = len(model.layers)
-    layer_caches = [LayerKVCache(budget=cache_budget) for _ in range(NL)]
 
-    # Prefill (dense, full experts)
-    _, new_kv0, positions0, _ = model.forward_active(
-        prompt_ids, prefix_len=0, layer_caches=layer_caches,
-        sparse_pattern=None, step=0, sparse_step_threshold=10**9,
-        need_weights=False, dynamic_k=None, expert_threshold=0.0,
-    )
-    for li, cache in enumerate(layer_caches):
-        cache.append(new_kv0[li][0], new_kv0[li][1], positions0, protected=False)
+    # Initial prompt caching
+    _, prompt_cache = model(prompt_ids, position_offset=0, past_kv=None)
+    
+    # Create N candidates using k_candidates uniformly
+    C = []
+    num_k = len(k_candidates)
+    
+    for i in range(N):
+        k = k_candidates[i % num_k]
+        state = torch.full((1, P + gen_length), MASK_ID, dtype=torch.long, device=device)
+        state[:, :P] = prompt_ids
+        C.append({"state": state, "k": k, "cache": prompt_cache, "score": 0.0})
 
-    x_active = torch.full((1, gen_length), MASK_ID, dtype=torch.long, device=device)
-
-    for block_idx in range(num_blocks):
-        block_start = block_idx * block_length
-        block_end = (block_idx + 1) * block_length
-        prefix_len = P + block_start
-
-        block_mask_index = (x_active[:, block_start:block_end] == MASK_ID)
-        num_transfer = get_num_transfer_tokens(block_mask_index, steps_per_block)
-
-        for step in range(steps_per_block):
-            active_ids = x_active[:, block_start:]
-            mask_index = (active_ids == MASK_ID)
-
-            # Dynamic expert pruning (conservative: 4->8)
-            if use_dynamic_experts:
-                dynamic_k = get_dynamic_k(step, steps_per_block, base_k=base_k, min_k=min_k)
-                thresh = get_expert_threshold(step, steps_per_block, expert_threshold=expert_threshold)
-            else:
-                dynamic_k = None
-                thresh = 0.0
-
-            # Dense attention, no sparse mask, no saliency tracking
-            logits, _, _, _ = model.forward_active(
-                active_ids, prefix_len=prefix_len, layer_caches=layer_caches,
-                sparse_pattern=None, step=step, sparse_step_threshold=10**9,
-                need_weights=False, dynamic_k=dynamic_k, expert_threshold=thresh,
+    for step_idx in range(max_des_steps):
+        block_start = P + step_idx * block_length
+        block_end = block_start + block_length
+        
+        new_C = []
+        for cand in C:
+            new_state, new_cache = _generate_block_cached(
+                model=model,
+                x=cand["state"].clone(),
+                block_start=block_start,
+                block_end=block_end,
+                steps_per_block=steps_per_block,
+                cache=cand["cache"],
+                temperature=temperature,
+                remasking="low_confidence",
+                topk_override=cand["k"]
             )
-
-            logits_with_noise = add_gumbel_noise(logits, temperature)
-            x0 = logits_with_noise.argmax(dim=-1)
-
-            if remasking == "low_confidence":
-                p = F.softmax(logits.float(), dim=-1)
-                x0_p = p.gather(-1, x0.unsqueeze(-1)).squeeze(-1)
-            elif remasking == "random":
-                x0_p = torch.rand(x0.shape, device=device)
-            else:
-                raise ValueError(f"Unknown remasking: {remasking}")
-
-            local_block_end = block_end - block_start
-            x0_p[:, local_block_end:] = -torch.inf
-
-            x0 = torch.where(mask_index, x0, active_ids)
-            confidence = torch.where(mask_index, x0_p, torch.full_like(x0_p, -torch.inf))
-
-            transfer_index = torch.zeros_like(x0, dtype=torch.bool)
-            for j in range(confidence.shape[0]):
-                k = num_transfer[j, step].item()
-                if k > 0:
-                    _, sel = torch.topk(confidence[j], k=int(k))
-                    transfer_index[j, sel] = True
-
-            active_ids = torch.where(transfer_index, x0, active_ids)
-            x_active[:, block_start:] = active_ids
-
-        # Commit block (dense, full experts)
-        finished_ids = x_active[:, block_start:block_end]
-        _, new_kv_final, positions_final, _ = model.forward_active(
-            finished_ids, prefix_len=prefix_len, layer_caches=layer_caches,
-            sparse_pattern=None, step=steps_per_block, sparse_step_threshold=10**9,
-            need_weights=False, dynamic_k=None, expert_threshold=0.0,
-        )
-        for li, cache in enumerate(layer_caches):
-            cache.append(new_kv_final[li][0], new_kv_final[li][1], positions_final, protected=False)
-
-    return x_active[:, :]
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Original generate_sparse_cached() - kept for comparison
-# ═══════════════════════════════════════════════════════════════════════════
-
-@torch.no_grad()
-def generate_sparse_cached(
-    model,
-    prompt_ids,
-    gen_length=128,
-    steps=128,
-    block_length=128,
-    sparse_pattern=None,
-    sparse_step_threshold=4,
-    cache_budget=None,
-    saliency_update_interval=8,
-    temperature=0.0,
-    remasking="low_confidence",
-    use_dynamic_experts=True,
-    base_k=8,
-    min_k=4,
-    expert_threshold=0.03,
-):
-    assert gen_length % block_length == 0
-    num_blocks = gen_length // block_length
-    steps_per_block = steps // num_blocks
-
-    device = prompt_ids.device
-    P = prompt_ids.shape[1]
-    NL = len(model.layers)
-    layer_caches = [LayerKVCache(budget=cache_budget) for _ in range(NL)]
-
-    _, new_kv0, positions0, _ = model.forward_active(
-        prompt_ids, prefix_len=0, layer_caches=layer_caches,
-        sparse_pattern=None, step=0, sparse_step_threshold=10**9,
-        need_weights=False, dynamic_k=None, expert_threshold=0.0,
-    )
-    for li, cache in enumerate(layer_caches):
-        cache.append(new_kv0[li][0], new_kv0[li][1], positions0, protected=False)
-
-    x_active = torch.full((1, gen_length), MASK_ID, dtype=torch.long, device=device)
-
-    for block_idx in range(num_blocks):
-        block_start = block_idx * block_length
-        block_end = (block_idx + 1) * block_length
-        prefix_len = P + block_start
-
-        block_mask_index = (x_active[:, block_start:block_end] == MASK_ID)
-        num_transfer = get_num_transfer_tokens(block_mask_index, steps_per_block)
-
-        for step in range(steps_per_block):
-            active_ids = x_active[:, block_start:]
-            mask_index = (active_ids == MASK_ID)
-            track_saliency = (step % saliency_update_interval == 0)
-
-            if use_dynamic_experts:
-                dynamic_k = get_dynamic_k(step, steps_per_block, base_k=base_k, min_k=min_k)
-                thresh = get_expert_threshold(step, steps_per_block, expert_threshold=expert_threshold)
-            else:
-                dynamic_k = None
-                thresh = 0.0
-
-            logits, new_kv, q_positions, all_attn = model.forward_active(
-                active_ids, prefix_len=prefix_len, layer_caches=layer_caches,
-                sparse_pattern=sparse_pattern, step=step,
-                sparse_step_threshold=sparse_step_threshold, need_weights=track_saliency,
-                dynamic_k=dynamic_k, expert_threshold=thresh,
-            )
-
-            if track_saliency:
-                for li, cache in enumerate(layer_caches):
-                    cached = cache.get()
-                    if cached is None or all_attn[li] is None:
-                        continue
-                    prefix_n = cached[2].shape[0]
-                    aw_prefix = all_attn[li][:, :, :, :prefix_n]
-                    cache.update_saliency(aw_prefix, cached[2])
-                    cache.evict()
-
-            logits_with_noise = add_gumbel_noise(logits, temperature)
-            x0 = logits_with_noise.argmax(dim=-1)
-
-            if remasking == "low_confidence":
-                p = F.softmax(logits.float(), dim=-1)
-                x0_p = p.gather(-1, x0.unsqueeze(-1)).squeeze(-1)
-            elif remasking == "random":
-                x0_p = torch.rand(x0.shape, device=device)
-            else:
-                raise ValueError(f"Unknown remasking: {remasking}")
-
-            local_block_end = block_end - block_start
-            x0_p[:, local_block_end:] = -torch.inf
-
-            x0 = torch.where(mask_index, x0, active_ids)
-            confidence = torch.where(mask_index, x0_p, torch.full_like(x0_p, -torch.inf))
-
-            transfer_index = torch.zeros_like(x0, dtype=torch.bool)
-            for j in range(confidence.shape[0]):
-                k = num_transfer[j, step].item()
-                if k > 0:
-                    _, sel = torch.topk(confidence[j], k=int(k))
-                    transfer_index[j, sel] = True
-
-            active_ids = torch.where(transfer_index, x0, active_ids)
-            x_active[:, block_start:] = active_ids
-
-        finished_ids = x_active[:, block_start:block_end]
-        _, new_kv_final, positions_final, _ = model.forward_active(
-            finished_ids, prefix_len=prefix_len, layer_caches=layer_caches,
-            sparse_pattern=None, step=steps_per_block, sparse_step_threshold=10**9,
-            need_weights=False, dynamic_k=None, expert_threshold=0.0,
-        )
-        for li, cache in enumerate(layer_caches):
-            cache.append(new_kv_final[li][0], new_kv_final[li][1], positions_final, protected=False)
-
-    return x_active[:, :]
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Calibration (unchanged)
-# ═══════════════════════════════════════════════════════════════════════════
-
-@torch.no_grad()
-def calibrate_sparse_pattern(
-    model,
-    calibration_prompt_ids,
-    candidate_windows=(16, 32, 64, 128),
-    candidate_strides=(0, 16, 32, 64),
-    mass_threshold=0.9,
-):
-    assert len(calibration_prompt_ids) > 0
-    stats_sum = None
-    n_prompts = 0
-    for ids in calibration_prompt_ids:
-        _, all_attn = model.forward_with_attn(ids)
-        NL = len(all_attn)
-        NH = all_attn[0].shape[1]
-        if stats_sum is None:
-            stats_sum = torch.zeros(NL, NH, len(candidate_windows), len(candidate_strides))
-        for li, aw in enumerate(all_attn):
-            heads = aw[0]
-            for h in range(NH):
-                for wi, window in enumerate(candidate_windows):
-                    for si, stride in enumerate(candidate_strides):
-                        stats_sum[li, h, wi, si] += _candidate_mass(heads[h], window, stride)
-        n_prompts += 1
-
-    stats = stats_sum / n_prompts
-    NL, NH = stats.shape[0], stats.shape[1]
-    window_out = torch.zeros(NL, NH, dtype=torch.long)
-    stride_out = torch.zeros(NL, NH, dtype=torch.long)
-    max_stride_cost = max(candidate_windows)
-
-    for li in range(NL):
-        for h in range(NH):
-            best = None
-            for wi, window in enumerate(candidate_windows):
-                for si, stride in enumerate(candidate_strides):
-                    mass = stats[li, h, wi, si].item()
-                    if mass >= mass_threshold:
-                        cost = window + (max_stride_cost // stride if stride > 0 else 0)
-                        if best is None or cost < best[0]:
-                            best = (cost, window, stride)
-            if best is None:
-                flat = stats[li, h].flatten()
-                idx = int(flat.argmax().item())
-                wi, si = divmod(idx, len(candidate_strides))
-                window, stride = candidate_windows[wi], candidate_strides[si]
-            else:
-                _, window, stride = best
-            window_out[li, h] = window
-            stride_out[li, h] = stride
-
-    return SparsePattern(NL, NH, window_out, stride_out)
+            
+            partial_response = new_state[:, :block_end]
+            score = verifier.score(prompt_ids, partial_response)
+            
+            new_C.append({"state": new_state, "k": cand["k"], "cache": new_cache, "score": score})
+            
+        # Sort and prune to top-M
+        new_C.sort(key=lambda c: c["score"], reverse=True)
+        C = new_C[:M]
+        
+        k_counts = {k: sum(1 for c in C if c["k"] == k) for k in k_candidates}
+        print(f"[DES Step {step_idx+1}] Retained {len(C)} candidates. Expert counts (k): {k_counts}")
+        
+    # Return highest scoring candidate
+    return C[0]["state"][:, P:P+max_des_steps*block_length]

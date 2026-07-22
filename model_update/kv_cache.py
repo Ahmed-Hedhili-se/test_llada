@@ -1,238 +1,246 @@
 """
-Shared building blocks for the Sparse-dLLM + SparseD integration.
+LLaDA-MoE with block-wise KV caching.
 
-Two independent mechanisms live here:
+Key idea:
+  - "prefix" tokens (prompt + already-finalized blocks) have FIXED content,
+    so their K/V (post-RoPE) never change once computed. Cache them.
+  - "active" tokens (current block, still being denoised) get fresh Q/K/V
+    computed every step, and attend against [cached prefix K/V ; active K/V].
+  - MoE/MLP/norms are all per-token, so we only ever need to run them over
+    the active block, not the full sequence.
+  - Logits are only computed/returned for the active block, since
+    generate.py already discards logits past block_end anyway.
 
-  * LayerKVCache  - Sparse-dLLM (arXiv 2508.02558). A per-layer, evictable
-    KV cache for the "frozen" part of the sequence (prompt + already
-    finalized blocks). After each denoising step we record how much
-    attention mass each cached token received ("saliency") and, once the
-    cache exceeds a configurable budget, evict the lowest-saliency entries.
-    Saliency is tracked with an exponential running average, matching the
-    paper's finding that token saliency is stable across denoising steps
-    (so a slowly-updated score is a reasonable proxy, not just "this step's
-    attention").
+Correctness-critical rule: a block's K/V may only be pushed into the
+permanent cache AFTER it is fully unmasked. Caching mid-denoising K/V
+would permanently bake in stale (masked-token) representations.
 
-  * SparsePattern - SparseD (arXiv 2509.24014). A fixed, per-(layer, head)
-    local-window + global-stride attention pattern, calibrated once offline
-    (see `calibrate_sparse_pattern` in generate.py) and reused unchanged
-    across every denoising step and every future generation call. It is
-    only ever applied from a configurable step threshold onward; the first
-    steps of each block always use full dense attention (the paper found
-    this matters for quality).
-
-Both are wired up as an attention *mask* inside ordinary (non-fused)
-softmax attention in model.py / model_small.py. This is a correctness
-prototype, not a throughput optimization: a real speed win requires a
-custom sparse-attention kernel (and, for the cache, an implementation that
-never materializes the evicted K/V rather than concatenating-then-slicing).
-That kernel work is explicitly out of scope here (Phase 4).
+Dims are passed via a Config so the exact same code can be correctness
+tested at small scale and then run at full 7B-MoE scale.
 """
 
-from __future__ import annotations
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+KVCache = List[Tuple[torch.Tensor, torch.Tensor]]  # per-layer (k, v), each [B, KVH, T, HD]
 
 
-# ─────────────────────────── Sparse-dLLM: evictable cache ──────────────────
-class LayerKVCache:
-    """Per-transformer-layer cache of *finalized* K/V (prompt + committed blocks).
+@dataclass
+class Cfg:
+    H: int
+    NH: int
+    KVH: int
+    NL: int
+    NE: int
+    TOPK: int
+    EI: int
+    VS: int
+    EPS: float = 1e-5
+    THETA: float = 50000.0
+    MASK_ID: int = 156895
 
-    Positions stored here are frozen once appended: they are not
-    recomputed when later blocks change (the same approximation any
-    block-wise dLLM cache makes). What Sparse-dLLM adds on top is that
-    entries can also be *evicted* (not just kept forever) once a saliency
-    score marks them as unimportant and the cache exceeds `budget`.
-    """
+    @property
+    def HD(self):
+        return self.H // self.NH
 
-    def __init__(self, budget: int | None = None, saliency_decay: float = 0.9):
-        self.budget = budget
-        self.decay = saliency_decay
-        self.k: torch.Tensor | None = None          # [B, NH, N, HD]
-        self.v: torch.Tensor | None = None           # [B, NH, N, HD]
-        self.positions: torch.Tensor | None = None   # [N] absolute sequence positions
-        self.saliency: torch.Tensor | None = None    # [N] running attention-mass score
-        self.protected: torch.Tensor | None = None    # [N] bool, never evicted
 
-    def get(self):
-        """Returns (k, v, positions) or None if the cache is empty."""
-        if self.k is None:
-            return None
-        return self.k, self.v, self.positions
+FULL_CFG = Cfg(H=2048, NH=16, KVH=16, NL=16, NE=64, TOPK=8, EI=1024, VS=157184)
+SMALL_CFG = Cfg(H=512, NH=8, KVH=8, NL=4, NE=16, TOPK=4, EI=256, VS=157184)
 
-    @torch.no_grad()
-    def append(self, k_new: torch.Tensor, v_new: torch.Tensor,
-               positions_new: torch.Tensor, protected: bool = False):
-        """Permanently add newly-finalized tokens' K/V to the cache."""
-        _, _, T, _ = k_new.shape
-        sal_new = torch.zeros(T, device=k_new.device)
-        prot_new = torch.full((T,), protected, dtype=torch.bool, device=k_new.device)
 
-        if self.k is None:
-            self.k, self.v = k_new, v_new
-            self.positions = positions_new.clone()
-            self.saliency, self.protected = sal_new, prot_new
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        dtype = x.dtype
+        x = x.float()
+        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return (self.weight * x).to(dtype)
+
+
+def build_rope_freqs(max_seq: int, head_dim: int, theta: float, device):
+    inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
+    pos = torch.arange(max_seq, device=device).float()
+    freqs = torch.outer(pos, inv_freq)
+    emb = torch.cat([freqs, freqs], dim=-1)
+    return emb.cos(), emb.sin()
+
+
+def rotate_half(x):
+    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2:]
+    return torch.cat([-x2, x1], dim=-1)
+
+
+def apply_rope(q, k, cos, sin):
+    cos = cos.unsqueeze(0).unsqueeze(0)
+    sin = sin.unsqueeze(0).unsqueeze(0)
+    return q * cos + rotate_half(q) * sin, k * cos + rotate_half(k) * sin
+
+
+class Attention(nn.Module):
+    def __init__(self, cfg: Cfg):
+        super().__init__()
+        self.cfg = cfg
+        H, NH, KVH, HD = cfg.H, cfg.NH, cfg.KVH, cfg.HD
+        self.q_proj = nn.Linear(H, NH * HD, bias=False)
+        self.k_proj = nn.Linear(H, KVH * HD, bias=False)
+        self.v_proj = nn.Linear(H, KVH * HD, bias=False)
+        self.o_proj = nn.Linear(H, H, bias=False)
+        self.q_norm = RMSNorm(HD, cfg.EPS)
+        self.k_norm = RMSNorm(HD, cfg.EPS)
+
+    def forward(self, x, cos, sin, past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None):
+        """
+        x: [B, Ta, H] active-block hidden states
+        cos/sin: [Ta, HD] rope freqs for the ACTIVE positions (absolute offset already applied)
+        past_kv: optional (k_prefix, v_prefix) each [B, KVH, Tp, HD], already RoPE'd
+        Returns: out [B, Ta, H], (k_active, v_active) each [B, KVH, Ta, HD] (RoPE'd, for caching)
+        """
+        cfg = self.cfg
+        B, Ta, _ = x.shape
+
+        q = self.q_proj(x).view(B, Ta, cfg.NH, cfg.HD)
+        k = self.k_proj(x).view(B, Ta, cfg.KVH, cfg.HD)
+        v = self.v_proj(x).view(B, Ta, cfg.KVH, cfg.HD)
+
+        q = self.q_norm(q.reshape(-1, cfg.HD)).reshape(B, Ta, cfg.NH, cfg.HD)
+        k = self.k_norm(k.reshape(-1, cfg.HD)).reshape(B, Ta, cfg.KVH, cfg.HD)
+
+        q = q.transpose(1, 2)  # [B, NH, Ta, HD]
+        k = k.transpose(1, 2)  # [B, KVH, Ta, HD]
+        v = v.transpose(1, 2)
+
+        q, k = apply_rope(q, k, cos, sin)  # k here is the fresh active-block k, RoPE'd
+
+        if past_kv is not None:
+            k_prefix, v_prefix = past_kv
+            k_full = torch.cat([k_prefix, k], dim=2)
+            v_full = torch.cat([v_prefix, v], dim=2)
         else:
-            self.k = torch.cat([self.k, k_new], dim=2)
-            self.v = torch.cat([self.v, v_new], dim=2)
-            self.positions = torch.cat([self.positions, positions_new])
-            self.saliency = torch.cat([self.saliency, sal_new])
-            self.protected = torch.cat([self.protected, prot_new])
+            k_full, v_full = k, v
 
-        if self.budget is not None:
-            self.evict()
+        out = F.scaled_dot_product_attention(q, k_full, v_full, attn_mask=None, is_causal=False)
+        out = out.transpose(1, 2).reshape(B, Ta, cfg.H)
+        return self.o_proj(out), (k, v)
 
-    @torch.no_grad()
-    def update_saliency(self, attn_weights_to_cache: torch.Tensor, key_positions: torch.Tensor):
+
+class ExpertMLP(nn.Module):
+    def __init__(self, cfg: Cfg):
+        super().__init__()
+        self.gate_proj = nn.Linear(cfg.H, cfg.EI, bias=False)
+        self.up_proj = nn.Linear(cfg.H, cfg.EI, bias=False)
+        self.down_proj = nn.Linear(cfg.EI, cfg.H, bias=False)
+
+    def forward(self, x):
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
+class MoEBlock(nn.Module):
+    def __init__(self, cfg: Cfg):
+        super().__init__()
+        self.cfg = cfg
+        self.gate = nn.Linear(cfg.H, cfg.NE, bias=False)
+        self.experts = nn.ModuleList([ExpertMLP(cfg) for _ in range(cfg.NE)])
+
+    def forward(self, x, topk_override: Optional[int] = None):
+        cfg = self.cfg
+        B, T, _ = x.shape
+        x_flat = x.view(B * T, cfg.H)
+
+        routing_weights = F.softmax(self.gate(x_flat), dim=-1, dtype=torch.float32)
+        k = topk_override if topk_override is not None else cfg.TOPK
+        routing_weights, selected_experts = torch.topk(routing_weights, k, dim=-1)
+        routing_weights = routing_weights.to(x.dtype)
+
+        out = torch.zeros_like(x_flat)
+        expert_mask = F.one_hot(selected_experts, num_classes=cfg.NE).permute(2, 1, 0)
+
+        for expert_idx in range(cfg.NE):
+            idx, top_x = torch.where(expert_mask[expert_idx])
+            if top_x.numel() == 0:
+                continue
+            tokens = x_flat[top_x]
+            h = self.experts[expert_idx](tokens) * routing_weights[top_x, idx, None]
+            out.index_add_(0, top_x, h.to(x.dtype))
+
+        return out.view(B, T, cfg.H)
+
+
+class Layer(nn.Module):
+    def __init__(self, cfg: Cfg):
+        super().__init__()
+        self.input_layernorm = RMSNorm(cfg.H, cfg.EPS)
+        self.self_attn = Attention(cfg)
+        self.post_attention_layernorm = RMSNorm(cfg.H, cfg.EPS)
+        self.mlp = MoEBlock(cfg)
+
+    def forward(self, x, cos, sin, past_kv=None, topk_override: Optional[int] = None):
+        attn_out, kv_new = self.self_attn(self.input_layernorm(x), cos, sin, past_kv)
+        x = x + attn_out
+        x = x + self.mlp(self.post_attention_layernorm(x), topk_override=topk_override)
+        return x, kv_new
+
+
+class LLaDAMoEKV(nn.Module):
+    def __init__(self, cfg: Cfg = FULL_CFG):
+        super().__init__()
+        self.cfg = cfg
+        self.embed_tokens = nn.Embedding(cfg.VS, cfg.H)
+        self.layers = nn.ModuleList([Layer(cfg) for _ in range(cfg.NL)])
+        self.norm = RMSNorm(cfg.H, cfg.EPS)
+        self.lm_head = nn.Linear(cfg.H, cfg.VS, bias=False)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        position_offset: int = 0,
+        past_kv: Optional[KVCache] = None,
+        topk_override: Optional[int] = None,
+    ):
         """
-        attn_weights_to_cache: [B, NH, Tq, Nk] attention weights restricted to the
-            columns that correspond to *this cache's* current keys (Nk must equal
-            len(key_positions), which should equal len(self.positions)).
-        Score per Sparse-dLLM: how much attention mass a token receives, max'd
-        over queries/heads/batch this step, folded into a running average since
-        saliency is reported to be stable across steps.
+        input_ids: [B, T] — either the full sequence (past_kv=None, e.g. prefix
+                   priming) or just the active block (past_kv=cache).
+        position_offset: absolute starting position of input_ids in the full
+                   sequence, for correct RoPE.
+        past_kv: list of (k,v) per layer for the prefix, or None.
+        topk_override: override the number of activated experts for this call.
+        Returns: logits [B, T, VS] for input_ids positions only, and
+                 new_kv: list of (k,v) per layer for input_ids' own tokens
+                 (caller decides whether/when to append these to the cache).
         """
-        if self.k is None or attn_weights_to_cache is None:
-            return
-        received = attn_weights_to_cache.amax(dim=(0, 1, 2))  # [Nk]
-        n = min(received.shape[0], self.saliency.shape[0])
-        self.saliency[:n] = (
-            self.decay * self.saliency[:n] + (1 - self.decay) * received[:n].to(self.saliency.device)
-        )
+        cfg = self.cfg
+        B, T = input_ids.shape
+        device = input_ids.device
 
-    @torch.no_grad()
-    def evict(self):
-        """Drop lowest-saliency, unprotected prefix/suffix entries down to `budget`."""
-        if self.budget is None or self.k is None:
-            return
-        n = self.k.shape[2]
-        n_drop = n - self.budget
-        if n_drop <= 0:
-            return
+        x = self.embed_tokens(input_ids)
 
-        order = torch.argsort(self.saliency)  # ascending: least salient first
-        drop = []
-        for i in order.tolist():
-            if not self.protected[i]:
-                drop.append(i)
-            if len(drop) == n_drop:
-                break
-        if not drop:
-            return
+        cos_full, sin_full = build_rope_freqs(position_offset + T, cfg.HD, cfg.THETA, device)
+        cos = cos_full[position_offset: position_offset + T].to(x.dtype)
+        sin = sin_full[position_offset: position_offset + T].to(x.dtype)
 
-        keep_mask = torch.ones(n, dtype=torch.bool, device=self.k.device)
-        keep_mask[torch.tensor(drop, device=self.k.device)] = False
-        self.k = self.k[:, :, keep_mask, :]
-        self.v = self.v[:, :, keep_mask, :]
-        self.positions = self.positions[keep_mask]
-        self.saliency = self.saliency[keep_mask]
-        self.protected = self.protected[keep_mask]
+        new_kv: KVCache = []
+        for i, layer in enumerate(self.layers):
+            layer_past = past_kv[i] if past_kv is not None else None
+            x, kv_i = layer(x, cos, sin, layer_past, topk_override=topk_override)
+            new_kv.append(kv_i)
 
-    def __len__(self):
-        return 0 if self.k is None else self.k.shape[2]
+        x = self.norm(x)
+        logits = self.lm_head(x)
+        return logits, new_kv
 
 
-# ─────────────────────────── SparseD: calibrated pattern ───────────────────
-class SparsePattern:
-    """Fixed per-(layer, head) local-window + global-stride attention pattern.
-
-    A key at absolute position k is attended to by a query at position q for
-    head h in layer l iff:
-        |q - k| <= window[l, h]      (local)
-     OR (stride[l, h] > 0 and k % stride[l, h] == 0)   (strided/global)
-
-    This is deliberately simple (no learned/absolute-index pattern) so it
-    generalizes across sequences of different lengths and different prompts,
-    unlike a pattern tied to specific calibration-time token indices.
-    """
-
-    def __init__(self, num_layers: int, num_heads: int,
-                 window: torch.Tensor, stride: torch.Tensor):
-        assert window.shape == (num_layers, num_heads)
-        assert stride.shape == (num_layers, num_heads)
-        self.num_layers = num_layers
-        self.num_heads = num_heads
-        self.window = window   # LongTensor [NL, NH]
-        self.stride = stride   # LongTensor [NL, NH]
-
-    def build_mask(self, layer_idx: int, q_positions: torch.Tensor,
-                   k_positions: torch.Tensor, device) -> torch.Tensor:
-        """Returns bool mask [NH, Tq, Tk], True = attend.
-
-        Fully vectorized across heads (no Python loop) — this runs on the
-        hot path (every denoising step, every layer), so per-call Python
-        overhead matters at the short sequence lengths typical of GSM8K-CoT
-        generation, where the actual attention math is already cheap.
-        """
-        q = q_positions.view(1, -1, 1).to(device)          # [1, Tq, 1]
-        k = k_positions.view(1, 1, -1).to(device)            # [1, 1, Tk]
-        dist = (q - k).abs()                                  # [1, Tq, Tk]
-
-        window = self.window[layer_idx].to(device).view(-1, 1, 1)   # [NH,1,1]
-        stride = self.stride[layer_idx].to(device).view(-1, 1, 1)   # [NH,1,1]
-
-        local = dist <= window                                # [NH, Tq, Tk]
-        stride_safe = torch.clamp(stride, min=1)
-        glob = (stride > 0) & ((k % stride_safe) == 0)         # [NH, 1, Tk] -> broadcasts
-        return local | glob                                    # [NH, Tq, Tk]
-
-    def build_block_mask(self, layer_idx: int, q_positions: torch.Tensor,
-                         k_positions: torch.Tensor, device):
-        """Builds a flex_attention BlockMask for PyTorch 2.5+.
-        
-        create_block_mask pads Q/KV lengths to block boundaries, so mask_mod
-        can receive indices beyond the actual sequence length. We use modular
-        wrapping to keep indexing safe and an explicit bounds gate to mask out
-        the padded region.
-        """
-        from torch.nn.attention.flex_attention import create_block_mask
-        
-        Q = len(q_positions)
-        K = len(k_positions)
-        q_pos = q_positions.to(device)
-        k_pos = k_positions.to(device)
-        window_t = self.window[layer_idx].to(device)
-        stride_t = self.stride[layer_idx].to(device)
-        
-        def mask_mod(b, h, q_idx, kv_idx):
-            in_bounds = (q_idx < Q) & (kv_idx < K)
-            q_safe = q_idx % Q
-            kv_safe = kv_idx % K
-            
-            q_val = q_pos[q_safe]
-            k_val = k_pos[kv_safe]
-            w = window_t[h]
-            s = stride_t[h]
-            
-            local_mask = (q_val - k_val).abs() <= w
-            stride_mask = (s > 0) & (k_val % torch.clamp(s, min=1) == 0)
-            return in_bounds & (local_mask | stride_mask)
-            
-        return create_block_mask(mask_mod, 1, self.num_heads, Q, K, device=device)
-
-    def save(self, path: str):
-        torch.save({"window": self.window, "stride": self.stride}, path)
-
-    @classmethod
-    def load(cls, path: str) -> "SparsePattern":
-        d = torch.load(path)
-        nl, nh = d["window"].shape
-        return cls(nl, nh, d["window"], d["stride"])
-
-
-def _candidate_mass(attn_head: torch.Tensor, window: int, stride: int) -> float:
-    """Fraction of a [T, T] attention-weight matrix's mass captured by a given
-    local-window(+stride) candidate pattern. Used only during calibration."""
-    T = attn_head.shape[0]
-    device = attn_head.device
-    q = torch.arange(T, device=device).view(-1, 1)
-    k = torch.arange(T, device=device).view(1, -1)
-    dist = (q - k).abs()
-    mask = dist <= window
-    if stride > 0:
-        glob = (k % stride == 0).expand(T, T)
-        mask = mask | glob
-    total = attn_head.sum()
-    if total <= 0:
-        return 0.0
-    return (attn_head * mask).sum().item() / total.item()
+def concat_kv(cache: Optional[KVCache], new_kv: KVCache) -> KVCache:
+    """Append newly-finalized block K/V onto the running prefix cache."""
+    if cache is None:
+        return new_kv
+    out = []
+    for (k_old, v_old), (k_new, v_new) in zip(cache, new_kv):
+        out.append((torch.cat([k_old, k_new], dim=2), torch.cat([v_old, v_new], dim=2)))
+    return out

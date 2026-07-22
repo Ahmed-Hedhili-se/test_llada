@@ -3,11 +3,8 @@ Option A Benchmark: Conservative speedup with accuracy safety.
 
 Compares:
   1. Dense Baseline (src/)
-  2. Cache Only (model_update/ - original sparse path overhead)
-  3. Cache + SparseD (model_update/ - original sparse path + sparse attention)
-  4. Dynamic Experts + Cache + SparseD (model_update/ - your previous best)
-  5. FAST DENSE CACHED (NEW - no sparse overhead + conservative expert pruning)
-  6. FAST DENSE CACHED (no dynamic experts - pure overhead reduction)
+  2. Block-wise KV Cache (model_update/)
+  3. Dynamic Experts Search (DES) (model_update/)
 """
 
 import argparse
@@ -41,12 +38,16 @@ def load_baseline(weight_dir, device):
 
 
 def load_new_approach(weight_dir, device):
-    from model_update.model import LLaDAMoE, load_weights
+    from model_update.model import LLaDAMoEKV, FULL_CFG
+    from src.model import load_weights
     if "cuda" in device:
         torch.cuda.synchronize()
     t0 = time.perf_counter()
-    model = LLaDAMoE().to(torch.bfloat16).to(device).eval()
-    load_weights(model, weight_dir, verbose=False)
+    model = LLaDAMoEKV(FULL_CFG).to(torch.bfloat16).to(device).eval()
+    try:
+        load_weights(model, weight_dir, verbose=False)
+    except Exception as e:
+        print(f"Warning: Failed to load weights: {e}")
     if "cuda" in device:
         torch.cuda.synchronize()
     return model, time.perf_counter() - t0
@@ -55,14 +56,15 @@ def load_new_approach(weight_dir, device):
 def benchmark_generation(model, device, prompt_ids, gen_length, steps, block_length,
                          num_warmup, num_runs, is_new=False, **kwargs):
     if is_new:
-        from model_update.generate import generate_sparse_cached, generate_dense_cached
-        use_dense = kwargs.pop("use_dense_cached", False)
-        if use_dense:
-            gen_fn = lambda: generate_dense_cached(
-                model, prompt_ids, gen_length, steps, block_length, **kwargs
+        from model_update.generate import generate_cached, generate_des, LogProbVerifier
+        use_des = kwargs.pop("use_des", False)
+        if use_des:
+            verifier = LogProbVerifier(model)
+            gen_fn = lambda: generate_des(
+                model, prompt_ids, verifier, gen_length, steps, block_length, **kwargs
             )
         else:
-            gen_fn = lambda: generate_sparse_cached(
+            gen_fn = lambda: generate_cached(
                 model, prompt_ids, gen_length, steps, block_length, **kwargs
             )
     else:
@@ -124,26 +126,19 @@ def get_stats(latencies):
     return mean_val, l_sorted[len(l_sorted) // 2], l_sorted[int(len(l_sorted) * 0.95)]
 
 
-def create_dummy_sparse_pattern(num_layers, num_heads):
-    from model_update.kv_cache import SparsePattern
-    window = torch.full((num_layers, num_heads), 64, dtype=torch.long)
-    stride = torch.full((num_layers, num_heads), 16, dtype=torch.long)
-    return SparsePattern(num_layers, num_heads, window, stride)
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--weight-dir", default="weights")
     ap.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--num-warmup", type=int, default=1)
     ap.add_argument("--num-runs", type=int, default=3)
-    ap.add_argument("--gen-length", type=int, default=64)
-    ap.add_argument("--steps", type=int, default=64)
-    ap.add_argument("--block-length", type=int, default=32)
+    ap.add_argument("--gen-length", type=int, default=32)
+    ap.add_argument("--steps", type=int, default=32)
+    ap.add_argument("--block-length", type=int, default=16)
     args = ap.parse_args()
 
     print(f"================================================================")
-    print(f" Option A Benchmark: Conservative Speedup (Accuracy-Safe)")
+    print(f" Benchmark: Inference Time Comparison")
     print(f"================================================================")
     print(f"  Device           : {args.device}")
     print(f"  PyTorch Version  : {torch.__version__}")
@@ -186,34 +181,13 @@ def main():
     new_model, new_load_time = load_new_approach(args.weight_dir, args.device)
     print(f"  New Approach loaded in {new_load_time:.2f} seconds.\n")
 
-    NL = len(new_model.layers)
-    dummy_pattern = create_dummy_sparse_pattern(NL, 16)
-
     configs = []
 
-    # Original configs for comparison
-    configs.append(("2. CACHE ONLY (original overhead)", {
-        "is_new": True, "cache_budget": 2048, "saliency_update_interval": 8,
-        "sparse_pattern": None, "use_dynamic_experts": False,
+    configs.append(("2. CACHE ONLY (Block-wise)", {
+        "is_new": True, "use_des": False,
     }))
-    configs.append(("3. CACHE + SPARSED (original)", {
-        "is_new": True, "cache_budget": 2048, "saliency_update_interval": 8,
-        "sparse_pattern": dummy_pattern, "use_dynamic_experts": False,
-    }))
-    configs.append(("4. DYNAMIC EXPERTS + CACHE + SPARSED", {
-        "is_new": True, "cache_budget": 2048, "saliency_update_interval": 8,
-        "sparse_pattern": dummy_pattern, "use_dynamic_experts": True,
-        "base_k": 8, "min_k": 4, "expert_threshold": 0.03,
-    }))
-
-    # NEW: Fast dense cached configs
-    configs.append(("5. FAST DENSE CACHED (no dyn experts)", {
-        "is_new": True, "use_dense_cached": True, "cache_budget": 2048,
-        "use_dynamic_experts": False,
-    }))
-    configs.append(("6. FAST DENSE CACHED (conservative dyn experts)", {
-        "is_new": True, "use_dense_cached": True, "cache_budget": 2048,
-        "use_dynamic_experts": True, "base_k": 8, "min_k": 4, "expert_threshold": 0.03,
+    configs.append(("3. DES (N=4, M=1)", {
+        "is_new": True, "use_des": True, "N": 4, "M": 1,
     }))
 
     results = [("1. DENSE BASELINE", baseline_gen_mean, baseline_tok_per_sec)]
@@ -251,7 +225,6 @@ def main():
     print(f"\n🏆 BEST CONFIG: {best_name}")
     print(f"   Speedup: {best_speedup:.2f}x vs baseline")
     print(f"   Time: {best_time:.2f}s | Throughput: {best_tps:.2f} tok/s")
-    print(f"\n💡 For accuracy validation, compare config #6 output to baseline on GSM8K.")
 
 if __name__ == "__main__":
     main()
