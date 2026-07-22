@@ -62,7 +62,6 @@ src/server.py                 — OpenAI-compatible chat completions server
 
 model_update/model.py         — KV-cached model with dynamic expert routing
 model_update/generate.py      — block-wise KV-cached generation (min_k ramping)
-model_update/kv_cache.py      — standalone KV cache model variant
 
 compare_models.py             — logit + generation comparison vs HF reference
 download_weights.py

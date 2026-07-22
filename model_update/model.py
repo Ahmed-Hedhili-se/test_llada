@@ -238,7 +238,6 @@ class LLaDAMoEKV(nn.Module):
 
 
 def concat_kv(cache: Optional[KVCache], new_kv: KVCache) -> KVCache:
-    """Append newly-finalized block K/V onto the running prefix cache."""
     if cache is None:
         return new_kv
     out = []

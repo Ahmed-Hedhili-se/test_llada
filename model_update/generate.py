@@ -145,7 +145,7 @@ def generate_cached(
     x = torch.full((1, P + gen_length), MASK_ID, dtype=torch.long, device=device)
     x[:, :P] = prompt_ids
 
-    # Prime the cache with the prompt (prefix) once.
+    
     _, cache = model(prompt_ids, position_offset=0, past_kv=None)
 
     for block_idx in range(num_blocks):
