@@ -159,15 +159,18 @@ class MoEBlock(nn.Module):
         routing_weights, selected_experts = torch.topk(routing_weights, k, dim=-1)
         
         if expert_threshold > 0:
-            mask = routing_weights > expert_threshold
-            routing_weights = routing_weights * mask
+            keep = routing_weights > expert_threshold
+            routing_weights = routing_weights * keep
             sum_w = routing_weights.sum(dim=-1, keepdim=True).clamp(min=1e-9)
             routing_weights = routing_weights / sum_w
+            one_hot = F.one_hot(selected_experts, num_classes=cfg.NE) * keep.unsqueeze(-1)
+            expert_mask = one_hot.permute(2, 1, 0)
+        else:
+            expert_mask = F.one_hot(selected_experts, num_classes=cfg.NE).permute(2, 1, 0)
 
         routing_weights = routing_weights.to(x.dtype)
 
         out = torch.zeros_like(x_flat)
-        expert_mask = F.one_hot(selected_experts, num_classes=cfg.NE).permute(2, 1, 0)
 
         for expert_idx in range(cfg.NE):
             idx, top_x = torch.where(expert_mask[expert_idx])
