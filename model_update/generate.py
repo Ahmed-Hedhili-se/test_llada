@@ -37,35 +37,17 @@ def get_num_transfer_tokens(mask_index: torch.Tensor, steps: int) -> torch.Tenso
         num_transfer[i, : remainder[i]] += 1
     return num_transfer
 
+def get_dynamic_k(step, steps_per_block, base_k=8, min_k=4):
+    """Conservative: ramp from min_k to base_k experts."""
+    progress = step / max(steps_per_block - 1, 1)
+    k = min_k + (base_k - min_k) * progress
+    return int(round(k))
 
-@torch.no_grad()
-def generate_cached(
-    model,
-    prompt_ids: torch.Tensor,
-    gen_length: int = 128,
-    steps: int = 128,
-    block_length: int = 128,
-    temperature: float = 0.0,
-    remasking: str = "low_confidence",
-) -> torch.Tensor:
-    """
-    Same signature/semantics as generate.generate(), minus cfg_scale
-    (CFG doubles the batch and complicates cache bookkeeping; add back
-    once single-sequence caching is verified correct).
-    """
-    assert gen_length % block_length == 0, "gen_length must be divisible by block_length"
-    num_blocks = gen_length // block_length
-    steps_per_block = steps // num_blocks
-
-    device = prompt_ids.device
-    P = prompt_ids.shape[1]
-
-    x = torch.full((1, P + gen_length), MASK_ID, dtype=torch.long, device=device)
-    x[:, :P] = prompt_ids
-    prompt_index = (x != MASK_ID)
-
-    # Prime the cache with the prompt (prefix) once.
-    _, cache = model(prompt_ids, position_offset=0, past_kv=None)
+def get_expert_threshold(step, steps_per_block, expert_threshold=0.03, max_threshold=0.05):
+    """Start with high threshold, drop to baseline (e.g. 0.03) at the end."""
+    progress = step / max(steps_per_block - 1, 1)
+    thresh = max_threshold - (max_threshold - expert_threshold) * progress
+    return thresh
 
 def _generate_block_cached(
     model,
@@ -76,7 +58,11 @@ def _generate_block_cached(
     cache,
     temperature: float,
     remasking: str,
-    topk_override: int | None = None,
+    use_dynamic_experts: bool = False,
+    base_k: int = 8,
+    min_k: int = 4,
+    expert_threshold: float = 0.03,
+    max_threshold: float = 0.05,
 ):
     block_length = block_end - block_start
     device = x.device
@@ -89,11 +75,19 @@ def _generate_block_cached(
         active_ids = x[:, block_start:block_end]
         mask_index = (active_ids == MASK_ID)
 
+        if use_dynamic_experts:
+            dynamic_k = get_dynamic_k(step, steps_per_block, base_k, min_k)
+            thresh = get_expert_threshold(step, steps_per_block, expert_threshold, max_threshold)
+        else:
+            dynamic_k = None
+            thresh = 0.0
+
         suffix_logits, _ = model(
             suffix_ids,
             position_offset=block_start,
             past_kv=cache,
-            topk_override=topk_override
+            dynamic_k=dynamic_k,
+            expert_threshold=thresh
         )
         logits = suffix_logits[:, :block_length]
 
@@ -127,7 +121,8 @@ def _generate_block_cached(
         finalized_ids,
         position_offset=block_start,
         past_kv=cache,
-        topk_override=topk_override
+        dynamic_k=None,
+        expert_threshold=0.0
     )
     cache = concat_kv(cache, new_kv)
     
@@ -143,6 +138,11 @@ def generate_cached(
     block_length: int = 128,
     temperature: float = 0.0,
     remasking: str = "low_confidence",
+    use_dynamic_experts: bool = False,
+    base_k: int = 8,
+    min_k: int = 4,
+    expert_threshold: float = 0.03,
+    max_threshold: float = 0.05,
 ) -> torch.Tensor:
     """
     Same signature/semantics as generate.generate(), minus cfg_scale
@@ -175,100 +175,11 @@ def generate_cached(
             cache=cache,
             temperature=temperature,
             remasking=remasking,
-            topk_override=None
+            use_dynamic_experts=use_dynamic_experts,
+            base_k=base_k,
+            min_k=min_k,
+            expert_threshold=expert_threshold,
+            max_threshold=max_threshold
         )
 
     return x[:, P:]
-
-
-class Verifier:
-    def score(self, prompt_ids, partial_response_ids) -> float:
-        """Higher = more promising partial solution. Must be implemented by a concrete verifier."""
-        raise NotImplementedError
-
-class LogProbVerifier(Verifier):
-    def __init__(self, model):
-        self.model = model
-
-    def score(self, prompt_ids, partial_response_ids) -> float:
-        """
-        Trivial placeholder for testing the search mechanics without a real PRM.
-        NOT competitive with a trained PRM. Real accuracy gains depend on a real verifier.
-        Scores by the model's own mean token confidence over the partial response.
-        """
-        with torch.no_grad():
-            logits, _ = self.model(partial_response_ids, position_offset=0, past_kv=None)
-            logprobs = F.log_softmax(logits.float(), dim=-1)
-            max_logprobs = logprobs.max(dim=-1).values
-            return max_logprobs.mean().item()
-
-
-@torch.no_grad()
-def generate_des(
-    model,
-    prompt_ids: torch.Tensor,
-    verifier: Verifier,
-    gen_length: int = 128,
-    steps: int = 128,
-    block_length: int = 128,
-    N: int = 32,
-    M: int | None = None,
-    k_candidates: tuple = (4, 5, 6, 7, 8, 9, 10, 11),
-    max_des_steps: int | None = None,
-    temperature: float = 0.8,
-):
-    if M is None:
-        M = max(1, N // 4)
-    if max_des_steps is None:
-        max_des_steps = gen_length // block_length
-        
-    assert gen_length % block_length == 0
-    steps_per_block = steps // (gen_length // block_length)
-    device = prompt_ids.device
-    P = prompt_ids.shape[1]
-
-    # Initial prompt caching
-    _, prompt_cache = model(prompt_ids, position_offset=0, past_kv=None)
-    
-    # Create N candidates using k_candidates uniformly
-    C = []
-    num_k = len(k_candidates)
-    
-    for i in range(N):
-        k = k_candidates[i % num_k]
-        state = torch.full((1, P + gen_length), MASK_ID, dtype=torch.long, device=device)
-        state[:, :P] = prompt_ids
-        C.append({"state": state, "k": k, "cache": prompt_cache, "score": 0.0})
-
-    for step_idx in range(max_des_steps):
-        block_start = P + step_idx * block_length
-        block_end = block_start + block_length
-        
-        new_C = []
-        for cand in C:
-            new_state, new_cache = _generate_block_cached(
-                model=model,
-                x=cand["state"].clone(),
-                block_start=block_start,
-                block_end=block_end,
-                steps_per_block=steps_per_block,
-                cache=cand["cache"],
-                temperature=temperature,
-                remasking="low_confidence",
-                topk_override=cand["k"]
-            )
-            
-            partial_response = new_state[:, :block_end]
-            score = verifier.score(prompt_ids, partial_response)
-            
-            new_C.append({"state": new_state, "k": cand["k"], "cache": new_cache, "score": score})
-            
-        # Sort and prune to top-M
-        new_C.sort(key=lambda c: c["score"], reverse=True)
-        C = new_C[:M]
-        
-        k_counts = {k: sum(1 for c in C if c["k"] == k) for k in k_candidates}
-        print(f"[DES Step {step_idx+1}] Retained {len(C)} candidates. Expert counts (k): {k_counts}")
-        
-    # Return highest scoring candidate
-    return C[0]["state"][:, P:P+max_des_steps*block_length]

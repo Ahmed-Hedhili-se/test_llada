@@ -149,14 +149,21 @@ class MoEBlock(nn.Module):
         self.gate = nn.Linear(cfg.H, cfg.NE, bias=False)
         self.experts = nn.ModuleList([ExpertMLP(cfg) for _ in range(cfg.NE)])
 
-    def forward(self, x, topk_override: Optional[int] = None):
+    def forward(self, x, dynamic_k: Optional[int] = None, expert_threshold: float = 0.0):
         cfg = self.cfg
         B, T, _ = x.shape
         x_flat = x.view(B * T, cfg.H)
 
         routing_weights = F.softmax(self.gate(x_flat), dim=-1, dtype=torch.float32)
-        k = topk_override if topk_override is not None else cfg.TOPK
+        k = dynamic_k if dynamic_k is not None else cfg.TOPK
         routing_weights, selected_experts = torch.topk(routing_weights, k, dim=-1)
+        
+        if expert_threshold > 0:
+            mask = routing_weights > expert_threshold
+            routing_weights = routing_weights * mask
+            sum_w = routing_weights.sum(dim=-1, keepdim=True).clamp(min=1e-9)
+            routing_weights = routing_weights / sum_w
+
         routing_weights = routing_weights.to(x.dtype)
 
         out = torch.zeros_like(x_flat)
@@ -181,10 +188,10 @@ class Layer(nn.Module):
         self.post_attention_layernorm = RMSNorm(cfg.H, cfg.EPS)
         self.mlp = MoEBlock(cfg)
 
-    def forward(self, x, cos, sin, past_kv=None, topk_override: Optional[int] = None):
+    def forward(self, x, cos, sin, past_kv=None, dynamic_k: Optional[int] = None, expert_threshold: float = 0.0):
         attn_out, kv_new = self.self_attn(self.input_layernorm(x), cos, sin, past_kv)
         x = x + attn_out
-        x = x + self.mlp(self.post_attention_layernorm(x), topk_override=topk_override)
+        x = x + self.mlp(self.post_attention_layernorm(x), dynamic_k=dynamic_k, expert_threshold=expert_threshold)
         return x, kv_new
 
 
@@ -202,7 +209,8 @@ class LLaDAMoEKV(nn.Module):
         input_ids: torch.Tensor,
         position_offset: int = 0,
         past_kv: Optional[KVCache] = None,
-        topk_override: Optional[int] = None,
+        dynamic_k: Optional[int] = None,
+        expert_threshold: float = 0.0,
     ):
         """
         input_ids: [B, T] — either the full sequence (past_kv=None, e.g. prefix
@@ -228,7 +236,7 @@ class LLaDAMoEKV(nn.Module):
         new_kv: KVCache = []
         for i, layer in enumerate(self.layers):
             layer_past = past_kv[i] if past_kv is not None else None
-            x, kv_i = layer(x, cos, sin, layer_past, topk_override=topk_override)
+            x, kv_i = layer(x, cos, sin, layer_past, dynamic_k=dynamic_k, expert_threshold=expert_threshold)
             new_kv.append(kv_i)
 
         x = self.norm(x)

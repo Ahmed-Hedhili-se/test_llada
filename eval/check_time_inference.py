@@ -56,17 +56,10 @@ def load_new_approach(weight_dir, device):
 def benchmark_generation(model, device, prompt_ids, gen_length, steps, block_length,
                          num_warmup, num_runs, is_new=False, **kwargs):
     if is_new:
-        from model_update.generate import generate_cached, generate_des, LogProbVerifier
-        use_des = kwargs.pop("use_des", False)
-        if use_des:
-            verifier = LogProbVerifier(model)
-            gen_fn = lambda: generate_des(
-                model, prompt_ids, verifier, gen_length, steps, block_length, **kwargs
-            )
-        else:
-            gen_fn = lambda: generate_cached(
-                model, prompt_ids, gen_length, steps, block_length, **kwargs
-            )
+        from model_update.generate import generate_cached
+        gen_fn = lambda: generate_cached(
+            model, prompt_ids, gen_length, steps, block_length, **kwargs
+        )
     else:
         def diffusion_generate(model, prompt_ids, gen_length=64, steps=64, block_length=32):
             import numpy as np
@@ -184,10 +177,10 @@ def main():
     configs = []
 
     configs.append(("2. CACHE ONLY (Block-wise)", {
-        "is_new": True, "use_des": False,
+        "is_new": True, "use_dynamic_experts": False,
     }))
-    configs.append(("3. DES (N=4, M=1)", {
-        "is_new": True, "use_des": True, "N": 4, "M": 1,
+    configs.append(("3. CACHE + DYNAMIC EXPERTS", {
+        "is_new": True, "use_dynamic_experts": True,
     }))
 
     results = [("1. DENSE BASELINE", baseline_gen_mean, baseline_tok_per_sec)]
