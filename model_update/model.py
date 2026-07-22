@@ -160,6 +160,11 @@ class MoEBlock(nn.Module):
         
         if expert_threshold > 0:
             keep = routing_weights > expert_threshold
+            # Hard Safety Floor: Ensure every token retains at least 1 expert (highest weighted)
+            zero_expert_tokens = (keep.sum(dim=-1) == 0)
+            if zero_expert_tokens.any():
+                keep[zero_expert_tokens, 0] = True
+
             routing_weights = routing_weights * keep
             sum_w = routing_weights.sum(dim=-1, keepdim=True).clamp(min=1e-9)
             routing_weights = routing_weights / sum_w

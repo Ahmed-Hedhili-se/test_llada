@@ -179,22 +179,77 @@ def main():
     configs.append(("2. CACHE ONLY (Block-wise)", {
         "is_new": True, "use_dynamic_experts": False,
     }))
-    configs.append(("3. CACHE + DYNAMIC EXPERTS", {
-        "is_new": True, "use_dynamic_experts": True,
+    configs.append(("3. CACHE + DYNAMIC EXPERTS (min_k=4)", {
+        "is_new": True, "use_dynamic_experts": True, "min_k": 4, "base_k": 8, "expert_threshold": 0.0,
+    }))
+    configs.append(("4. CACHE + DYNAMIC EXPERTS (min_k=5)", {
+        "is_new": True, "use_dynamic_experts": True, "min_k": 5, "base_k": 8, "expert_threshold": 0.0,
+    }))
+    configs.append(("5. CACHE + DYNAMIC EXPERTS (min_k=6)", {
+        "is_new": True, "use_dynamic_experts": True, "min_k": 6, "base_k": 8, "expert_threshold": 0.0,
     }))
 
-    results = [("1. DENSE BASELINE", baseline_gen_mean, baseline_tok_per_sec)]
+    results = []
+
+    # Compute baseline token output for divergence check
+    def set_seed(seed=42):
+        import random
+        import numpy as np
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
+    set_seed(42)
+    baseline_out = benchmark_generation(
+        baseline, args.device, prompt_ids, args.gen_length, args.steps,
+        args.block_length, num_warmup=0, num_runs=1, is_new=False
+    )
+    baseline_gen_lats = benchmark_generation(
+        baseline, args.device, prompt_ids, args.gen_length, args.steps,
+        args.block_length, args.num_warmup, args.num_runs, is_new=False
+    )
+    baseline_gen_mean, _, _ = get_stats(baseline_gen_lats)
+    baseline_tok_per_sec = args.gen_length / baseline_gen_mean
+    results.append(("1. DENSE BASELINE", baseline_gen_mean, baseline_tok_per_sec, "0.00%"))
+
+    del baseline
+    import gc
+    gc.collect()
+    if "cuda" in args.device:
+        torch.cuda.empty_cache()
+
+    # 2. New Approach
+    print("================ LOADING NEW APPROACH ================")
+    new_model, new_load_time = load_new_approach(args.weight_dir, args.device)
+    print(f"  New Approach loaded in {new_load_time:.2f} seconds.\n")
+
+    # Baseline output for divergence comparison
+    set_seed(42)
+    from model_update.generate import generate_cached
+    ref_tokens = generate_cached(
+        new_model, prompt_ids, args.gen_length, args.steps, args.block_length, use_dynamic_experts=False
+    )[0].cpu()
 
     for name, kwargs in configs:
         print(f"================ {name} ================")
+        set_seed(42)
+        test_tokens = generate_cached(
+            new_model, prompt_ids, args.gen_length, args.steps, args.block_length, **kwargs
+        )[0].cpu()
+        
+        diff_count = (ref_tokens != test_tokens).sum().item()
+        div_pct = f"{(diff_count / len(ref_tokens)) * 100:.2f}%"
+
         gen_lats = benchmark_generation(
             new_model, args.device, prompt_ids, args.gen_length, args.steps,
             args.block_length, args.num_warmup, args.num_runs, **kwargs
         )
         gen_mean, _, _ = get_stats(gen_lats)
         tok_per_sec = args.gen_length / gen_mean
-        print(f"  Mean latency: {gen_mean:.2f}s ({tok_per_sec:.2f} tok/s)\n")
-        results.append((name, gen_mean, tok_per_sec))
+        print(f"  Mean latency: {gen_mean:.2f}s ({tok_per_sec:.2f} tok/s) | Divergence vs Cache-Only: {div_pct}\n")
+        results.append((name, gen_mean, tok_per_sec, div_pct))
 
     del new_model
     gc.collect()
@@ -202,22 +257,22 @@ def main():
         torch.cuda.empty_cache()
 
     # Output Results Table
-    print("=" * 130)
-    print("                                   BENCHMARK RESULTS COMPARISON")
-    print("=" * 130)
-    print(f"| {'Configuration':<50} | {'Time (sec)':>12} | {'Tok/sec':>10} | {'Speedup':>10} |")
-    print(f"|{'-'*50}|{'-'*14}|{'-'*12}|{'-'*12}|")
+    print("=" * 140)
+    print("                                   BENCHMARK & DIVERGENCE STANDING CHECK")
+    print("=" * 140)
+    print(f"| {'Configuration':<48} | {'Time (sec)':>12} | {'Tok/sec':>10} | {'Speedup':>10} | {'Token Div %':>12} |")
+    print(f"|{'-'*48}|{'-'*14}|{'-'*12}|{'-'*12}|{'-'*14}|")
     baseline_time = results[0][1]
-    for name, t, tps in results:
+    for name, t, tps, div in results:
         speedup = baseline_time / t if t > 0 else 0
-        print(f"| {name:<50} | {t:>12.2f} | {tps:>10.2f} | {speedup:>9.2f}x |")
-    print("=" * 130)
+        print(f"| {name:<48} | {t:>12.2f} | {tps:>10.2f} | {speedup:>9.2f}x | {div:>12} |")
+    print("=" * 140)
 
-    best_name, best_time, best_tps = min(results[1:], key=lambda x: x[1])
+    best_name, best_time, best_tps, best_div = min(results[1:], key=lambda x: x[1])
     best_speedup = baseline_time / best_time
-    print(f"\n🏆 BEST CONFIG: {best_name}")
+    print(f"\n🏆 FASTEST CONFIG: {best_name}")
     print(f"   Speedup: {best_speedup:.2f}x vs baseline")
-    print(f"   Time: {best_time:.2f}s | Throughput: {best_tps:.2f} tok/s")
+    print(f"   Time: {best_time:.2f}s | Throughput: {best_tps:.2f} tok/s | Token Divergence: {best_div}")
 
 if __name__ == "__main__":
     main()

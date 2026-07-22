@@ -43,12 +43,6 @@ def get_dynamic_k(step, steps_per_block, base_k=8, min_k=4):
     k = min_k + (base_k - min_k) * progress
     return int(round(k))
 
-def get_expert_threshold(step, steps_per_block, expert_threshold=0.03, max_threshold=0.05):
-    """Start with high threshold, drop to baseline (e.g. 0.03) at the end."""
-    progress = step / max(steps_per_block - 1, 1)
-    thresh = max_threshold - (max_threshold - expert_threshold) * progress
-    return thresh
-
 def _generate_block_cached(
     model,
     x: torch.Tensor,
@@ -61,8 +55,8 @@ def _generate_block_cached(
     use_dynamic_experts: bool = False,
     base_k: int = 8,
     min_k: int = 4,
-    expert_threshold: float = 0.03,
-    max_threshold: float = 0.05,
+    expert_threshold: float = 0.0,
+    max_threshold: float = 0.0,
 ):
     block_length = block_end - block_start
     device = x.device
@@ -77,7 +71,7 @@ def _generate_block_cached(
 
         if use_dynamic_experts:
             dynamic_k = get_dynamic_k(step, steps_per_block, base_k, min_k)
-            thresh = get_expert_threshold(step, steps_per_block, expert_threshold, max_threshold)
+            thresh = 0.0  # expert_threshold disabled per safety mandate
         else:
             dynamic_k = None
             thresh = 0.0
@@ -141,8 +135,8 @@ def generate_cached(
     use_dynamic_experts: bool = False,
     base_k: int = 8,
     min_k: int = 4,
-    expert_threshold: float = 0.03,
-    max_threshold: float = 0.05,
+    expert_threshold: float = 0.0,
+    max_threshold: float = 0.0,
 ) -> torch.Tensor:
     """
     Same signature/semantics as generate.generate(), minus cfg_scale
