@@ -12,7 +12,7 @@ low-confidence remasking, block restriction), but:
 import torch
 import torch.nn.functional as F
 
-from model_kvcache import concat_kv
+from .model import concat_kv
 
 MASK_ID = 156895
 
