@@ -210,8 +210,9 @@ def main():
     for name, kwargs in configs:
         print(f"================ {name} ================")
         set_seed(42)
+        gen_kwargs = {k: v for k, v in kwargs.items() if k != "is_new"}
         test_tokens = generate_cached(
-            new_model, prompt_ids, args.gen_length, args.steps, args.block_length, **kwargs
+            new_model, prompt_ids, args.gen_length, args.steps, args.block_length, **gen_kwargs
         )[0].cpu()
         
         diff_count = (ref_tokens != test_tokens).sum().item()
