@@ -25,8 +25,10 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from vllm.model_executor.layers.fused_moe import FusedMoE , fused_moe
 
-KVCache = List[Tuple[torch.Tensor, torch.Tensor]]  # per-layer (k, v), each [B, KVH, T, HD]
+# Type alias for KV cache (list of (k, v) tensor pairs for each layer)
+KVCache = List[Tuple[torch.Tensor, torch.Tensor]]
 
 
 @dataclass
@@ -46,6 +48,45 @@ class Cfg:
     @property
     def HD(self):
         return self.H // self.NH
+
+
+class VLLMFusedMoEBlock(nn.Module):
+    def __init__(self, cfg: Cfg):
+        super().__init__()
+        self.cfg = cfg
+        self.gate = nn.Linear(cfg.H, cfg.NE, bias=False)
+        self.w1 = nn.Parameter(torch.empty(cfg.NE, 2 * cfg.EI, cfg.H))
+        self.w2 = nn.Parameter(torch.empty(cfg.NE, cfg.H, cfg.EI))
+
+    def load_from_unfused(self, experts_module_list: nn.ModuleList):
+        with torch.no_grad():
+            for i, expert in enumerate(experts_module_list):
+                w_gate = expert.gate_proj.weight
+                w_up = expert.up_proj.weight
+
+                self.w1[i].copy_(torch.cat([w_gate, w_up], dim=0))
+                self.w2[i].copy_(expert.down_proj.weight)
+
+    def forward(self, x: torch.Tensor, dynamic_k: Optional[int] = None) -> torch.Tensor:
+        B, T, H = x.shape
+        x_flat = x.view(B * T, H)
+        router_logits = self.gate(x_flat)
+        routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float32)
+
+        k = dynamic_k if dynamic_k is not None else self.cfg.TOPK
+        topk_weights, topk_ids = torch.topk(routing_weights, k, dim=-1)
+
+        # call vllm triton fused kernel
+        out = fused_moe(
+            hidden_states=x_flat,
+            w1=self.w1,
+            w2=self.w2,
+            gating_output=topk_weights.to(x.dtype),
+            topk_ids=topk_ids.to(torch.int32),
+            inplace=False,
+        )
+        return out.view(B, T, H)
+
 
 
 FULL_CFG = Cfg(H=2048, NH=16, KVH=16, NL=16, NE=64, TOPK=8, EI=1024, VS=157184)
@@ -175,12 +216,12 @@ class MoEBlock(nn.Module):
 
 
 class Layer(nn.Module):
-    def __init__(self, cfg: Cfg):
+    def __init__(self, cfg: Cfg, use_fused_moe: bool = False):
         super().__init__()
         self.input_layernorm = RMSNorm(cfg.H, cfg.EPS)
         self.self_attn = Attention(cfg)
         self.post_attention_layernorm = RMSNorm(cfg.H, cfg.EPS)
-        self.mlp = MoEBlock(cfg)
+        self.mlp = VLLMFusedMoEBlock(cfg) if use_fused_moe else MoEBlock(cfg)
 
     def forward(self, x, cos, sin, past_kv=None, dynamic_k: Optional[int] = None):
         attn_out, kv_new = self.self_attn(self.input_layernorm(x), cos, sin, past_kv)
@@ -190,13 +231,14 @@ class Layer(nn.Module):
 
 
 class LLaDAMoEKV(nn.Module):
-    def __init__(self, cfg: Cfg = FULL_CFG):
+    def __init__(self, cfg: Cfg = FULL_CFG, use_fused_moe: bool = False):
         super().__init__()
         self.cfg = cfg
         self.embed_tokens = nn.Embedding(cfg.VS, cfg.H)
-        self.layers = nn.ModuleList([Layer(cfg) for _ in range(cfg.NL)])
+        self.layers = nn.ModuleList([Layer(cfg, use_fused_moe=use_fused_moe) for _ in range(cfg.NL)])
         self.norm = RMSNorm(cfg.H, cfg.EPS)
         self.lm_head = nn.Linear(cfg.H, cfg.VS, bias=False)
+
 
     def forward(
         self,
