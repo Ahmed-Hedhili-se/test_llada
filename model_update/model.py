@@ -21,20 +21,54 @@ tested at small scale and then run at full 7B-MoE scale.
 
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
+import sys
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-try:
-    from vllm.model_executor.layers.fused_moe.fused_moe import fused_moe
-except ImportError:
+import importlib.util
+import site
+from pathlib import Path
+
+
+def _load_fused_moe():
+    # 1. Try standard imports
+    try:
+        from vllm.model_executor.layers.fused_moe.fused_moe import fused_moe
+        if callable(fused_moe):
+            return fused_moe
+    except Exception:
+        pass
+
     try:
         from vllm.model_executor.layers.fused_moe import fused_moe
-    except ImportError:
-        fused_moe = None
+        if callable(fused_moe):
+            return fused_moe
+        elif hasattr(fused_moe, "fused_moe"):
+            return fused_moe.fused_moe
+    except Exception:
+        pass
 
-if fused_moe is not None and not callable(fused_moe) and hasattr(fused_moe, "fused_moe"):
-    fused_moe = fused_moe.fused_moe
+    # 2. Try loading fused_moe.py directly from site-packages (bypassing vllm.__init__)
+    try:
+        site_dirs = site.getsitepackages()
+        if hasattr(site, "getuserbase"):
+            site_dirs.append(str(Path(site.getuserbase()) / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"))
+        for sp in site_dirs:
+            target = Path(sp) / "vllm" / "model_executor" / "layers" / "fused_moe" / "fused_moe.py"
+            if target.exists():
+                spec = importlib.util.spec_from_file_location("vllm_fused_moe_standalone", str(target))
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                if hasattr(mod, "fused_moe") and callable(mod.fused_moe):
+                    return mod.fused_moe
+    except Exception:
+        pass
+
+    return None
+
+
+fused_moe = _load_fused_moe()
 
 # Type alias for KV cache (list of (k, v) tensor pairs for each layer)
 KVCache = List[Tuple[torch.Tensor, torch.Tensor]]

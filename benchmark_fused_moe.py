@@ -282,6 +282,18 @@ def main():
     device = torch.device(args.device)
     dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[args.dtype]
 
+    if device.type == "cuda" and not cuda_ok:
+        print("\n" + "=" * 60)
+        print(f"[ERROR] Cannot run benchmark on '{device}': CUDA GPU is not functional.")
+        print("Reason: The host NVIDIA driver on your server is incompatible with PyTorch.")
+        print("=" * 60)
+        print("\n[ACTION REQUIRED] To fix GPU execution on srv-vgpu-02:")
+        print("  Option 1: Reinstall PyTorch for CUDA 12.1 in your venv:")
+        print("            pip install torch --index-url https://download.pytorch.org/whl/cu121")
+        print("  Option 2: Update host NVIDIA driver to version >= 535.xx")
+        print("  Option 3: Run CPU mode: python benchmark_fused_moe.py --device cpu --dtype float32 --config small\n")
+        return
+
     print("============================================================")
     print(" LLaDA-MoE Fused MoE Speedup Benchmark")
     print("============================================================")
@@ -289,22 +301,29 @@ def main():
     print(f" Dtype      : {dtype}")
     print(f" Config     : {args.config.upper()} (Hidden={cfg.H}, Layers={cfg.NL}, Experts={cfg.NE}, TopK={cfg.TOPK})")
 
-    # 1. Benchmark isolated MoE Layer
-    benchmark_layer_moe(cfg, device, dtype, batch_size=1, seq_len=args.block_len, warmup=args.warmup * 2, runs=args.runs * 4)
+    try:
+        # 1. Benchmark isolated MoE Layer
+        benchmark_layer_moe(cfg, device, dtype, batch_size=1, seq_len=args.block_len, warmup=args.warmup * 2, runs=args.runs * 4)
 
-    # 2. Benchmark Full Generation
-    if not args.layer_only:
-        benchmark_end_to_end_generation(
-            cfg=cfg,
-            device=device,
-            dtype=dtype,
-            prompt_len=args.prompt_len,
-            gen_len=args.gen_len,
-            steps=args.steps,
-            block_len=args.block_len,
-            warmup=args.warmup,
-            runs=args.runs,
-        )
+        # 2. Benchmark Full Generation
+        if not args.layer_only:
+            benchmark_end_to_end_generation(
+                cfg=cfg,
+                device=device,
+                dtype=dtype,
+                prompt_len=args.prompt_len,
+                gen_len=args.gen_len,
+                steps=args.steps,
+                block_len=args.block_len,
+                warmup=args.warmup,
+                runs=args.runs,
+            )
+    except RuntimeError as e:
+        if "NVIDIA driver" in str(e) or "cuda" in str(e).lower():
+            print(f"\n[ERROR] CUDA execution failed: {e}")
+            print("\nPlease fix your CUDA driver installation or run with `--device cpu`.")
+        else:
+            raise e
 
 
 if __name__ == "__main__":
