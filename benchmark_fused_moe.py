@@ -20,7 +20,7 @@ import torch.nn as nn
 # Ensure local workspace paths can be imported
 sys.path.insert(0, str(Path(__file__).parent))
 
-from model_update.model import LLaDAMoEKV, MoEBlock, VLLMFusedMoEBlock, FULL_CFG, SMALL_CFG
+from model_update.model import LLaDAMoEKV, MoEBlock, TritonFusedMoEBlock, FULL_CFG, SMALL_CFG
 from model_update.generate import generate_cached
 
 
@@ -46,7 +46,7 @@ def benchmark_layer_moe(cfg, device, dtype, batch_size, seq_len, warmup=5, runs=
 
     # 2. Fused MoE
     try:
-        fused_block = VLLMFusedMoEBlock(cfg).to(device=device, dtype=dtype).eval()
+        fused_block = TritonFusedMoEBlock(cfg).to(device=device, dtype=dtype).eval()
         init_moe_weights(fused_block)
         # Load weights from unfused to ensure matching shapes & initialized values
         fused_block.load_state_dict_from_unfused(unfused_block)

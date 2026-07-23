@@ -60,34 +60,50 @@ class Cfg:
         return self.H // self.NH
 
 
-class VLLMFusedMoEBlock(nn.Module):
+from .fused_moe_triton import fused_moe
+
+class TritonFusedMoEBlock(nn.Module):
     """
-    A compiled 'Fused' MoE block using PyTorch 2's native torch.compile().
-    This bypasses the need for vLLM's C++ extensions while providing substantial speedups.
+    A standalone Triton-based Fused MoE block.
+    Provides Grouped GEMM speedups without any C++ dependencies.
     """
     def __init__(self, cfg: Cfg):
         super().__init__()
         self.cfg = cfg
-        # We reuse the Unfused MoE logic, but wrap it in torch.compile to fuse operations (like SwiGLU and GEMM)
-        self.unfused_block = MoEBlock(cfg)
-        
-        import torch._dynamo
-        torch._dynamo.config.suppress_errors = True
-        self.compiled_block = torch.compile(self.unfused_block)
-
-    def load_from_unfused(self, experts_module_list: nn.ModuleList):
-        """Helper to copy weights directly from an unfused MoE block for 1:1 parity."""
-        # Instead of just experts, we expect the entire block state to be matched
-        # (This is handled in benchmark_fused_moe.py by loading the whole block if needed)
-        pass
+        self.gate = nn.Linear(cfg.H, cfg.NE, bias=False)
+        self.w1 = nn.Parameter(torch.empty(cfg.NE, 2 * cfg.EI, cfg.H))
+        self.w2 = nn.Parameter(torch.empty(cfg.NE, cfg.H, cfg.EI))
 
     def load_state_dict_from_unfused(self, unfused_block: nn.Module):
-        self.unfused_block.load_state_dict(unfused_block.state_dict())
+        # We must load the gate and the w1/w2 experts
+        with torch.no_grad():
+            self.gate.weight.copy_(unfused_block.gate.weight)
+            for i, expert in enumerate(unfused_block.experts):
+                w_gate = expert.gate_proj.weight
+                w_up = expert.up_proj.weight
+                self.w1[i].copy_(torch.cat([w_gate, w_up], dim=0))
+                self.w2[i].copy_(expert.down_proj.weight)
 
     def forward(self, x: torch.Tensor, dynamic_k: Optional[int] = None) -> torch.Tensor:
         if x.device.type == "cpu":
-            return self.unfused_block(x, dynamic_k=dynamic_k)
-        return self.compiled_block(x, dynamic_k=dynamic_k)
+            raise NotImplementedError("Triton Fused MoE requires a CUDA GPU.")
+
+        B, T, H = x.shape
+        x_flat = x.view(B * T, H)
+        router_logits = self.gate(x_flat)
+        routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float32)
+
+        k = dynamic_k if dynamic_k is not None else self.cfg.TOPK
+        topk_weights, topk_ids = torch.topk(routing_weights, k, dim=-1)
+
+        out = fused_moe(
+            hidden_states=x_flat,
+            w1=self.w1,
+            w2=self.w2,
+            gating_output=topk_weights.to(x.dtype),
+            topk_ids=topk_ids.to(torch.int32),
+        )
+        return out.view(B, T, H)
 
 
 
@@ -223,7 +239,7 @@ class Layer(nn.Module):
         self.input_layernorm = RMSNorm(cfg.H, cfg.EPS)
         self.self_attn = Attention(cfg)
         self.post_attention_layernorm = RMSNorm(cfg.H, cfg.EPS)
-        self.mlp = VLLMFusedMoEBlock(cfg) if use_fused_moe else MoEBlock(cfg)
+        self.mlp = TritonFusedMoEBlock(cfg) if use_fused_moe else MoEBlock(cfg)
 
     def forward(self, x, cos, sin, past_kv=None, dynamic_k: Optional[int] = None):
         attn_out, kv_new = self.self_attn(self.input_layernorm(x), cos, sin, past_kv)
