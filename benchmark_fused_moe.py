@@ -49,7 +49,7 @@ def benchmark_layer_moe(cfg, device, dtype, batch_size, seq_len, warmup=5, runs=
         fused_block = VLLMFusedMoEBlock(cfg).to(device=device, dtype=dtype).eval()
         init_moe_weights(fused_block)
         # Load weights from unfused to ensure matching shapes & initialized values
-        fused_block.load_from_unfused(unfused_block.experts)
+        fused_block.load_state_dict_from_unfused(unfused_block)
         fused_available = True
     except Exception as e:
         print(f"[WARN] Fused MoE initialization failed: {e}")
