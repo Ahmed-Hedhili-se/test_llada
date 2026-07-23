@@ -242,11 +242,30 @@ def benchmark_end_to_end_generation(
         print("Ensure vLLM / Triton CUDA dependencies are correctly installed.")
 
 
+def check_cuda_support():
+    """Safely check if CUDA is functional without crashing on driver mismatch."""
+    if not torch.cuda.is_available():
+        return False, False
+    try:
+        # Trigger lazy init safely
+        torch.cuda.current_device()
+        bf16_ok = torch.cuda.is_bf16_supported()
+        return True, bf16_ok
+    except Exception as e:
+        print(f"[WARN] CUDA initialization failed ({e}).")
+        print("       NVIDIA driver may be incompatible with the installed PyTorch CUDA version.")
+        return False, False
+
+
 def main():
+    cuda_ok, bf16_ok = check_cuda_support()
+    default_device = "cuda" if cuda_ok else "cpu"
+    default_dtype = "bfloat16" if (cuda_ok and bf16_ok) else "float32"
+
     parser = argparse.ArgumentParser(description="Benchmark Fused MoE vs Unfused MoE in LLaDA")
     parser.add_argument("--config", type=str, choices=["full", "small"], default="full", help="Model configuration scale")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device (cuda or cpu)")
-    parser.add_argument("--dtype", type=str, choices=["bfloat16", "float16", "float32"], default="bfloat16" if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else "float32")
+    parser.add_argument("--device", type=str, default=default_device, help="Device (cuda or cpu)")
+    parser.add_argument("--dtype", type=str, choices=["bfloat16", "float16", "float32"], default=default_dtype)
     parser.add_argument("--prompt-len", type=int, default=128, help="Prompt sequence length")
     parser.add_argument("--gen-len", type=int, default=128, help="Generated sequence length")
     parser.add_argument("--steps", type=int, default=64, help="Total diffusion steps")
