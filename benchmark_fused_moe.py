@@ -89,36 +89,39 @@ def benchmark_layer_moe(cfg, device, dtype, batch_size, seq_len, warmup=5, runs=
     print(f"  Unfused MoE Block latency: {unfused_ms:.3f} ms | Throughput: {unfused_tok_per_sec:,.1f} tok/s")
 
     if fused_available:
-        # Warmup Fused
-        for _ in range(warmup):
-            with torch.no_grad():
-                _ = fused_block(x)
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-
-        # Measure Fused
-        if device.type == "cuda":
-            start_evt.record()
-            for _ in range(runs):
+        try:
+            # Warmup Fused
+            for _ in range(warmup):
                 with torch.no_grad():
                     _ = fused_block(x)
-            end_evt.record()
-            torch.cuda.synchronize()
-            fused_ms = start_evt.elapsed_time(end_evt) / runs
-        else:
-            t0 = time.perf_counter()
-            for _ in range(runs):
-                with torch.no_grad():
-                    _ = fused_block(x)
-            t1 = time.perf_counter()
-            fused_ms = ((t1 - t0) / runs) * 1000.0
+            if device.type == "cuda":
+                torch.cuda.synchronize()
 
-        fused_tok_per_sec = (batch_size * seq_len) / (fused_ms / 1000.0)
-        speedup = unfused_ms / fused_ms if fused_ms > 0 else 0
-        pct_increase = ((fused_tok_per_sec - unfused_tok_per_sec) / unfused_tok_per_sec) * 100.0
+            # Measure Fused
+            if device.type == "cuda":
+                start_evt.record()
+                for _ in range(runs):
+                    with torch.no_grad():
+                        _ = fused_block(x)
+                end_evt.record()
+                torch.cuda.synchronize()
+                fused_ms = start_evt.elapsed_time(end_evt) / runs
+            else:
+                t0 = time.perf_counter()
+                for _ in range(runs):
+                    with torch.no_grad():
+                        _ = fused_block(x)
+                t1 = time.perf_counter()
+                fused_ms = ((t1 - t0) / runs) * 1000.0
 
-        print(f"  Fused MoE Block latency:   {fused_ms:.3f} ms | Throughput: {fused_tok_per_sec:,.1f} tok/s")
-        print(f"  >>> Isolated MoE Speedup: {speedup:.2f}x ({pct_increase:+.1f}% throughput increase)")
+            fused_tok_per_sec = (batch_size * seq_len) / (fused_ms / 1000.0)
+            speedup = unfused_ms / fused_ms if fused_ms > 0 else 0
+            pct_increase = ((fused_tok_per_sec - unfused_tok_per_sec) / unfused_tok_per_sec) * 100.0
+
+            print(f"  Fused MoE Block latency:   {fused_ms:.3f} ms | Throughput: {fused_tok_per_sec:,.1f} tok/s")
+            print(f"  >>> Isolated MoE Speedup: {speedup:.2f}x ({pct_increase:+.1f}% throughput increase)")
+        except Exception as e:
+            print(f"  [SKIP] Fused MoE execution skipped/failed: {e}")
     else:
         print("  [SKIP] Fused MoE could not be benchmarked on this environment.")
 

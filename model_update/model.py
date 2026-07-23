@@ -25,7 +25,16 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from vllm.model_executor.layers.fused_moe import FusedMoE , fused_moe
+try:
+    from vllm.model_executor.layers.fused_moe.fused_moe import fused_moe
+except ImportError:
+    try:
+        from vllm.model_executor.layers.fused_moe import fused_moe
+    except ImportError:
+        fused_moe = None
+
+if fused_moe is not None and not callable(fused_moe) and hasattr(fused_moe, "fused_moe"):
+    fused_moe = fused_moe.fused_moe
 
 # Type alias for KV cache (list of (k, v) tensor pairs for each layer)
 KVCache = List[Tuple[torch.Tensor, torch.Tensor]]
@@ -68,6 +77,11 @@ class VLLMFusedMoEBlock(nn.Module):
                 self.w2[i].copy_(expert.down_proj.weight)
 
     def forward(self, x: torch.Tensor, dynamic_k: Optional[int] = None) -> torch.Tensor:
+        if x.device.type == "cpu":
+            raise NotImplementedError("Fused MoE (vLLM Triton kernel) requires a CUDA GPU device.")
+        if fused_moe is None or not callable(fused_moe):
+            raise RuntimeError("vllm fused_moe is not callable or available.")
+
         B, T, H = x.shape
         x_flat = x.view(B * T, H)
         router_logits = self.gate(x_flat)
