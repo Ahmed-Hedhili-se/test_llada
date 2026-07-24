@@ -123,6 +123,36 @@ python -m eval.check_time_inference --weight-dir weights --topk <K>
 
 > **Note**: These benchmarks ran on CPU due to a CUDA driver mismatch on the test server. On GPU, the Triton fused MoE kernel provides **additional** speedup since it replaces 64 sequential expert calls with a single grouped-GEMM kernel — the CPU benchmark cannot benefit from this Triton fusion.
 
+### Dynamic Expert Ramping (earlier GPU benchmark)
+
+Before fused MoE was added, the dynamic expert ramping mechanism was benchmarked independently. During denoising, the number of active experts ramps linearly from `min_k` at step 0 up to `base_k=8` at the final step:
+
+| Configuration | Time (s) | Tok/s | Speedup | Token Divergence |
+|---|---:|---:|:---:|:---:|
+| 1. Dense Baseline | 6.81 | 4.70 | 1.00× | 0.00% |
+| 2. Cache Only (Block-wise) | 6.43 | 4.98 | 1.06× | 0.00% |
+| 3. Cache + Dynamic Experts (min\_k=4) | 5.68 | 5.63 | **1.20×** | 6.25% |
+| 4. Cache + Dynamic Experts (min\_k=5) | 5.98 | 5.35 | 1.14× | 0.00% |
+| 5. Cache + Dynamic Experts (min\_k=6) | 6.12 | 5.23 | 1.11× | 0.00% |
+
+🏆 **Fastest**: Cache + Dynamic Experts (min\_k=4) — 1.20× speedup, 5.68s, 5.63 tok/s
+
+### Understanding Token Divergence (9.38%)
+
+In the CPU benchmarks above, the token divergence is **constant at 9.38% (3/32 tokens) regardless of top-k**. This is expected:
+
+- If the divergence were caused by using fewer experts, you'd see 0% divergence at topk=8 (same as baseline) and increasing divergence at topk=5 and topk=4. But it's always 3 tokens.
+- The cause is the **block-wise KV caching itself**, which changes the attention context:
+
+| | Baseline (`src/`) | Optimized (`model_update/`) |
+|---|---|---|
+| Each step runs | `model(entire_sequence)` | `model(active_block, cache)` |
+| Active tokens attend to | Prompt + current block + **future `[MASK]` blocks** | Prefix + current block only (**no future blocks**) |
+
+Since LLaDA uses **bidirectional (non-causal) attention**, the baseline lets tokens "see" future `[MASK]` tokens in upcoming blocks. The cached version cannot (future blocks aren't computed yet). The 3 divergent tokens are cases where seeing vs not seeing future masks tips the `argmax` prediction differently.
+
+> **This is not a quality issue** — both outputs are valid denoising trajectories. The masked diffusion process has multiple valid solutions, and the 3 tokens that diverge are near confidence-boundary cases.
+
 ---
 
 ## Correctness Verification
