@@ -1,18 +1,19 @@
 """
-Option A Benchmark: Conservative speedup with accuracy safety.
+Inference Time Benchmark: Baseline vs Optimized.
 
 Compares:
-  1. Dense Baseline (src/)
-  2. Block-wise KV Cache (model_update/)
-  3. Dynamic Experts Search (DES) (model_update/)
+  1. Dense Baseline (src/)  — unfused MoE, no KV cache, topk=8
+  2. Optimized     (model_update/) — Triton fused MoE, block-wise KV cache, topk=5
 """
 
 import argparse
+import gc
 import os
 import sys
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer
@@ -25,7 +26,36 @@ sys.path.insert(0, str(workspace_root))
 MASK_ID = 156895
 
 
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+def set_seed(seed=42):
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def get_stats(latencies):
+    l_sorted = sorted(latencies)
+    mean_val = sum(l_sorted) / len(l_sorted)
+    median_val = l_sorted[len(l_sorted) // 2]
+    p95_val = l_sorted[int(len(l_sorted) * 0.95)]
+    return mean_val, median_val, p95_val
+
+
+def free_model(model, device):
+    del model
+    gc.collect()
+    if "cuda" in device:
+        torch.cuda.empty_cache()
+
+
+# ── loaders ──────────────────────────────────────────────────────────────────
+
 def load_baseline(weight_dir, device):
+    """Load the original dense (unfused) model from src/."""
     from src.model import LLaDAMoE, load_weights
     if "cuda" in device:
         torch.cuda.synchronize()
@@ -37,7 +67,8 @@ def load_baseline(weight_dir, device):
     return model, time.perf_counter() - t0
 
 
-def load_new_approach(weight_dir, device):
+def load_optimized(weight_dir, device):
+    """Load the optimized model from model_update/ with Triton fused MoE."""
     from model_update.model import LLaDAMoEKV, FULL_CFG
     from src.model import load_weights
     if "cuda" in device:
@@ -47,80 +78,89 @@ def load_new_approach(weight_dir, device):
     try:
         load_weights(model, weight_dir, verbose=False)
     except Exception as e:
-        print(f"Warning: Failed to load weights: {e}")
+        print(f"  Warning: Failed to load weights: {e}")
     if "cuda" in device:
         torch.cuda.synchronize()
     return model, time.perf_counter() - t0
 
 
-def benchmark_generation(model, device, prompt_ids, gen_length, steps, block_length,
-                         num_warmup, num_runs, is_new=False, **kwargs):
-    if is_new:
-        from model_update.generate import generate_cached
-        gen_fn = lambda: generate_cached(
-            model, prompt_ids, gen_length, steps, block_length, **kwargs
-        )
-    else:
-        def diffusion_generate(model, prompt_ids, gen_length=64, steps=64, block_length=32):
-            import numpy as np
-            device = prompt_ids.device
-            P = prompt_ids.shape[1]
-            x = torch.full((1, P + gen_length), MASK_ID, dtype=torch.long, device=device)
-            x[:, :P] = prompt_ids
-            num_blocks = gen_length // block_length
-            steps_per_block = steps // num_blocks
-            for block_idx in range(num_blocks):
-                bs = P + block_idx * block_length
-                be = P + (block_idx + 1) * block_length
-                block_mask = (x[:, bs:be] == MASK_ID)
-                mask_num = block_mask.sum(dim=1, keepdim=True)
-                base = mask_num // steps_per_block
-                rem = mask_num % steps_per_block
-                ntok = torch.zeros(1, steps_per_block, device=device, dtype=torch.long) + base
-                for i in range(1):
-                    ntok[i, :rem[i]] += 1
-                for step in range(steps_per_block):
-                    mask_index = (x == MASK_ID)
-                    with torch.no_grad():
-                        logits = model(x)
-                    x0 = logits.argmax(dim=-1)
-                    p = F.softmax(logits.float(), dim=-1)
-                    x0_p = p.gather(-1, x0.unsqueeze(-1)).squeeze(-1)
-                    x0_p[:, be:] = -np.inf
-                    x0 = torch.where(mask_index, x0, x)
-                    conf = torch.where(mask_index, x0_p, torch.tensor(-np.inf, device=device))
-                    transfer = torch.zeros_like(x0, dtype=torch.bool)
-                    k = ntok[0, step].item()
-                    if k > 0:
-                        _, sel = torch.topk(conf[0], k=int(k))
-                        transfer[0, sel] = True
-                    x[transfer] = x0[transfer]
-            return x[0, P:]
-        gen_fn = lambda: diffusion_generate(model, prompt_ids, gen_length, steps, block_length)
+# ── generation wrappers ──────────────────────────────────────────────────────
 
+def baseline_generate(model, prompt_ids, gen_length, steps, block_length):
+    """LLaDA iterative unmasking without KV cache (baseline src/ model)."""
+    device = prompt_ids.device
+    P = prompt_ids.shape[1]
+    x = torch.full((1, P + gen_length), MASK_ID, dtype=torch.long, device=device)
+    x[:, :P] = prompt_ids
+
+    num_blocks = gen_length // block_length
+    steps_per_block = steps // num_blocks
+
+    for block_idx in range(num_blocks):
+        bs = P + block_idx * block_length
+        be = P + (block_idx + 1) * block_length
+        block_mask = (x[:, bs:be] == MASK_ID)
+        mask_num = block_mask.sum(dim=1, keepdim=True)
+        base = mask_num // steps_per_block
+        rem = mask_num % steps_per_block
+        ntok = torch.zeros(1, steps_per_block, device=device, dtype=torch.long) + base
+        for i in range(1):
+            ntok[i, :rem[i]] += 1
+
+        for step in range(steps_per_block):
+            mask_index = (x == MASK_ID)
+            with torch.no_grad():
+                logits = model(x)
+            x0 = logits.argmax(dim=-1)
+            p = F.softmax(logits.float(), dim=-1)
+            x0_p = p.gather(-1, x0.unsqueeze(-1)).squeeze(-1)
+            x0_p[:, be:] = -np.inf
+            x0 = torch.where(mask_index, x0, x)
+            conf = torch.where(mask_index, x0_p, torch.tensor(-np.inf, device=device))
+            transfer = torch.zeros_like(x0, dtype=torch.bool)
+            k = ntok[0, step].item()
+            if k > 0:
+                _, sel = torch.topk(conf[0], k=int(k))
+                transfer[0, sel] = True
+            x[transfer] = x0[transfer]
+
+    return x[0, P:]
+
+
+def optimized_generate(model, prompt_ids, gen_length, steps, block_length, topk):
+    """Generation with block-wise KV cache, fused MoE, and fixed topk."""
+    from model_update.generate import generate_cached
+    return generate_cached(
+        model, prompt_ids, gen_length, steps, block_length,
+        use_dynamic_experts=True, base_k=topk, min_k=topk,  # fixed topk (no ramp)
+    )
+
+
+# ── benchmarking ─────────────────────────────────────────────────────────────
+
+def benchmark(gen_fn, device, num_warmup, num_runs):
+    """Run warmup + timed runs and return list of latencies."""
     for _ in range(num_warmup):
-        _ = gen_fn()
+        gen_fn()
     if "cuda" in device:
         torch.cuda.synchronize()
 
     latencies = []
     for _ in range(num_runs):
+        if "cuda" in device:
+            torch.cuda.synchronize()
         t0 = time.perf_counter()
-        _ = gen_fn()
+        gen_fn()
         if "cuda" in device:
             torch.cuda.synchronize()
         latencies.append(time.perf_counter() - t0)
     return latencies
 
 
-def get_stats(latencies):
-    l_sorted = sorted(latencies)
-    mean_val = sum(l_sorted) / len(l_sorted)
-    return mean_val, l_sorted[len(l_sorted) // 2], l_sorted[int(len(l_sorted) * 0.95)]
-
+# ── main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description="Baseline vs Optimized inference time comparison")
     ap.add_argument("--weight-dir", default="weights")
     ap.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--num-warmup", type=int, default=1)
@@ -128,19 +168,24 @@ def main():
     ap.add_argument("--gen-length", type=int, default=32)
     ap.add_argument("--steps", type=int, default=32)
     ap.add_argument("--block-length", type=int, default=16)
+    ap.add_argument("--topk", type=int, default=5, help="Fixed top-k experts for the optimized model")
     args = ap.parse_args()
 
-    print(f"================================================================")
-    print(f" Benchmark: Inference Time Comparison")
-    print(f"================================================================")
+    print("=" * 80)
+    print("  Benchmark: Baseline (src/) vs Optimized (model_update/)")
+    print("=" * 80)
     print(f"  Device           : {args.device}")
     print(f"  PyTorch Version  : {torch.__version__}")
     print(f"  Weight Directory : {args.weight_dir}")
+    print(f"  Gen Length       : {args.gen_length}")
+    print(f"  Steps            : {args.steps}")
+    print(f"  Block Length     : {args.block_length}")
+    print(f"  Optimized top-k  : {args.topk}")
     print(f"  Warmup Runs      : {args.num_warmup}")
     print(f"  Benchmark Runs   : {args.num_runs}")
-    print(f"================================================================\n")
+    print("=" * 80 + "\n")
 
-    if not os.path.exists(args.weight_dir) or not os.path.isdir(args.weight_dir):
+    if not os.path.isdir(args.weight_dir):
         print(f"Error: Weight directory '{args.weight_dir}' does not exist.")
         sys.exit(1)
 
@@ -151,104 +196,87 @@ def main():
     test_prompt = "The chemical symbol for gold is Au and for silver is"
     prompt_ids = tok(test_prompt, return_tensors="pt")["input_ids"].to(args.device)
 
-    # 1. Baseline
-    print("================ 1. DENSE BASELINE ================")
-    baseline, baseline_load_time = load_baseline(args.weight_dir, args.device)
-    print(f"  Baseline loaded in {baseline_load_time:.2f} seconds.")
-    baseline_gen_lats = benchmark_generation(
-        baseline, args.device, prompt_ids, args.gen_length, args.steps,
-        args.block_length, args.num_warmup, args.num_runs, is_new=False
-    )
-    baseline_gen_mean, _, _ = get_stats(baseline_gen_lats)
-    baseline_tok_per_sec = args.gen_length / baseline_gen_mean
-    print(f"  Mean latency: {baseline_gen_mean:.2f}s ({baseline_tok_per_sec:.2f} tok/s)\n")
+    # ────────────────────────────────────────────────────────────────────────
+    # 1. Dense Baseline  (src/ — unfused MoE, no KV cache, topk=8)
+    # ────────────────────────────────────────────────────────────────────────
+    print("=" * 60)
+    print("  1. DENSE BASELINE  (src/, unfused MoE, topk=8, no cache)")
+    print("=" * 60)
+    baseline_model, baseline_load_time = load_baseline(args.weight_dir, args.device)
+    print(f"  Loaded in {baseline_load_time:.2f}s")
 
-    del baseline
-    import gc
-    gc.collect()
-    if "cuda" in args.device:
-        torch.cuda.empty_cache()
-
-    # 2. New Approach
-    print("================ LOADING NEW APPROACH ================")
-    new_model, new_load_time = load_new_approach(args.weight_dir, args.device)
-    print(f"  New Approach loaded in {new_load_time:.2f} seconds.\n")
-
-    configs = []
-
-    configs.append(("2. CACHE ONLY (Block-wise)", {
-        "is_new": True, "use_dynamic_experts": False,
-    }))
-    configs.append(("3. CACHE + DYNAMIC EXPERTS (min_k=4)", {
-        "is_new": True, "use_dynamic_experts": True, "min_k": 4, "base_k": 8,
-    }))
-    configs.append(("4. CACHE + DYNAMIC EXPERTS (min_k=5)", {
-        "is_new": True, "use_dynamic_experts": True, "min_k": 5, "base_k": 8,
-    }))
-    configs.append(("5. CACHE + DYNAMIC EXPERTS (min_k=6)", {
-        "is_new": True, "use_dynamic_experts": True, "min_k": 6, "base_k": 8,
-    }))
-
-    results = [("1. DENSE BASELINE", baseline_gen_mean, baseline_tok_per_sec, "0.00%")]
-
-    def set_seed(seed=42):
-        import random
-        import numpy as np
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
-
-    # Cache-only output for divergence comparison
     set_seed(42)
-    from model_update.generate import generate_cached
-    ref_tokens = generate_cached(
-        new_model, prompt_ids, args.gen_length, args.steps, args.block_length, use_dynamic_experts=False
+    baseline_tokens = baseline_generate(
+        baseline_model, prompt_ids, args.gen_length, args.steps, args.block_length
+    ).cpu()
+
+    baseline_lats = benchmark(
+        lambda: baseline_generate(baseline_model, prompt_ids, args.gen_length, args.steps, args.block_length),
+        args.device, args.num_warmup, args.num_runs,
+    )
+    bl_mean, bl_med, bl_p95 = get_stats(baseline_lats)
+    bl_tps = args.gen_length / bl_mean
+    print(f"  Mean: {bl_mean:.2f}s | Median: {bl_med:.2f}s | P95: {bl_p95:.2f}s | {bl_tps:.2f} tok/s\n")
+
+    free_model(baseline_model, args.device)
+
+    # ────────────────────────────────────────────────────────────────────────
+    # 2. Optimized  (model_update/ — fused MoE, KV cache, topk=5)
+    # ────────────────────────────────────────────────────────────────────────
+    print("=" * 60)
+    print(f"  2. OPTIMIZED  (model_update/, fused MoE, topk={args.topk}, KV cache)")
+    print("=" * 60)
+    opt_model, opt_load_time = load_optimized(args.weight_dir, args.device)
+    print(f"  Loaded in {opt_load_time:.2f}s")
+
+    set_seed(42)
+    opt_tokens = optimized_generate(
+        opt_model, prompt_ids, args.gen_length, args.steps, args.block_length, args.topk
     )[0].cpu()
 
-    for name, kwargs in configs:
-        print(f"================ {name} ================")
-        set_seed(42)
-        gen_kwargs = {k: v for k, v in kwargs.items() if k != "is_new"}
-        test_tokens = generate_cached(
-            new_model, prompt_ids, args.gen_length, args.steps, args.block_length, **gen_kwargs
-        )[0].cpu()
-        
-        diff_count = (ref_tokens != test_tokens).sum().item()
-        div_pct = f"{(diff_count / len(ref_tokens)) * 100:.2f}%"
+    opt_lats = benchmark(
+        lambda: optimized_generate(opt_model, prompt_ids, args.gen_length, args.steps, args.block_length, args.topk),
+        args.device, args.num_warmup, args.num_runs,
+    )
+    opt_mean, opt_med, opt_p95 = get_stats(opt_lats)
+    opt_tps = args.gen_length / opt_mean
+    print(f"  Mean: {opt_mean:.2f}s | Median: {opt_med:.2f}s | P95: {opt_p95:.2f}s | {opt_tps:.2f} tok/s\n")
 
-        gen_lats = benchmark_generation(
-            new_model, args.device, prompt_ids, args.gen_length, args.steps,
-            args.block_length, args.num_warmup, args.num_runs, **kwargs
-        )
-        gen_mean, _, _ = get_stats(gen_lats)
-        tok_per_sec = args.gen_length / gen_mean
-        print(f"  Mean latency: {gen_mean:.2f}s ({tok_per_sec:.2f} tok/s) | Divergence vs Cache-Only: {div_pct}\n")
-        results.append((name, gen_mean, tok_per_sec, div_pct))
+    # ── token divergence ─────────────────────────────────────────────────────
+    min_len = min(len(baseline_tokens), len(opt_tokens))
+    diff_count = (baseline_tokens[:min_len] != opt_tokens[:min_len]).sum().item()
+    div_pct = (diff_count / min_len) * 100
 
-    del new_model
-    gc.collect()
-    if "cuda" in args.device:
-        torch.cuda.empty_cache()
+    free_model(opt_model, args.device)
 
-    # Output Results Table
-    print("=" * 140)
-    print("                                   BENCHMARK & DIVERGENCE STANDING CHECK")
-    print("=" * 140)
-    print(f"| {'Configuration':<48} | {'Time (sec)':>12} | {'Tok/sec':>10} | {'Speedup':>10} | {'Token Div %':>12} |")
-    print(f"|{'-'*48}|{'-'*14}|{'-'*12}|{'-'*12}|{'-'*14}|")
-    baseline_time = results[0][1]
-    for name, t, tps, div in results:
-        speedup = baseline_time / t if t > 0 else 0
-        print(f"| {name:<48} | {t:>12.2f} | {tps:>10.2f} | {speedup:>9.2f}x | {div:>12} |")
-    print("=" * 140)
+    # ────────────────────────────────────────────────────────────────────────
+    # Results
+    # ────────────────────────────────────────────────────────────────────────
+    speedup = bl_mean / opt_mean if opt_mean > 0 else float("inf")
 
-    best_name, best_time, best_tps, best_div = min(results[1:], key=lambda x: x[1])
-    best_speedup = baseline_time / best_time
-    print(f"\n🏆 FASTEST CONFIG: {best_name}")
-    print(f"   Speedup: {best_speedup:.2f}x vs baseline")
-    print(f"   Time: {best_time:.2f}s | Throughput: {best_tps:.2f} tok/s | Token Divergence: {best_div}")
+    print("=" * 100)
+    print("                              RESULTS")
+    print("=" * 100)
+    header = f"| {'Configuration':<50} | {'Time (s)':>10} | {'Tok/s':>10} | {'Speedup':>10} |"
+    sep    = f"|{'-'*50}|{'-'*12}|{'-'*12}|{'-'*12}|"
+    print(header)
+    print(sep)
+    print(f"| {'Baseline (src/, topk=8, no cache)':<50} | {bl_mean:>10.2f} | {bl_tps:>10.2f} | {'1.00x':>10} |")
+    print(f"| {f'Optimized (model_update/, topk={args.topk}, KV cache)':<50} | {opt_mean:>10.2f} | {opt_tps:>10.2f} | {f'{speedup:.2f}x':>10} |")
+    print("=" * 100)
+    print(f"\n  Token Divergence : {diff_count}/{min_len} tokens ({div_pct:.2f}%)")
+    print(f"  Speedup          : {speedup:.2f}x")
+
+    if speedup > 1:
+        print(f"\n  ✅ Optimized model is {speedup:.2f}x faster than baseline.")
+    else:
+        print(f"\n  ⚠️  Optimized model is {1/speedup:.2f}x slower than baseline.")
+
+    decoded_baseline = tok.decode(baseline_tokens, skip_special_tokens=True)
+    decoded_opt = tok.decode(opt_tokens, skip_special_tokens=True)
+    print(f"\n  Baseline output : {decoded_baseline[:200]}")
+    print(f"  Optimized output: {decoded_opt[:200]}")
+
 
 if __name__ == "__main__":
     main()

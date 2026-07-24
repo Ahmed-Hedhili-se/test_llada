@@ -13,3 +13,5 @@ aiohttp
 
 lm-eval[api]>=0.4.4
 tqdm
+
+triton>=2.1.0

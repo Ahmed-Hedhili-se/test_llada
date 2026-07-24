@@ -47,3 +47,7 @@ optimized_results.json
 *.swo
 .DS_Store
 Thumbs.db
+
+# AI tooling
+.agents/
+.gemini/
