@@ -146,15 +146,14 @@ def chat_completions(req: ChatRequest):
             )
         elif BACKEND == "fast_dense":
             # Option A: Fast dense cached + conservative dynamic experts
-            from model_update.generate import generate_dense_cached
-            out_ids = generate_dense_cached(
+            from model_update.generate import generate_cached
+            out_ids = generate_cached(
                 MODEL,
                 input_ids,
                 gen_length=gen_length,
                 steps=steps,
                 block_length=block_length,
                 temperature=req.temperature,
-                cache_budget=2048,
                 use_dynamic_experts=True,
                 base_k=8,
                 min_k=5,
@@ -235,9 +234,19 @@ def load_model(weight_dir: str, device: str, backend: str):
         MODEL = LLaDAMoE().to(torch.bfloat16).to(device).eval()
         load_weights(MODEL, weight_dir, verbose=True)
     elif backend in ("fast_dense", "dyn_experts"):
-        from model_update.model import LLaDAMoE, load_weights
-        MODEL = LLaDAMoE().to(torch.bfloat16).to(device).eval()
+        from model_update.model import LLaDAMoEKV, TritonFusedMoEBlock
+        from src.model import load_weights
+        print("Instantiating unfused model to load weights...")
+        MODEL = LLaDAMoEKV(use_fused_moe=False).to(torch.bfloat16).eval()
         load_weights(MODEL, weight_dir, verbose=True)
+        
+        print("Converting to Fused MoE blocks...")
+        for i, layer in enumerate(MODEL.layers):
+            fused_mlp = TritonFusedMoEBlock(layer.mlp.cfg).to(torch.bfloat16)
+            fused_mlp.load_state_dict_from_unfused(layer.mlp)
+            layer.mlp = fused_mlp
+            
+        MODEL = MODEL.to(device)
     elif backend == "ours_kv":
         from src.Model_KVcache import LLaDAMoEKV
         MODEL = LLaDAMoEKV().to(torch.bfloat16).to(device).eval()
