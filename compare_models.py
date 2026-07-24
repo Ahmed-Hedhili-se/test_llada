@@ -29,10 +29,20 @@ GEN_LEN = 32   # short generation suffix appended for logit comparison
 
 def load_ours(weight_dir: str):
     sys.path.insert(0, str(Path(__file__).parent))
-    from src.model import LLaDAMoE, load_weights
-    model = LLaDAMoE().to(torch.bfloat16).to("cuda:0").eval()
+    from model_update.model import LLaDAMoEKV, TritonFusedMoEBlock
+    from src.model import load_weights
+    
+    print("Instantiating unfused model to load weights...")
+    model = LLaDAMoEKV(use_fused_moe=False).to(torch.bfloat16).eval()
     load_weights(model, weight_dir, verbose=True)
-    return model
+    
+    print("Converting to Fused MoE blocks...")
+    for i, layer in enumerate(model.layers):
+        fused_mlp = TritonFusedMoEBlock(layer.mlp.cfg).to(torch.bfloat16)
+        fused_mlp.load_state_dict_from_unfused(layer.mlp)
+        layer.mlp = fused_mlp
+        
+    return model.to("cuda:0")
 
 
 def load_hf(weight_dir: str):
@@ -60,6 +70,15 @@ def make_diffusion_input(prompt_ids: torch.Tensor, gen_length: int) -> tuple[tor
 def diffusion_generate(model, prompt_ids, gen_length=64, steps=64, block_length=32,
                         temperature=0.0, is_hf=False):
     """Run the masked diffusion decode loop, works for both our model and HF."""
+    if not is_hf:
+        # Use our optimized cached generation loop
+        from model_update.generate import generate_cached
+        return generate_cached(
+            model, prompt_ids, gen_length=gen_length, steps=steps,
+            block_length=block_length, temperature=temperature,
+            use_dynamic_experts=False  # Keep TopK=8 to perfectly match HF for test
+        )
+
     import numpy as np
 
     device = prompt_ids.device

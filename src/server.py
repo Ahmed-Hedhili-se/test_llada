@@ -36,8 +36,8 @@ TOKENIZER = None
 DEVICE = "cuda:0"
 BACKEND = "ours"
 
-DEFAULT_STEPS        = 128
-DEFAULT_GEN_LENGTH   = 128
+DEFAULT_STEPS        = 512
+DEFAULT_GEN_LENGTH   = 512
 DEFAULT_BLOCK_LENGTH = 32
 DEFAULT_TEMPERATURE  = 0.0
 DEFAULT_CFG_SCALE    = 0.0
@@ -176,15 +176,22 @@ def chat_completions(req: ChatRequest):
                 min_k=5,
             )
         elif BACKEND == "hf":
-            # Use standard HuggingFace generate
-            out_ids = MODEL.generate(
+            # HuggingFace's .generate() blocks diffusion models in newer versions.
+            # We wrap the HF model to return logits and use our diffusion generate loop.
+            from src.generate import generate
+            class HFWrapper:
+                def __init__(self, m): self.m = m
+                def __call__(self, x, **kwargs): return self.m(x, **kwargs).logits
+            
+            out_ids = generate(
+                HFWrapper(MODEL),
                 input_ids,
-                max_new_tokens=gen_length,
-                do_sample=False,
-                temperature=req.temperature if req.temperature > 0 else None,
-                top_p=req.top_p if req.temperature > 0 else None,
-                pad_token_id=TOKENIZER.pad_token_id,
-                eos_token_id=TOKENIZER.eos_token_id,
+                gen_length=gen_length,
+                steps=steps,
+                block_length=block_length,
+                temperature=req.temperature,
+                cfg_scale=req.cfg_scale,
+                remasking=req.remasking,
             )
     elapsed = time.time() - t0
 
