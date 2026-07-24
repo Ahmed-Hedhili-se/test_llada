@@ -236,6 +236,7 @@ def load_model(weight_dir: str, device: str, backend: str):
     elif backend in ("fast_dense", "dyn_experts"):
         from model_update.model import LLaDAMoEKV, TritonFusedMoEBlock
         from src.model import load_weights
+        
         print("Instantiating unfused model to load weights...")
         MODEL = LLaDAMoEKV(use_fused_moe=False).to(torch.bfloat16).eval()
         load_weights(MODEL, weight_dir, verbose=True)
