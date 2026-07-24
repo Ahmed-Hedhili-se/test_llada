@@ -168,23 +168,67 @@ def main():
 
     tok = AutoTokenizer.from_pretrained(args.weight_dir, trust_remote_code=True)
 
+    # ---------------- Phase 1: Ours ----------------
     print("Loading our model...")
     ours = load_ours(args.weight_dir)
-    print("Loading HF model...")
-    hf = load_hf(args.weight_dir)  # noqa: requires transformers==4.53.x
-    print()
-
-    sep = "=" * 72
-    all_cos, all_matches = [], []
-
+    
+    our_results = []
     torch.manual_seed(42)
     for prompt_text in PROMPTS:
         prompt_ids = tok(prompt_text, return_tensors="pt")["input_ids"].to("cuda:0")
         x, P = make_diffusion_input(prompt_ids, GEN_LEN)
-
         with torch.no_grad():
-            our_logits = ours(x)         # [1, P+GEN_LEN, V]
-            hf_logits  = hf(x).logits   # [1, P+GEN_LEN, V]
+            our_logits = ours(x).cpu()
+        
+        our_gen = None
+        if not args.no_gen:
+            our_gen = diffusion_generate(
+                ours, prompt_ids, args.gen_length, args.steps,
+                args.block_length, is_hf=False
+            ).cpu()
+            
+        our_results.append((our_logits, our_gen, P))
+        
+    print("Unloading our model to free VRAM...")
+    del ours
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    # ---------------- Phase 2: HF ----------------
+    print("\nLoading HF model...")
+    hf = load_hf(args.weight_dir)
+    
+    hf_results = []
+    torch.manual_seed(42)
+    for prompt_text in PROMPTS:
+        prompt_ids = tok(prompt_text, return_tensors="pt")["input_ids"].to("cuda:0")
+        x, P = make_diffusion_input(prompt_ids, GEN_LEN)
+        with torch.no_grad():
+            hf_logits = hf(x).logits.cpu()
+            
+        hf_gen = None
+        if not args.no_gen:
+            hf_gen = diffusion_generate(
+                hf, prompt_ids, args.gen_length, args.steps,
+                args.block_length, is_hf=True
+            ).cpu()
+            
+        hf_results.append((hf_logits, hf_gen))
+        
+    print("Unloading HF model...")
+    del hf
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    # ---------------- Phase 3: Compare ----------------
+    print("\nComparing Results...")
+    sep = "=" * 72
+    all_cos, all_matches = [], []
+
+    for i, prompt_text in enumerate(PROMPTS):
+        our_logits, our_gen, P = our_results[i]
+        hf_logits, hf_gen = hf_results[i]
 
         cos_scores, matches = compare_all_masked_positions(our_logits, hf_logits, P, GEN_LEN, tok)
         avg_cos   = sum(cos_scores) / len(cos_scores)
@@ -192,7 +236,6 @@ def main():
         all_cos.extend(cos_scores)
         all_matches.extend(matches)
 
-        # Show first-mask-pos top-5 for qualitative check
         ol0 = our_logits[0, P].float()
         hl0 = hf_logits[0, P].float()
 
@@ -205,10 +248,6 @@ def main():
         print(f"  pos[0] HF   top-5 : {topk_tokens(hl0, tok)}")
 
         if not args.no_gen:
-            our_gen = diffusion_generate(ours, prompt_ids, args.gen_length, args.steps,
-                                          args.block_length, is_hf=False)
-            hf_gen  = diffusion_generate(hf,   prompt_ids, args.gen_length, args.steps,
-                                          args.block_length, is_hf=True)
             our_ids = our_gen.tolist()
             hf_ids  = hf_gen.tolist()
             if tok.eos_token_id in our_ids: our_ids = our_ids[:our_ids.index(tok.eos_token_id)]
@@ -223,7 +262,6 @@ def main():
     print(f"OVERALL  positions={len(all_cos)}")
     print(f"         avg_cosine={overall_cos:.4f}")
     print(f"         top1_match={sum(all_matches)}/{len(all_matches)} ({overall_top1*100:.1f}%)")
-
 
 if __name__ == "__main__":
     main()
