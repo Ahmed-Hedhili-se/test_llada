@@ -178,7 +178,7 @@ def main():
         prompt_ids = tok(prompt_text, return_tensors="pt")["input_ids"].to("cuda:0")
         x, P = make_diffusion_input(prompt_ids, GEN_LEN)
         with torch.no_grad():
-            our_logits = ours(x).cpu()
+            our_logits = ours(x)[0].cpu()
         
         our_gen = None
         if not args.no_gen:
