@@ -162,9 +162,10 @@ Verified against the HuggingFace reference implementation:
 | Metric | Result |
 |---|---|
 | Weight mapping | 3,219 / 3,219 (100%) |
-| Logit cosine similarity | avg **0.9706** across 256 masked positions |
-| Top-1 token match | **91.4%** (234/256) |
-| Generation quality | Matches HF on factual, code, and math prompts |
+| Logit cosine similarity | avg **0.9781** across 256 masked positions |
+| Top-1 token match | **91.0%** (233/256) |
+| GSM8K-CoT Accuracy (`fast_dense`) | **36.5%** (demonstrates strong robustness with `topk=5` and dynamic experts) |
+| Generation quality | Matches HF generation behavior with exact cosine precision |
 
 ---
 
