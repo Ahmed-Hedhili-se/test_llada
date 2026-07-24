@@ -248,8 +248,8 @@ def main():
         print(f"  pos[0] HF   top-5 : {topk_tokens(hl0, tok)}")
 
         if not args.no_gen:
-            our_ids = our_gen.tolist()
-            hf_ids  = hf_gen.tolist()
+            our_ids = our_gen.flatten().tolist()
+            hf_ids  = hf_gen.flatten().tolist()
             if tok.eos_token_id in our_ids: our_ids = our_ids[:our_ids.index(tok.eos_token_id)]
             if tok.eos_token_id in hf_ids:  hf_ids  = hf_ids[:hf_ids.index(tok.eos_token_id)]
             print(f"  ours gen : {repr(tok.decode(our_ids, skip_special_tokens=True)[:200])}")
