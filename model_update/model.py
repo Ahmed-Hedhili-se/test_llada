@@ -35,9 +35,6 @@ def _load_fused_moe():
     return None
 
 fused_moe = None
-
-
-# Type alias for KV cache (list of (k, v) tensor pairs for each layer)
 KVCache = List[Tuple[torch.Tensor, torch.Tensor]]
 
 
@@ -63,10 +60,6 @@ class Cfg:
 from .fused_moe_triton import fused_moe
 
 class TritonFusedMoEBlock(nn.Module):
-    """
-    A standalone Triton-based Fused MoE block.
-    Provides Grouped GEMM speedups without any C++ dependencies.
-    """
     def __init__(self, cfg: Cfg):
         super().__init__()
         self.cfg = cfg
@@ -75,7 +68,6 @@ class TritonFusedMoEBlock(nn.Module):
         self.w2 = nn.Parameter(torch.empty(cfg.NE, cfg.H, cfg.EI))
 
     def load_state_dict_from_unfused(self, unfused_block: nn.Module):
-        # We must load the gate and the w1/w2 experts
         with torch.no_grad():
             self.gate.weight.copy_(unfused_block.gate.weight)
             for i, expert in enumerate(unfused_block.experts):
