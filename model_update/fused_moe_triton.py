@@ -16,7 +16,8 @@ def fused_moe_kernel(
         stride_bse, stride_bsn,
         BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
         GROUP_SIZE_M: tl.constexpr, MUL_ROUTED_WEIGHT: tl.constexpr, top_k: tl.constexpr,
-        compute_type: tl.constexpr, use_fp8_w8a8: tl.constexpr, use_int8_w8a16: tl.constexpr):
+        compute_type: tl.constexpr, use_fp8_w8a8: tl.constexpr, use_int8_w8a16: tl.constexpr,
+        is_first_gemm: tl.constexpr):
     
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
@@ -37,7 +38,10 @@ def fused_moe_kernel(
 
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a_ptrs = a_ptr + (offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak)
+    if is_first_gemm:
+        a_ptrs = a_ptr + (offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak)
+    else:
+        a_ptrs = a_ptr + (offs_token[:, None] * stride_am + offs_k[None, :] * stride_ak)
 
     off_experts = tl.load(expert_ids_ptr + pid_m)
     b_ptrs = b_ptr + off_experts * stride_be + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
@@ -102,6 +106,7 @@ def invoke_fused_moe_kernel(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor,
                             mul_routed_weight: bool, top_k: int, config: Dict[str, Any]) -> None:
     compute_type = tl.bfloat16 if A.dtype == torch.bfloat16 else tl.float16
     grid = lambda META: (triton.cdiv(sorted_token_ids.shape[0], META['BLOCK_SIZE_M']) * triton.cdiv(B.shape[1], META['BLOCK_SIZE_N']), )
+    is_first_gemm = not mul_routed_weight
     fused_moe_kernel[grid](
         A, B, C, None, None,
         topk_weights, sorted_token_ids, expert_ids, num_tokens_post_padded,
@@ -112,6 +117,7 @@ def invoke_fused_moe_kernel(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor,
         0, 0,
         MUL_ROUTED_WEIGHT=mul_routed_weight, top_k=top_k,
         compute_type=compute_type, use_fp8_w8a8=False, use_int8_w8a16=False,
+        is_first_gemm=is_first_gemm,
         **config,
     )
 
