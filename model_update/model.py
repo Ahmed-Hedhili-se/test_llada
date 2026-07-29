@@ -20,7 +20,7 @@ tested at small scale and then run at full 7B-MoE scale.
 """
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Literal, Union
 import sys
 
 import torch
@@ -31,35 +31,34 @@ import site
 from pathlib import Path
 import torch.distributed as dist
 from .distributed import get_tp_size, get_tp_rank, get_tp_group
-import vllm.distributed as vllm_distributed
 import re
-from vllm.model_executor.models.utils import maybe_prefix
-from vllm.model_executor.layers.linear import (ColumnParallelLinear,
-                        ReplicatedLinear,
-                        RowParallelLinear)
 
-def torch_all_reduce(tensor) :
-    torch.distributed.all_reduce(tensor)
-    return tensor
-vllm_distributed.tensor_model_parallel_all_reduce = torch_all_reduce
+try:
+    import vllm.distributed as vllm_distributed
+    def torch_all_reduce(tensor):
+        torch.distributed.all_reduce(tensor)
+        return tensor
+    vllm_distributed.tensor_model_parallel_all_reduce = torch_all_reduce
+except ImportError:
+    pass
 
 
-
-def replace_linear_class( linear: nn.Linear, style: Literal["colwise", "rowwise"] , quant_config,
-) -> Union[ColumnParallelLinear, RowParallelLinear]:
-
-    if not instance (style , str ) : 
+def replace_linear_class(linear: nn.Linear, style: str, quant_config):
+    from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear, ReplicatedLinear
+    if not isinstance(style, str): 
         raise ValueError(f"Unsupported parallel style type {type(style)}, expected str")
-    vllm_linear_cls= {
-        "colwise" : ColumnParallelLinear ,
-        "rowwise" : RowParallelLinear,
-    }.get(style , ReplicatedLinear)
+    vllm_linear_cls = {
+        "colwise": ColumnParallelLinear,
+        "rowwise": RowParallelLinear,
+    }.get(style, ReplicatedLinear)
 
-    return vllm_linear_cls(input_size=linear.in_features,
+    return vllm_linear_cls(
+        input_size=linear.in_features,
         output_size=linear.out_features,
         bias=linear.bias is not None,
         quant_config=quant_config,
-        return_bias=False,)
+        return_bias=False,
+    )
 
     
 
@@ -379,6 +378,8 @@ class LLaDAMoEKV(nn.Module):
     def tensor_parallel(self, tp_size):
         tp_plan = self._tp_plan
         self._tp_size = tp_size
+
+        from vllm.model_executor.models.utils import maybe_prefix
 
         def _tensor_parallel(module: nn.Module, prefix: str = ""):
             for child_name, child_module in module.named_children():
