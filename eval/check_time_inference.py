@@ -46,10 +46,15 @@ def get_stats(latencies):
 
 
 def free_model(model, device):
+    try:
+        model.to("cpu")
+    except Exception:
+        pass
     del model
     gc.collect()
     if "cuda" in device:
         torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
 
 # ── loaders ──────────────────────────────────────────────────────────────────
@@ -60,8 +65,9 @@ def load_baseline(weight_dir, device):
     if "cuda" in device:
         torch.cuda.synchronize()
     t0 = time.perf_counter()
-    model = LLaDAMoE().to(torch.bfloat16).to(device).eval()
+    model = LLaDAMoE().to(torch.bfloat16).eval()
     load_weights(model, weight_dir, verbose=False)
+    model = model.to(device)
     if "cuda" in device:
         torch.cuda.synchronize()
     return model, time.perf_counter() - t0
@@ -74,15 +80,16 @@ def load_optimized(weight_dir, device):
     if "cuda" in device:
         torch.cuda.synchronize()
     t0 = time.perf_counter()
-    model = LLaDAMoEKV(FULL_CFG, use_fused_moe=False).to(torch.bfloat16).to(device).eval()
+    model = LLaDAMoEKV(FULL_CFG, use_fused_moe=False).to(torch.bfloat16).eval()
     try:
         load_weights(model, weight_dir, verbose=False)
         for i, layer in enumerate(model.layers):
-            fused_mlp = TritonFusedMoEBlock(layer.mlp.cfg).to(torch.bfloat16).to(device)
+            fused_mlp = TritonFusedMoEBlock(layer.mlp.cfg).to(torch.bfloat16)
             fused_mlp.load_state_dict_from_unfused(layer.mlp)
             layer.mlp = fused_mlp
     except Exception as e:
         print(f"  Warning: Failed to load weights: {e}")
+    model = model.to(device)
     if "cuda" in device:
         torch.cuda.synchronize()
     return model, time.perf_counter() - t0
@@ -173,6 +180,7 @@ def main():
     ap.add_argument("--steps", type=int, default=32)
     ap.add_argument("--block-length", type=int, default=16)
     ap.add_argument("--topk", type=int, default=5, help="Fixed top-k experts for the optimized model")
+    ap.add_argument("--mode", choices=["both", "baseline", "optimized"], default="both", help="Which model(s) to benchmark")
     args = ap.parse_args()
 
     print("=" * 80)
