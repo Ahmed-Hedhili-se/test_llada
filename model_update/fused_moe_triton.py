@@ -1,7 +1,28 @@
+import os
+import json
 import torch
 import triton
 import triton.language as tl
 from typing import Any, Dict, Optional, Tuple
+
+TUNED_CONFIGS = {}
+config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "moe_tune_config.json")
+try:
+    if os.path.exists(config_path):
+        with open(config_path, "r") as f:
+            TUNED_CONFIGS = json.load(f)
+except Exception as e:
+    print(f"Warning: Failed to load {config_path}: {e}")
+
+def get_best_config(M: int, E: int) -> Dict[str, Any]:
+    if TUNED_CONFIGS:
+        m_keys = [int(k) for k in TUNED_CONFIGS.keys()]
+        closest_m = min(m_keys, key=lambda k: abs(k - M))
+        return TUNED_CONFIGS[str(closest_m)]
+        
+    if M <= E:
+        return {'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}
+    return {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}
 
 @triton.jit
 def fused_moe_kernel(
@@ -107,6 +128,11 @@ def invoke_fused_moe_kernel(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor,
     compute_type = tl.bfloat16 if A.dtype == torch.bfloat16 else tl.float16
     grid = lambda META: (triton.cdiv(sorted_token_ids.shape[0], META['BLOCK_SIZE_M']) * triton.cdiv(B.shape[1], META['BLOCK_SIZE_N']), )
     is_first_gemm = not mul_routed_weight
+    
+    kernel_kwargs = config.copy()
+    num_warps = kernel_kwargs.pop('num_warps', 4)
+    num_stages = kernel_kwargs.pop('num_stages', 4)
+    
     fused_moe_kernel[grid](
         A, B, C, None, None,
         topk_weights, sorted_token_ids, expert_ids, num_tokens_post_padded,
@@ -118,7 +144,8 @@ def invoke_fused_moe_kernel(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor,
         MUL_ROUTED_WEIGHT=mul_routed_weight, top_k=top_k,
         compute_type=compute_type, use_fp8_w8a8=False, use_int8_w8a16=False,
         is_first_gemm=is_first_gemm,
-        **config,
+        num_warps=num_warps, num_stages=num_stages,
+        **kernel_kwargs,
     )
 
 def fused_moe(hidden_states: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor,
@@ -128,10 +155,7 @@ def fused_moe(hidden_states: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor,
     E, N, _ = w1.shape
     top_k = topk_ids.shape[1]
     
-    # We use a static config that works well for most shapes
-    config = {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}
-    if M <= E:
-        config = {'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}
+    config = get_best_config(M, E)
 
     # 1. Align Block Size
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(topk_ids, config['BLOCK_SIZE_M'], E)
