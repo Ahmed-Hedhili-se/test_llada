@@ -16,8 +16,8 @@ def main():
     # Initialize the model using the small config for quick testing by default.
     # To test with full config, you can change SMALL_CFG to FULL_CFG
     cfg = SMALL_CFG 
-    print(f"Initializing model with Config: {cfg}")
-    model = LLaDAMoEKV(cfg).to(device)
+    print(f"Initializing model with Config: {cfg}, Fused MoE: True")
+    model = LLaDAMoEKV(cfg, use_fused_moe=True).to(device)
     model.eval()
 
     event_records = []
@@ -50,15 +50,28 @@ def main():
         layer.mlp.register_forward_hook(post_hook('mlp'))
 
     # Dummy input
-    B, T = 2, 128
-    print(f"Creating dummy input with Batch Size: {B}, Sequence Length: {T}")
-    input_ids = torch.randint(0, cfg.VS, (B, T), device=device)
+    B = 2
+    T_prefix = 128
+    T_active = 64
+    dynamic_k = 4 # Example of dynamic experts
+
+    print(f"Creating dummy input with Batch Size: {B}")
+    print(f"Prefix Length: {T_prefix}, Active Block Length: {T_active}")
+    print(f"Using dynamic_k: {dynamic_k} for MoE")
+
+    prefix_ids = torch.randint(0, cfg.VS, (B, T_prefix), device=device)
+    active_ids = torch.randint(0, cfg.VS, (B, T_active), device=device)
+    
+    # Generate KV cache from prefix
+    print("Generating prefix KV cache...")
+    with torch.no_grad():
+        _, past_kv = model(prefix_ids)
     
     # Warmup
-    print("Warming up...")
+    print("Warming up active block processing...")
     with torch.no_grad():
         for _ in range(3):
-            model(input_ids)
+            model(active_ids, position_offset=T_prefix, past_kv=past_kv, dynamic_k=dynamic_k)
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
 
@@ -70,7 +83,7 @@ def main():
     start_total = time.perf_counter()
     with torch.no_grad():
         for _ in range(num_steps):
-            model(input_ids)
+            model(active_ids, position_offset=T_prefix, past_kv=past_kv, dynamic_k=dynamic_k)
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
     end_total = time.perf_counter()
