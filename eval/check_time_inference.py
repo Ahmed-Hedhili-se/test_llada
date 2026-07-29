@@ -69,14 +69,18 @@ def load_baseline(weight_dir, device):
 
 def load_optimized(weight_dir, device):
     """Load the optimized model from model_update/ with Triton fused MoE."""
-    from model_update.model import LLaDAMoEKV, FULL_CFG
+    from model_update.model import LLaDAMoEKV, FULL_CFG, TritonFusedMoEBlock
     from src.model import load_weights
     if "cuda" in device:
         torch.cuda.synchronize()
     t0 = time.perf_counter()
-    model = LLaDAMoEKV(FULL_CFG).to(torch.bfloat16).to(device).eval()
+    model = LLaDAMoEKV(FULL_CFG, use_fused_moe=False).to(torch.bfloat16).to(device).eval()
     try:
         load_weights(model, weight_dir, verbose=False)
+        for i, layer in enumerate(model.layers):
+            fused_mlp = TritonFusedMoEBlock(layer.mlp.cfg).to(torch.bfloat16).to(device)
+            fused_mlp.load_state_dict_from_unfused(layer.mlp)
+            layer.mlp = fused_mlp
     except Exception as e:
         print(f"  Warning: Failed to load weights: {e}")
     if "cuda" in device:
