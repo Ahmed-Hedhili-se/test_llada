@@ -21,8 +21,8 @@ def get_best_config(M: int, E: int) -> Dict[str, Any]:
         return TUNED_CONFIGS[str(closest_m)]
         
     if M <= E:
-        return {'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}
-    return {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}
+        return {'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1, 'num_warps': 4, 'num_stages': 2}
+    return {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8, 'num_warps': 4, 'num_stages': 2}
 
 @triton.jit
 def fused_moe_kernel(
@@ -131,7 +131,7 @@ def invoke_fused_moe_kernel(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor,
     
     kernel_kwargs = config.copy()
     num_warps = kernel_kwargs.pop('num_warps', 4)
-    num_stages = kernel_kwargs.pop('num_stages', 4)
+    num_stages = kernel_kwargs.pop('num_stages', 2)
     
     fused_moe_kernel[grid](
         A, B, C, None, None,

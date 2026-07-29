@@ -53,10 +53,15 @@ def benchmark_moe_config(M, E, N, K, top_k, config):
             False, top_k, config
         )
         
+    # Prune configs exceeding GPU shared memory limits (approx 96 KB)
+    shmem_bytes = (config['BLOCK_SIZE_M'] * config['BLOCK_SIZE_K'] + config['BLOCK_SIZE_K'] * config['BLOCK_SIZE_N']) * config.get('num_stages', 2) * 2
+    if shmem_bytes > 96000:
+        return float('inf')
+
     try:
         ms = triton.testing.do_bench(run_first_gemm, warmup=10, rep=50)
         return ms
-    except Exception:
+    except BaseException:
         # Catch OutOfResources or Triton compilation errors for invalid configs
         return float('inf')
 
