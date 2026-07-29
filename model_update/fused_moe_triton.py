@@ -15,14 +15,35 @@ except Exception as e:
     print(f"Warning: Failed to load {config_path}: {e}")
 
 def get_best_config(M: int, E: int) -> Dict[str, Any]:
+    config = None
     if TUNED_CONFIGS:
         m_keys = [int(k) for k in TUNED_CONFIGS.keys()]
         closest_m = min(m_keys, key=lambda k: abs(k - M))
-        return TUNED_CONFIGS[str(closest_m)]
+        candidate = TUNED_CONFIGS[str(closest_m)].copy()
         
-    if M <= E:
-        return {'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1, 'num_warps': 4, 'num_stages': 2}
-    return {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8, 'num_warps': 4, 'num_stages': 2}
+        # Calculate shared memory requirement
+        bm = candidate.get('BLOCK_SIZE_M', 64)
+        bn = candidate.get('BLOCK_SIZE_N', 64)
+        bk = candidate.get('BLOCK_SIZE_K', 32)
+        ns = candidate.get('num_stages', 2)
+        shmem = (bm * bk + bk * bn) * ns * 2
+        
+        if shmem <= 96000:
+            config = candidate
+        else:
+            # Try reducing num_stages to 2
+            candidate['num_stages'] = 2
+            shmem_reduced = (bm * bk + bk * bn) * 2 * 2
+            if shmem_reduced <= 96000:
+                config = candidate
+
+    if config is None:
+        if M <= E:
+            config = {'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1, 'num_warps': 4, 'num_stages': 2}
+        else:
+            config = {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8, 'num_warps': 4, 'num_stages': 2}
+            
+    return config
 
 @triton.jit
 def fused_moe_kernel(
