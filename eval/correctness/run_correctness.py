@@ -61,6 +61,7 @@ def run_eval(base_url: str, output_dir: str, num_concurrent: int, limit: int, se
         "--seed", str(seed),
         "--output_path", output_dir,
         "--log_samples",
+        "--confirm_run_unsafe_code",
     ]
     print(f"Running: {' '.join(cmd)}\n", flush=True)
     env = os.environ.copy()
