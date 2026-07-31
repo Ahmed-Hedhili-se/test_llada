@@ -34,6 +34,7 @@ import sys
 import time
 
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
+os.environ["HF_ALLOW_CODE_EVAL"] = "1"
 sys.stdout.reconfigure(line_buffering=True)
 
 TASK  = "gsm8k_cot"
@@ -153,7 +154,8 @@ def save_summary(results: dict, output_path: str, seed: int, config_name: str = 
 
 
 def main():
-    ap = argparse.ArgumentParser(description="GSM8K-CoT correctness evaluation")
+    ap = argparse.ArgumentParser(description="Correctness evaluation via lm-eval")
+    ap.add_argument("--task", default="gsm8k_cot", help="Task to evaluate (e.g. gsm8k_cot, humaneval, mbpp)")
     ap.add_argument("--base-url", default="http://localhost:8000", help="OpenAI-compatible endpoint URL")
     ap.add_argument("--limit", type=int, default=LIMIT, help="Number of problems to evaluate")
     ap.add_argument("--num-concurrent", type=int, default=1, help="Concurrent requests")
@@ -164,6 +166,9 @@ def main():
     ap.add_argument("--config-name", default="", help="Name of config being tested (for summary)")
     ap.add_argument("--compare-all", action="store_true", help="Run all configs and compare (requires server support)")
     args = ap.parse_args()
+
+    global TASK
+    TASK = args.task
 
     seed = args.seed if args.seed is not None else random.randint(0, 999999)
     print(f"Target: {args.base_url}")
