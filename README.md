@@ -187,7 +187,7 @@ Verified against the HuggingFace reference implementation:
 | Weight mapping | 3,219 / 3,219 (100%) |
 | Logit cosine similarity | avg **0.9781** across 256 masked positions |
 | Top-1 token match | **91.0%** (233/256) |
-| GSM8K-CoT Accuracy (`fast_dense`) | **36.5%** (demonstrates strong robustness with `topk=5` and dynamic experts) |
+| MMLU Accuracy (`fast_dense`) | **60.0%** (demonstrates strong robustness with `topk=5` and dynamic experts; baseline is 66.0%) |
 | Generation quality | Matches HF generation behavior with exact cosine precision |
 
 ---
@@ -294,7 +294,7 @@ python diagnose_speedup.py                          # GPU/config/kernel diagnost
 python eval/check_time_inference.py --weight-dir ./weights  # end-to-end benchmark
 python compare_models.py --weight-dir ./weights     # logit comparison vs HF reference
 python -m eval.check_server                         # server smoke test
-python -m eval.correctness.run_correctness          # GSM8K-CoT accuracy (200 problems)
+python -m eval.correctness.run_correctness          # MMLU accuracy (200 problems)
 python -m eval.throughput.run_throughput            # concurrent request throughput
 ```
 
@@ -324,7 +324,7 @@ python -m eval.throughput.run_throughput            # concurrent request through
 │   ├── diagnose_dynamic_experts.py         Token divergence & routing diagnostic
 │   ├── diagnose_real_activation_pruning.py Per-layer routing distribution analysis
 │   ├── correctness/
-│   │   └── run_correctness.py              GSM8K-CoT accuracy (200 problems)
+│   │   └── run_correctness.py              MMLU / ARC correctness evaluation
 │   └── throughput/
 │       └── run_throughput.py               Concurrent request throughput benchmark
 │
