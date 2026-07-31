@@ -56,7 +56,7 @@ def run_eval(base_url: str, output_dir: str, num_concurrent: int, limit: int, se
         "--tasks", TASK,
         "--limit", str(limit),
         "--apply_chat_template",
-        "--gen_kwargs", "temperature=0,top_p=1.0",
+        "--gen_kwargs", "temperature=0,top_p=1.0,max_tokens=256,steps=128",
         "--seed", str(seed),
         "--output_path", output_dir,
         "--log_samples",
