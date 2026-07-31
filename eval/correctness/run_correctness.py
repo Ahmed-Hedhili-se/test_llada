@@ -50,19 +50,31 @@ def run_eval(base_url: str, output_dir: str, num_concurrent: int, limit: int, se
         f"tokenizer_backend=huggingface,"
         f"timeout=600"
     )
+    # Task-specific settings
+    CODE_TASKS = {"humaneval", "mbpp", "mbpp_plus"}
+    is_code_task = TASK in CODE_TASKS
+
+    if is_code_task:
+        # Code tasks: no chat template (model must output raw code), higher temperature
+        gen_kwargs = "temperature=0.2,top_p=0.95,max_tokens=512,steps=128"
+    else:
+        # Chat/reasoning tasks: use chat template, greedy decoding
+        gen_kwargs = "temperature=0,top_p=1.0,max_tokens=256,steps=128"
+
     cmd = [
         sys.executable, "-u", "-m", "lm_eval",
         "--model", "local-chat-completions",
         "--model_args", model_args,
         "--tasks", TASK,
         "--limit", str(limit),
-        "--apply_chat_template",
-        "--gen_kwargs", "temperature=0,top_p=1.0,max_tokens=256,steps=128",
+        "--gen_kwargs", gen_kwargs,
         "--seed", str(seed),
         "--output_path", output_dir,
         "--log_samples",
         "--confirm_run_unsafe_code",
     ]
+    if not is_code_task:
+        cmd.insert(cmd.index("--gen_kwargs"), "--apply_chat_template")
     print(f"Running: {' '.join(cmd)}\n", flush=True)
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
