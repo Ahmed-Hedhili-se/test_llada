@@ -32,12 +32,16 @@ from pathlib import Path
 import torch.distributed as dist
 from .distributed import get_tp_size, get_tp_rank, get_tp_group
 import re
-import vllm.distributed as vllm_distributed
-
-def torch_all_reduce(tensor):
-    torch.distributed.all_reduce(tensor)
-    return tensor
-vllm_distributed.tensor_model_parallel_all_reduce = torch_all_reduce
+try:
+    import vllm.distributed as vllm_distributed
+    def torch_all_reduce(tensor):
+        torch.distributed.all_reduce(tensor)
+        return tensor
+    vllm_distributed.tensor_model_parallel_all_reduce = torch_all_reduce
+except Exception as e:
+    # Catching Exception because it could be an ImportError or an OSError (like libcudart.so.13 missing)
+    print(f"Warning: vLLM not available or broken ({e}). Tensor parallelism will fall back or be disabled.")
+    pass
 
 
 def replace_linear_class(linear: nn.Linear, style: str, quant_config):
