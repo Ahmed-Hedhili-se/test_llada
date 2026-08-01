@@ -32,15 +32,12 @@ from pathlib import Path
 import torch.distributed as dist
 from .distributed import get_tp_size, get_tp_rank, get_tp_group
 import re
+import vllm.distributed as vllm_distributed
 
-try:
-    import vllm.distributed as vllm_distributed
-    def torch_all_reduce(tensor):
-        torch.distributed.all_reduce(tensor)
-        return tensor
-    vllm_distributed.tensor_model_parallel_all_reduce = torch_all_reduce
-except ImportError:
-    pass
+def torch_all_reduce(tensor):
+    torch.distributed.all_reduce(tensor)
+    return tensor
+vllm_distributed.tensor_model_parallel_all_reduce = torch_all_reduce
 
 
 def replace_linear_class(linear: nn.Linear, style: str, quant_config):
@@ -59,9 +56,6 @@ def replace_linear_class(linear: nn.Linear, style: str, quant_config):
         quant_config=quant_config,
         return_bias=False,
     )
-
-    
-
 
 
 def _load_fused_moe():

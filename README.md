@@ -108,14 +108,14 @@ python eval/check_time_inference.py --weight-dir weights --topk 5
 | Configuration | top-k | Time (s) | Tok/s | Speedup | Token Divergence |
 |---|:---:|---:|---:|:---:|:---:|
 | **Baseline** (`src/`, unfused, no cache) | 8 | 6.49 | 4.93 | 1.00× | — |
-| **Optimized** (`model_update/`, tuned kernel) | 5 | 1.81 | 17.68 | **3.59×** | 9.38% |
+| **Optimized** (`model_update/`, tuned kernel) | 5 | 1.73 | 18.50 | **3.75×** | 9.38% |
 
 ### Speedup Breakdown
 
 ```
             Speedup vs Baseline (32 tokens, NVIDIA A40-24Q GPU)
 
-  topk=5  ████████████████████████████████████  3.59×   (KV cache + fused MoE + tuned kernel)
+  topk=5  ██████████████████████████████████████  3.75×   (KV cache + fused MoE + tuned kernel)
 
   ──────────────────────────────────────────────
   1.0×           2.0×          3.0×          4.0×

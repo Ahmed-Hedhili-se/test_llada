@@ -1,52 +1,3 @@
-"""
-tuning_fused_moe_triton.py — End-to-end aware MoE autotuner
-============================================================
-
-WHY THE OLD TUNER WAS WRONG
------------------------------
-The previous tuner had four critical flaws:
-
-1. It only benchmarked the FIRST GEMM in isolation.
-   The full fused_moe call is: GEMM1 → SiLU+mul activation → GEMM2 → sum.
-   GEMM2 has a DIFFERENT input shape (M*top_k, N//2 → H) and shares the same
-   BLOCK_SIZE_M. A config that is fast for GEMM1 may be slow for GEMM2
-   because the input matrices have different aspect ratios.
-
-2. It optimized for MINIMUM KERNEL LATENCY, not minimum PADDING OVERHEAD.
-   Consider M=16, E=16 (your small model config), top_k=4.
-   Each expert receives on average (16*4)/16 = 4 tokens.
-   BLOCK_SIZE_M=128 pads each expert to 128, so the padded EM = 16*128 = 2048.
-   BLOCK_SIZE_M=16 pads each expert to 16, so the padded EM = 16*16 = 256.
-   The kernel launched for BM=128 computes 8× more work!
-   Under an idle GPU the extra compute is hidden by parallelism. Under a loaded
-   GPU (like yours with 16 experts running concurrently with attention), the
-   SM occupancy is already saturated, so padding directly becomes wasted cycles.
-
-3. The cost metric (do_bench latency of kernel alone) ignores:
-   - moe_align_block_size() CPU overhead (grows with BLOCK_SIZE_M when E is large)
-   - Memory allocation overhead for intermediate caches (grows with M*top_k*N)
-   - The SiLU activation fused between GEMM1 and GEMM2
-
-4. The M-buckets were wrong for your actual model.
-   Your SMALL_CFG uses NE=16 experts with TOPK=4, not 64 experts with top_k=8.
-   Active tokens per layer = batch_size * block_length = 2 * 64 = 128.
-   So realistic M is NOT [1...1024] — it is [64, 128] for your workload.
-
-WHAT THIS TUNER DOES INSTEAD
-------------------------------
-1. Benchmarks the COMPLETE fused_moe pipeline (GEMM1 + act + GEMM2 + sum).
-2. Scores each config with a COMPOSITE METRIC:
-      score = kernel_ms + PADDING_PENALTY * padding_ratio
-   where padding_ratio = (padded_EM - real_EM) / real_EM.
-   This penalizes configs that dramatically inflate the padded token count.
-3. Uses REALISTIC M values drawn from your actual model config (block_length=64,
-   batch_size=2 → M=128 is the main workload point).
-4. Adds a PROFILING section that prints occupancy, register usage, shared memory,
-   and padding ratio for every candidate, so you can see WHY one config wins.
-5. Validates that the tuned config produces numerically identical output to the
-   reference config before writing any JSON.
-"""
-
 import json
 import math
 import itertools
@@ -328,7 +279,6 @@ def main():
     print(f"  max_block_m={args.max_block_m}  penalty={args.penalty}")
     print(f"{'='*70}\n")
 
-    # Reference config used for correctness checks
     reference_cfg = {
         "BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 64,
         "GROUP_SIZE_M": 1,  "num_warps": 4,     "num_stages": 2,
@@ -357,11 +307,9 @@ def main():
                 print(f"  [{i+1:3d}/{len(all_configs)}] best score={best_so_far[0]:.3f} ms "
                       f"lat={best_so_far[1]:.3f} ms  pad={best_so_far[2]:.1%}")
 
-        # Sort by composite score
         results.sort(key=lambda x: x[0])
         best_score, best_lat, best_pad, best_cfg = results[0]
 
-        # ── Print top-N profiles ──────────────────────────────────────────
         print(f"\n  Top {args.top_configs} configs for M={M}:")
         for rank, (score, lat, pad, cfg) in enumerate(results[:args.top_configs]):
             prof = profile_config(cfg, K, N)
@@ -379,7 +327,6 @@ def main():
             print(f"\n  Correctness check: cos_sim={cos:.6f}  {'✅ PASS' if ok else '❌ FAIL'}")
             if not ok:
                 print("  WARNING: Skipping this config — outputs do not match reference!")
-                # Fall back to reference config
                 best_cfg   = reference_cfg
                 best_lat   = float("nan")
                 best_score = float("nan")
@@ -390,7 +337,6 @@ def main():
         print(f"     Latency={best_lat:.3f}ms  Padding={best_pad:.1%}  "
               f"Score={best_score:.3f}\n")
 
-    # ── Save JSON ─────────────────────────────────────────────────────────────
     with open(args.output, "w") as f:
         json.dump(best_configs, f, indent=4)
 
