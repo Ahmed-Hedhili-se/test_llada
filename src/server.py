@@ -154,9 +154,9 @@ def chat_completions(req: ChatRequest):
                 steps=steps,
                 block_length=block_length,
                 temperature=req.temperature,
-                use_dynamic_experts=True,
+                use_dynamic_experts=False,
                 base_k=8,
-                min_k=5,
+                min_k=8,
             )
         elif BACKEND == "dyn_experts":
             # Sparse path + dynamic expert pruning
