@@ -13,12 +13,15 @@ HOST="0.0.0.0"
 DEVICE="cuda:0"
 VENV="${VENV:-$SCRIPT_DIR/.venv}"
 
+BACKEND="ours"
+
 while [[ $# -gt 0 ]]; do
     case $1 in
         --weight-dir) WEIGHT_DIR="$2"; shift 2 ;;
         --port)       PORT="$2";       shift 2 ;;
         --host)       HOST="$2";       shift 2 ;;
         --device)     DEVICE="$2";     shift 2 ;;
+        --backend)    BACKEND="$2";    shift 2 ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
@@ -42,4 +45,5 @@ exec "$PY" -m src.server \
     --weight-dir "$WEIGHT_DIR" \
     --port "$PORT" \
     --host "$HOST" \
-    --device "$DEVICE"
+    --device "$DEVICE" \
+    --backend "$BACKEND"

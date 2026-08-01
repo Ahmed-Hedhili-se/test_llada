@@ -28,6 +28,8 @@ SUPPORTED TASKS
 ---------------
   mmlu            : all 57 MMLU subjects (test split, ~14 000 questions)
   mmlu_<subject>  : single MMLU subject (e.g. mmlu_anatomy)
+  mmlu_pro        : MMLU-Pro (all subjects)
+  mmlu_pro_<subj> : single MMLU-Pro subject
   arc_challenge   : ARC-Challenge (1172 test questions)
   arc_easy        : ARC-Easy (2376 test questions)
 
@@ -78,13 +80,13 @@ DEFAULT_TIMEOUT = 120   # seconds per request
 # Tasks that MUST NOT run through this script
 _CODE_TASKS = {"humaneval", "mbpp", "mbpp_plus", "humaneval_plus"}
 
-# Answer choices
-CHOICES = ["A", "B", "C", "D"]
+# Answer choices (up to J for MMLU-Pro)
+CHOICES = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]
 
 SYSTEM_PROMPT = (
     "You are a helpful, precise assistant. "
     "Answer multiple-choice questions by responding with ONLY the letter "
-    "of the correct answer (A, B, C, or D). "
+    "of the correct answer. "
     "Do not explain your answer."
 )
 
@@ -115,6 +117,43 @@ def _load_mmlu(subject: Optional[str], limit: int) -> list[dict]:
             "choices":    row["choices"],   # list of 4 strings
             "answer_idx": int(row["answer"]),  # 0-indexed
             "subject":    row.get("subject", subject or "mmlu"),
+        })
+
+    if limit and len(items) > limit:
+        random.shuffle(items)
+        items = items[:limit]
+    return items
+
+
+def _load_mmlu_pro(subject: Optional[str], limit: int) -> list[dict]:
+    """
+    Load MMLU-Pro test questions.
+    Each returned dict: {question, choices:[A..J], answer_idx: int, subject}
+    """
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        print("[ERROR] 'datasets' package is required.  Run: pip install datasets")
+        sys.exit(1)
+
+    ds = load_dataset("TIGER-Lab/MMLU-Pro", trust_remote_code=True)
+    split = ds["test"]
+    items = []
+    for row in split:
+        subj = row.get("category", "mmlu_pro")
+        if subject and subj != subject:
+            continue
+            
+        # answer is provided as "A", "B", etc.
+        ans_letter = row["answer"]
+        if ans_letter not in CHOICES:
+            continue
+            
+        items.append({
+            "question":   row["question"],
+            "choices":    row["options"],
+            "answer_idx": CHOICES.index(ans_letter),
+            "subject":    subj,
         })
 
     if limit and len(items) > limit:
@@ -175,6 +214,9 @@ def load_dataset_for_task(task: str, limit: int) -> list[dict]:
 
     if task == "mmlu":
         return _load_mmlu(None, limit)
+    elif task.startswith("mmlu_pro"):
+        subject = task[len("mmlu_pro_"):] if task.startswith("mmlu_pro_") else None
+        return _load_mmlu_pro(subject, limit)
     elif task.startswith("mmlu_"):
         subject = task[len("mmlu_"):]
         return _load_mmlu(subject, limit)
@@ -182,7 +224,7 @@ def load_dataset_for_task(task: str, limit: int) -> list[dict]:
         return _load_arc(task, limit)
     else:
         print(f"[ERROR] Unsupported task: '{task}'")
-        print("Supported: mmlu, mmlu_<subject>, arc_challenge, arc_easy")
+        print("Supported: mmlu, mmlu_pro, mmlu_<subject>, arc_challenge, arc_easy")
         sys.exit(1)
 
 
@@ -191,9 +233,12 @@ def load_dataset_for_task(task: str, limit: int) -> list[dict]:
 def build_prompt(item: dict) -> str:
     q = item["question"].strip()
     lines = [q, ""]
-    for letter, text in zip(CHOICES, item["choices"]):
+    valid_letters = CHOICES[:len(item["choices"])]
+    for letter, text in zip(valid_letters, item["choices"]):
         lines.append(f"{letter}) {text}")
-    lines.append("\nAnswer with only the letter A, B, C, or D.")
+    
+    letters_str = ", ".join(valid_letters[:-1]) + f", or {valid_letters[-1]}" if len(valid_letters) > 1 else valid_letters[0]
+    lines.append(f"\nAnswer with only the letter {letters_str}.")
     return "\n".join(lines)
 
 
@@ -226,11 +271,11 @@ def parse_answer(text: str) -> Optional[str]:
     # Exact single letter
     if text.upper() in CHOICES:
         return text.upper()
-    # First letter that is A/B/C/D (ignore punctuation / wrapping)
-    m = re.search(r"\b([ABCD])\b", text.upper())
+    # First letter that is A-J (ignore punctuation / wrapping)
+    m = re.search(r"\b([A-J])\b", text.upper())
     if m:
         return m.group(1)
-    # Last resort: first A/B/C/D character anywhere
+    # Last resort: first A-J character anywhere
     for ch in text.upper():
         if ch in CHOICES:
             return ch
