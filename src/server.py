@@ -22,6 +22,7 @@ from typing import Optional
 
 import torch
 import uvicorn
+import threading
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -42,6 +43,8 @@ DEFAULT_BLOCK_LENGTH = 32
 DEFAULT_TEMPERATURE  = 0.0
 DEFAULT_CFG_SCALE    = 0.0
 DEFAULT_REMASKING    = "low_confidence"
+
+request_lock = threading.Lock()
 
 
 class Message(BaseModel):
@@ -119,7 +122,7 @@ def chat_completions(req: ChatRequest):
         steps = (gen_length // block_length) * max(1, steps // (gen_length // block_length))
 
     t0 = time.time()
-    with torch.no_grad():
+    with torch.no_grad(), request_lock:
         if BACKEND == "ours":
             from src.generate import generate
             out_ids = generate(
@@ -145,8 +148,25 @@ def chat_completions(req: ChatRequest):
                 remasking=req.remasking,
             )
         elif BACKEND == "fast_dense":
-            # Option A: Fast dense cached + conservative dynamic experts
+            from model_update.model import LLaDAMoEKV
             from model_update.generate import generate_cached
+            from model_update.distributed import get_tp_size
+            
+            if get_tp_size() > 1:
+                import torch.distributed as dist
+                req_obj = {
+                    "type": "generate_cached",
+                    "input_ids": input_ids.cpu(),
+                    "gen_length": gen_length,
+                    "steps": steps,
+                    "block_length": block_length,
+                    "temperature": req.temperature,
+                    "use_dynamic_experts": True,
+                    "base_k": 8,
+                    "min_k": 5
+                }
+                dist.broadcast_object_list([req_obj], src=0)
+
             out_ids = generate_cached(
                 MODEL,
                 input_ids,
@@ -159,8 +179,25 @@ def chat_completions(req: ChatRequest):
                 min_k=8,
             )
         elif BACKEND == "dyn_experts":
-            # Sparse path + dynamic expert pruning
+            from model_update.model import LLaDAMoEKV
             from model_update.generate import generate_sparse_cached
+            from model_update.distributed import get_tp_size
+            
+            if get_tp_size() > 1:
+                import torch.distributed as dist
+                req_obj = {
+                    "type": "generate_cached",
+                    "input_ids": input_ids.cpu(),
+                    "gen_length": gen_length,
+                    "steps": steps,
+                    "block_length": block_length,
+                    "temperature": req.temperature,
+                    "use_dynamic_experts": True,
+                    "base_k": 8,
+                    "min_k": 5
+                }
+                dist.broadcast_object_list([req_obj], src=0)
+
             out_ids = generate_sparse_cached(
                 MODEL,
                 input_ids,
@@ -242,11 +279,11 @@ def load_model(weight_dir: str, device: str, backend: str):
         load_weights(MODEL, weight_dir, verbose=True)
     elif backend in ("fast_dense", "dyn_experts"):
         from model_update.model import LLaDAMoEKV, TritonFusedMoEBlock
-        from src.model import load_weights
+        from model_update.distributed import load_weights_tp
         
-        print("Instantiating unfused model to load weights...")
+        print(f"Instantiating unfused model to load weights on Rank {get_tp_rank()}...")
         MODEL = LLaDAMoEKV(use_fused_moe=False).to(torch.bfloat16).eval()
-        load_weights(MODEL, weight_dir, verbose=True)
+        load_weights_tp(MODEL, weight_dir, verbose=True)
         
         print("Converting to Fused MoE blocks...")
         for i, layer in enumerate(MODEL.layers):
@@ -273,16 +310,54 @@ def load_model(weight_dir: str, device: str, backend: str):
 
 
 def main():
+    from model_update.distributed import init_distributed, get_tp_rank, get_tp_size
+    init_distributed()
+    
     ap = argparse.ArgumentParser()
     ap.add_argument("--weight-dir", default="weights")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--host", default="0.0.0.0")
-    ap.add_argument("--device", default="cuda:0")
+    # In distributed mode, we override device with local rank
+    ap.add_argument("--device", default=f"cuda:{get_tp_rank()}" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--backend", choices=["ours", "ours_kv", "fast_dense", "dyn_experts", "hf"], default="ours")
     args = ap.parse_args()
 
+    # Override device if TP is active
+    if get_tp_size() > 1:
+        args.device = f"cuda:{get_tp_rank()}"
+
     load_model(args.weight_dir, args.device, args.backend)
-    uvicorn.run(app, host=args.host, port=args.port)
+    
+    if get_tp_size() > 1 and get_tp_rank() != 0:
+        print(f"Rank {get_tp_rank()} waiting for generation tasks...")
+        worker_loop()
+    else:
+        uvicorn.run(app, host=args.host, port=args.port)
+
+
+def worker_loop():
+    import torch.distributed as dist
+    while True:
+        objs = [None]
+        dist.broadcast_object_list(objs, src=0)
+        req = objs[0]
+        if req is None:
+            continue
+        
+        if req["type"] == "generate_cached":
+            from model_update.generate import generate_cached
+            generate_cached(
+                MODEL,
+                req["input_ids"].to(DEVICE),
+                gen_length=req["gen_length"],
+                steps=req["steps"],
+                block_length=req["block_length"],
+                temperature=req["temperature"],
+                use_dynamic_experts=req["use_dynamic_experts"],
+                base_k=req["base_k"],
+                min_k=req["min_k"]
+            )
+
 
 
 if __name__ == "__main__":

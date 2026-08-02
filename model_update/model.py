@@ -32,34 +32,7 @@ from pathlib import Path
 import torch.distributed as dist
 from .distributed import get_tp_size, get_tp_rank, get_tp_group
 import re
-try:
-    import vllm.distributed as vllm_distributed
-    def torch_all_reduce(tensor):
-        torch.distributed.all_reduce(tensor)
-        return tensor
-    vllm_distributed.tensor_model_parallel_all_reduce = torch_all_reduce
-except Exception as e:
-    # Catching Exception because it could be an ImportError or an OSError (like libcudart.so.13 missing)
-    print(f"Warning: vLLM not available or broken ({e}). Tensor parallelism will fall back or be disabled.")
-    pass
 
-
-def replace_linear_class(linear: nn.Linear, style: str, quant_config):
-    from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear, ReplicatedLinear
-    if not isinstance(style, str): 
-        raise ValueError(f"Unsupported parallel style type {type(style)}, expected str")
-    vllm_linear_cls = {
-        "colwise": ColumnParallelLinear,
-        "rowwise": RowParallelLinear,
-    }.get(style, ReplicatedLinear)
-
-    return vllm_linear_cls(
-        input_size=linear.in_features,
-        output_size=linear.out_features,
-        bias=linear.bias is not None,
-        quant_config=quant_config,
-        return_bias=False,
-    )
 
 
 def _load_fused_moe():
@@ -326,14 +299,6 @@ class LLaDAMoEKV(nn.Module):
         self.layers = nn.ModuleList([Layer(cfg, use_fused_moe=use_fused_moe) for _ in range(cfg.NL)])
         self.norm = RMSNorm(cfg.H, cfg.EPS)
         self.lm_head = nn.Linear(cfg.H, cfg.VS, bias=False)
-        
-        self._tp_plan = {
-            "layers.*.self_attn.q_proj": "colwise",
-            "layers.*.self_attn.k_proj": "colwise",
-            "layers.*.self_attn.v_proj": "colwise",
-            "layers.*.self_attn.o_proj": "rowwise",
-        }
-
 
     def forward(
         self,
@@ -372,31 +337,6 @@ class LLaDAMoEKV(nn.Module):
         x = self.norm(x)
         logits = self.lm_head(x)
         return logits, new_kv
-
-    def tensor_parallel(self, tp_size):
-        tp_plan = self._tp_plan
-        self._tp_size = tp_size
-
-        from vllm.model_executor.models.utils import maybe_prefix
-
-        def _tensor_parallel(module: nn.Module, prefix: str = ""):
-            for child_name, child_module in module.named_children():
-                qual_name = maybe_prefix(prefix, child_name)
-                for pattern, style in tp_plan.items():
-                    if re.match(pattern, qual_name) and isinstance(child_module, nn.Linear):
-                        new_module = replace_linear_class(child_module, style, None)
-                        dtype = child_module.weight.dtype
-                        new_module.weight_loader(new_module.weight, child_module.weight)
-                        new_module.weight.data = new_module.weight.data.to(dtype)
-                        setattr(module, child_name, new_module)
-                        break
-                    else:
-                        _tensor_parallel(child_module, prefix=qual_name)
-                if '.self_attn' in qual_name and len(qual_name.split('.')) == 3:
-                    child_module.tp_size = tp_size
-
-        _tensor_parallel(self)
-
 
 def concat_kv(cache: Optional[KVCache], new_kv: KVCache) -> KVCache:
     if cache is None:
