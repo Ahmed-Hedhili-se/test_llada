@@ -183,9 +183,11 @@ def main():
     ap.add_argument("--steps", type=int, default=32)
     ap.add_argument("--block-length", type=int, default=16)
     ap.add_argument("--topk", type=int, default=5, help="Fixed top-k experts for the optimized model")
-    ap.add_argument("--mode", choices=["both", "baseline", "optimized"], default="both", help="Which model(s) to benchmark")
+    ap.add_argument("--mode", choices=["both", "baseline", "optimized"], default="both",
+                    help="Which model(s) to benchmark")
     args = ap.parse_args()
 
+    # In distributed mode, override device with local rank
     if get_tp_size() > 1:
         args.device = f"cuda:{get_tp_rank()}"
         if args.mode in ["both", "baseline"]:
@@ -196,30 +198,37 @@ def main():
     is_master = (get_tp_rank() == 0)
 
     if is_master:
-    print("  Benchmark: Baseline (src/) vs Optimized (model_update/)")
-    print("=" * 80)
-    print(f"  Device           : {args.device}")
-    print(f"  PyTorch Version  : {torch.__version__}")
-    print(f"  Weight Directory : {args.weight_dir}")
-    print(f"  Gen Length       : {args.gen_length}")
-    print(f"  Steps            : {args.steps}")
-    print(f"  Block Length     : {args.block_length}")
-    print(f"  Optimized top-k  : {args.topk}")
-    print(f"  Warmup Runs      : {args.num_warmup}")
-    print(f"  Benchmark Runs   : {args.num_runs}")
-    print("=" * 80 + "\n")
+        print("=" * 80)
+        print("  Benchmark: Baseline (src/) vs Optimized (model_update/)")
+        print("=" * 80)
+        print(f"  Device           : {args.device}")
+        print(f"  PyTorch Version  : {torch.__version__}")
+        print(f"  Weight Directory : {args.weight_dir}")
+        print(f"  Gen Length       : {args.gen_length}")
+        print(f"  Steps            : {args.steps}")
+        print(f"  Block Length     : {args.block_length}")
+        print(f"  Optimized top-k  : {args.topk}")
+        print(f"  Warmup Runs      : {args.num_warmup}")
+        print(f"  Benchmark Runs   : {args.num_runs}")
+        print("=" * 80 + "\n")
 
     if not os.path.isdir(args.weight_dir):
-        print(f"Error: Weight directory '{args.weight_dir}' does not exist.")
+        if is_master:
+            print(f"Error: Weight directory '{args.weight_dir}' does not exist.")
         sys.exit(1)
 
-        print("Loading tokenizer...")
+    print(f"[Rank {get_tp_rank()}] Loading tokenizer...")
     tok = AutoTokenizer.from_pretrained(args.weight_dir, trust_remote_code=True)
     if is_master:
         print("Done.\n")
 
     test_prompt = "The chemical symbol for gold is Au and for silver is"
     prompt_ids = tok(test_prompt, return_tensors="pt")["input_ids"].to(args.device)
+
+    # ── 1. Dense Baseline ────────────────────────────────────────────────────
+    baseline_tokens = None
+    bl_mean = 0.0
+    bl_tps = 0.0
 
     if args.mode in ["both", "baseline"]:
         if is_master:
@@ -231,27 +240,26 @@ def main():
             print(f"  Loaded in {baseline_load_time:.2f}s")
 
         set_seed(42)
-    baseline_tokens = baseline_generate(
-        baseline_model, prompt_ids, args.gen_length, args.steps, args.block_length
-    ).cpu()
+        baseline_tokens = baseline_generate(
+            baseline_model, prompt_ids, args.gen_length, args.steps, args.block_length
+        ).cpu()
 
-    baseline_lats = benchmark(
-        lambda: baseline_generate(baseline_model, prompt_ids, args.gen_length, args.steps, args.block_length),
-        args.device, args.num_warmup, args.num_runs,
-    )
+        baseline_lats = benchmark(
+            lambda: baseline_generate(baseline_model, prompt_ids, args.gen_length, args.steps, args.block_length),
+            args.device, args.num_warmup, args.num_runs,
+        )
         bl_mean, bl_med, bl_p95 = get_stats(baseline_lats)
         bl_tps = args.gen_length / bl_mean
         if is_master:
             print(f"  Mean: {bl_mean:.2f}s | Median: {bl_med:.2f}s | P95: {bl_p95:.2f}s | {bl_tps:.2f} tok/s\n")
 
         free_model(baseline_model, args.device)
-    else:
-        bl_mean = 0.0
-        bl_tps = 0.0
 
-    # ────────────────────────────────────────────────────────────────────────
-    # 2. Optimized  (model_update/ — fused MoE, KV cache, topk=5)
-    # ────────────────────────────────────────────────────────────────────────
+    # ── 2. Optimized ─────────────────────────────────────────────────────────
+    opt_tokens = None
+    opt_mean = 0.0
+    opt_tps = 0.0
+
     if args.mode in ["both", "optimized"]:
         if is_master:
             print("=" * 60)
@@ -262,39 +270,27 @@ def main():
             print(f"  Loaded in {opt_load_time:.2f}s")
 
         set_seed(42)
-    opt_tokens = optimized_generate(
-        opt_model, prompt_ids, args.gen_length, args.steps, args.block_length, args.topk
-    )[0].cpu()
+        opt_tokens = optimized_generate(
+            opt_model, prompt_ids, args.gen_length, args.steps, args.block_length, args.topk
+        )[0].cpu()
 
-    opt_lats = benchmark(
-        lambda: optimized_generate(opt_model, prompt_ids, args.gen_length, args.steps, args.block_length, args.topk),
-        args.device, args.num_warmup, args.num_runs,
-    )
+        opt_lats = benchmark(
+            lambda: optimized_generate(opt_model, prompt_ids, args.gen_length, args.steps, args.block_length, args.topk),
+            args.device, args.num_warmup, args.num_runs,
+        )
         opt_mean, opt_med, opt_p95 = get_stats(opt_lats)
         opt_tps = args.gen_length / opt_mean
         if is_master:
             print(f"  Mean: {opt_mean:.2f}s | Median: {opt_med:.2f}s | P95: {opt_p95:.2f}s | {opt_tps:.2f} tok/s\n")
 
         free_model(opt_model, args.device)
-    else:
-        opt_mean = 0.0
-        opt_tps = 0.0
 
+    # Worker ranks are done — only master prints the final table
     if not is_master:
         return
 
-    # ── token divergence ─────────────────────────────────────────────────────
-    if args.mode == "both":
-        min_len = min(len(baseline_tokens), len(opt_tokens))
-        diff_count = (baseline_tokens[:min_len] != opt_tokens[:min_len]).sum().item()
-        div_pct = (diff_count / min_len) * 100
-    else:
-        diff_count, min_len, div_pct = 0, 0, 0.0
-
-    # ────────────────────────────────────────────────────────────────────────
-    # Results
-    # ────────────────────────────────────────────────────────────────────────
-    speedup = bl_mean / opt_mean if opt_mean > 0 else float("inf")
+    # ── Results ──────────────────────────────────────────────────────────────
+    speedup = bl_mean / opt_mean if opt_mean > 0 and bl_mean > 0 else float("inf")
 
     print("=" * 100)
     print("                              RESULTS")
@@ -303,28 +299,29 @@ def main():
     sep    = f"|{'-'*50}|{'-'*12}|{'-'*12}|{'-'*12}|"
     print(header)
     print(sep)
-    
+
     if args.mode in ["both", "baseline"]:
         print(f"| {'Baseline (src/, topk=8, no cache)':<50} | {bl_mean:>10.2f} | {bl_tps:>10.2f} | {'1.00x':>10} |")
     if args.mode in ["both", "optimized"]:
         speed_text = f"{speedup:.2f}x" if args.mode == "both" else "N/A"
         print(f"| {f'Optimized (model_update/, topk={args.topk}, KV cache)':<50} | {opt_mean:>10.2f} | {opt_tps:>10.2f} | {speed_text:>10} |")
     print("=" * 100)
-    
-    if args.mode == "both":
+
+    if args.mode == "both" and baseline_tokens is not None and opt_tokens is not None:
+        min_len = min(len(baseline_tokens), len(opt_tokens))
+        diff_count = (baseline_tokens[:min_len] != opt_tokens[:min_len]).sum().item()
+        div_pct = (diff_count / min_len) * 100
         print(f"\n  Token Divergence : {diff_count}/{min_len} tokens ({div_pct:.2f}%)")
         print(f"  Speedup          : {speedup:.2f}x")
-
         if speedup > 1:
             print(f"\n  ✅ Optimized model is {speedup:.2f}x faster than baseline.")
         else:
             print(f"\n  ⚠️  Optimized model is {1/speedup:.2f}x slower than baseline.")
-
         decoded_baseline = tok.decode(baseline_tokens, skip_special_tokens=True)
         decoded_opt = tok.decode(opt_tokens, skip_special_tokens=True)
         print(f"\n  Baseline output : {decoded_baseline[:200]}")
         print(f"  Optimized output: {decoded_opt[:200]}")
-    elif args.mode == "optimized":
+    elif args.mode == "optimized" and opt_tokens is not None:
         decoded_opt = tok.decode(opt_tokens, skip_special_tokens=True)
         print(f"\n  Optimized output: {decoded_opt[:200]}")
 
