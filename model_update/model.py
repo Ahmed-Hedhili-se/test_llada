@@ -113,7 +113,7 @@ class TritonFusedMoEBlock(nn.Module):
         )
         
         out = out.view(B, T, H)
-        if tp_size > 1:
+        if self.tp_size > 1:
             dist.all_reduce(out, op=dist.ReduceOp.SUM, group=get_tp_group())
             
         return out
