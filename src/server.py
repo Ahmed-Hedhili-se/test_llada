@@ -64,6 +64,11 @@ class ChatRequest(BaseModel):
     block_length: int = DEFAULT_BLOCK_LENGTH
     cfg_scale: float = DEFAULT_CFG_SCALE
     remasking: str = DEFAULT_REMASKING
+    # model_update ("fast_dense") only — overrides that backend's MoE expert count.
+    # None means "use this backend's default" (see fast_dense branch below).
+    use_dynamic_experts: Optional[bool] = None
+    base_k: Optional[int] = None
+    min_k: Optional[int] = None
 
 
 @app.get("/health")
@@ -151,7 +156,11 @@ def chat_completions(req: ChatRequest):
             from model_update.model import LLaDAMoEKV
             from model_update.generate import generate_cached
             from model_update.distributed import get_tp_size
-            
+
+            use_dynamic_experts = req.use_dynamic_experts if req.use_dynamic_experts is not None else False
+            base_k = req.base_k if req.base_k is not None else 8
+            min_k = req.min_k if req.min_k is not None else 8
+
             if get_tp_size() > 1:
                 import torch.distributed as dist
                 req_obj = {
@@ -161,9 +170,9 @@ def chat_completions(req: ChatRequest):
                     "steps": steps,
                     "block_length": block_length,
                     "temperature": req.temperature,
-                    "use_dynamic_experts": True,
-                    "base_k": 8,
-                    "min_k": 5
+                    "use_dynamic_experts": use_dynamic_experts,
+                    "base_k": base_k,
+                    "min_k": min_k,
                 }
                 dist.broadcast_object_list([req_obj], src=0)
 
@@ -174,9 +183,9 @@ def chat_completions(req: ChatRequest):
                 steps=steps,
                 block_length=block_length,
                 temperature=req.temperature,
-                use_dynamic_experts=False,
-                base_k=8,
-                min_k=8,
+                use_dynamic_experts=use_dynamic_experts,
+                base_k=base_k,
+                min_k=min_k,
             )
         elif BACKEND == "dyn_experts":
             from model_update.model import LLaDAMoEKV

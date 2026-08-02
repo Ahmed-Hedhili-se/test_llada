@@ -55,6 +55,12 @@ Usage:
     python -m eval.correctness.run_correctness \\
         --baseline results/baseline_mmlu.json \\
         --output results/optimised_mmlu.json
+
+    # Compare dynamic experts (top_k=5) vs static (top_k=8) on model_update.
+    # Requires the server to be running with --backend fast_dense.
+    python -m eval.correctness.run_correctness \\
+        --compare-dynamic-experts \\
+        --output results/moe_mmlu.json
 """
 
 from __future__ import annotations
@@ -244,7 +250,7 @@ def build_prompt(item: dict) -> str:
 
 # ── Server call ──────────────────────────────────────────────────────────────────
 
-def call_server(base_url: str, prompt: str, timeout: int) -> str:
+def call_server(base_url: str, prompt: str, timeout: int, gen_config: Optional[dict] = None) -> str:
     payload = {
         "model":       "inclusionAI/LLaDA-MoE-7B-A1B-Instruct",
         "messages":    [
@@ -256,6 +262,8 @@ def call_server(base_url: str, prompt: str, timeout: int) -> str:
         "max_tokens":  16,
         "steps":       32,
     }
+    if gen_config:
+        payload.update(gen_config)
     resp = requests.post(
         f"{base_url}/v1/chat/completions",
         json=payload,
@@ -289,6 +297,7 @@ def evaluate(
     base_url: str,
     num_concurrent: int,
     timeout: int,
+    gen_config: Optional[dict] = None,
 ) -> dict:
     correct = 0
     total   = len(items)
@@ -298,7 +307,7 @@ def evaluate(
     def _eval_one(idx: int, item: dict):
         prompt    = build_prompt(item)
         try:
-            raw       = call_server(base_url, prompt, timeout)
+            raw       = call_server(base_url, prompt, timeout, gen_config=gen_config)
             predicted = parse_answer(raw)
         except Exception as e:
             return idx, item, None, str(e)
@@ -394,6 +403,32 @@ def print_comparison(stats: dict, baseline_path: str, task: str, label: str = "C
     print(f"{'='*60}\n")
 
 
+def print_dynamic_experts_comparison(label_a: str, stats_a: dict, label_b: str, stats_b: dict):
+    """Compare two live evaluate() runs against the same model_update model
+    (e.g. dynamic top-k=5 experts vs. static top-k=8) instead of a saved
+    baseline file."""
+    acc_a, acc_b = stats_a["accuracy"], stats_b["accuracy"]
+    diff = acc_a - acc_b
+    print(f"\n{'='*60}")
+    print("  Dynamic vs Static Experts — Comparison")
+    print(f"{'='*60}")
+    print(f"  {label_a:<32} : {acc_a:.4f} ({acc_a*100:.1f}%)  [{stats_a['correct']}/{stats_a['total']}]")
+    print(f"  {label_b:<32} : {acc_b:.4f} ({acc_b*100:.1f}%)  [{stats_b['correct']}/{stats_b['total']}]")
+    print(f"  Difference (A - B)               : {diff:+.4f} ({diff*100:+.1f}%)")
+    if abs(diff) <= 0.01:
+        print("  ✅ PASS: dynamic experts within 1% of static top-k=8")
+    elif abs(diff) <= 0.02:
+        print("  ⚠️  WARNING: dynamic experts within 2% of static top-k=8 (acceptable)")
+    else:
+        print("  ❌ FAIL: dynamic experts degrade accuracy by more than 2%")
+    print(f"{'='*60}\n")
+
+
+def _suffixed_path(path: str, suffix: str) -> str:
+    root, ext = os.path.splitext(path)
+    return f"{root}_{suffix}{ext or '.json'}"
+
+
 def save_summary(stats: dict, task: str, output_path: str, seed: int, config_name: str = ""):
     summary = {
         "task":        task,
@@ -440,6 +475,16 @@ def main():
     ap.add_argument("--seed",           type=int, default=None)
     ap.add_argument("--config-name",    default="",
                     help="Label stored in the summary JSON.")
+    ap.add_argument(
+        "--compare-dynamic-experts", action="store_true",
+        help=(
+            "Run the SAME questions twice against the model_update ('fast_dense') "
+            "model — once with dynamic experts (use_dynamic_experts=True, "
+            "base_k=min_k=5) and once static (use_dynamic_experts=False, top_k=8) "
+            "— then compare accuracy. Requires the server to be running with "
+            "--backend fast_dense. Ignores --baseline."
+        ),
+    )
     args = ap.parse_args()
 
     if args.task in _CODE_TASKS:
@@ -462,6 +507,29 @@ def main():
     print("Loading dataset...", flush=True)
     items = load_dataset_for_task(args.task, limit)
     print(f"Loaded {len(items)} questions.\n")
+
+    if args.compare_dynamic_experts:
+        configs = [
+            ("Dynamic Experts (top_k=5)", {"use_dynamic_experts": True, "base_k": 5, "min_k": 5}),
+            ("Static Experts (top_k=8)",  {"use_dynamic_experts": False, "base_k": 8, "min_k": 8}),
+        ]
+        run_stats = {}
+        for label, gen_config in configs:
+            print(f"\n{'#'*60}\n  Running: {label}  {gen_config}\n{'#'*60}")
+            t0 = time.time()
+            stats = evaluate(items, args.base_url, args.num_concurrent, args.timeout, gen_config=gen_config)
+            elapsed = time.time() - t0
+            print(f"\nTotal time : {elapsed:.1f}s  ({elapsed/max(len(items),1):.1f}s/question)")
+            print_results(stats, args.task, label)
+            run_stats[label] = stats
+
+            if args.output:
+                suffix = "dynamic" if gen_config["use_dynamic_experts"] else "static"
+                save_summary(stats, args.task, _suffixed_path(args.output, suffix), seed, label)
+
+        (label_a, _), (label_b, _) = configs
+        print_dynamic_experts_comparison(label_a, run_stats[label_a], label_b, run_stats[label_b])
+        return
 
     t0    = time.time()
     stats = evaluate(items, args.base_url, args.num_concurrent, args.timeout)
