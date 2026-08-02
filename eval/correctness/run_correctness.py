@@ -126,9 +126,9 @@ def _load_mmlu(subject: Optional[str], limit: int) -> list[dict]:
         sys.exit(1)
 
     if subject:
-        ds = load_dataset("cais/mmlu", subject, trust_remote_code=True)
+        ds = load_dataset("cais/mmlu", subject)
     else:
-        ds = load_dataset("cais/mmlu", "all", trust_remote_code=True)
+        ds = load_dataset("cais/mmlu", "all")
 
     split = ds["test"]
     items = []
@@ -157,7 +157,7 @@ def _load_mmlu_pro(subject: Optional[str], limit: int) -> list[dict]:
         print("[ERROR] 'datasets' package is required.  Run: pip install datasets")
         sys.exit(1)
 
-    ds = load_dataset("TIGER-Lab/MMLU-Pro", trust_remote_code=True)
+    ds = load_dataset("TIGER-Lab/MMLU-Pro")
     split = ds["test"]
     items = []
     for row in split:
@@ -195,7 +195,7 @@ def _load_arc(variant: str, limit: int) -> list[dict]:
         sys.exit(1)
 
     name = "ARC-Challenge" if variant == "arc_challenge" else "ARC-Easy"
-    ds = load_dataset("allenai/ai2_arc", name, trust_remote_code=True)
+    ds = load_dataset("allenai/ai2_arc", name)
     split = ds["test"]
 
     items = []
