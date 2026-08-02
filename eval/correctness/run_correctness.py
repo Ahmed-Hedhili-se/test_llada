@@ -545,6 +545,19 @@ def main():
                          f"(CoT) or 32 (--direct-answer).")
     ap.add_argument("--block-length", type=int, default=DEFAULT_COT_BLOCK_LENGTH,
                     help="Server-side block_length for generation.")
+    ap.add_argument(
+        "--use-dynamic-experts", action="store_true",
+        help=(
+            "Single-run mode: route through model_update's dynamic (reduced) "
+            "expert path instead of the default static top-k=8. Combine with "
+            "--base-k/--min-k. Ignored if --compare-dynamic-experts is set "
+            "(that flag already runs both configs)."
+        ),
+    )
+    ap.add_argument("--base-k", type=int, default=5,
+                    help="Max experts for --use-dynamic-experts (default: 5).")
+    ap.add_argument("--min-k", type=int, default=5,
+                    help="Min experts for --use-dynamic-experts (default: 5, i.e. fixed top-k=5).")
     args = ap.parse_args()
 
     cot = not args.direct_answer
@@ -568,6 +581,8 @@ def main():
     print(f"Concurrent : {args.num_concurrent}")
     print(f"Prompting  : {'chain-of-thought' if cot else 'direct (bare letter)'}")
     print(f"Max tokens : {max_tokens}  |  Steps: {steps}  |  Block length: {args.block_length}")
+    if args.use_dynamic_experts and not args.compare_dynamic_experts:
+        print(f"Experts    : dynamic (base_k={args.base_k}, min_k={args.min_k})")
     print(f"Seed       : {seed}\n")
 
     print("Loading dataset...", flush=True)
@@ -575,6 +590,12 @@ def main():
     print(f"Loaded {len(items)} questions.\n")
 
     base_gen_config = {"block_length": args.block_length}
+    if args.use_dynamic_experts and not args.compare_dynamic_experts:
+        base_gen_config.update({
+            "use_dynamic_experts": True,
+            "base_k": args.base_k,
+            "min_k": args.min_k,
+        })
 
     if args.compare_dynamic_experts:
         configs = [
