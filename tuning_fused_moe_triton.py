@@ -20,14 +20,14 @@ from model_update.fused_moe_triton import (
 MODEL_SHAPES = {
     # (E, N, K, top_k, description)
     # E = num_experts, N = w1 output (2*expert_inner), K = hidden_dim
-    "SMALL_CFG": (16,  512, 512,  4, "test model (NE=16, EI=256, H=512)"),
+    "SMALL_CFG": (16,  512,  512,  4, "test model (NE=16, EI=256, H=512)"),
     "FULL_CFG":  (64, 2048, 2048, 8, "production model (NE=64, EI=1024, H=2048)"),
 }
 
 # Representative M values encountered during actual block-wise KV generation.
-# M = batch_size * active_block_length.  For your setup (BS=2, BL=64) M≈128.
-# We also include smaller values for prefill and speculative small batches.
-REALISTIC_M_BUCKETS = [1, 2, 4, 8, 16, 32, 64, 128, 256]
+# M = batch_size * active_block_length.  For your setup (BS=1, BL=32) M≈32.
+# RTX A6000 has 48 GB VRAM — we include larger M values to exploit this.
+REALISTIC_M_BUCKETS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
 
 # How heavily to penalise padding waste (tuned empirically; 0 = pure latency)
 PADDING_PENALTY_WEIGHT = 0.5
@@ -256,17 +256,27 @@ def verify_correctness(E, N, K, top_k, config_under_test, reference_config):
 # ═══════════════════════════════════════════════════════════════════════════════
 def main():
     import argparse
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--model",        default="SMALL_CFG", choices=list(MODEL_SHAPES))
+    import os
+    ap = argparse.ArgumentParser(
+        description="End-to-end aware MoE Autotuner for Triton fused kernels."
+    )
+    ap.add_argument("--model",        default="FULL_CFG", choices=list(MODEL_SHAPES),
+                    help="Model config to tune for (default: FULL_CFG = production model).")
     ap.add_argument("--max-block-m",  type=int, default=64,
                     help="Hard cap on BLOCK_SIZE_M to limit padding overhead.")
     ap.add_argument("--penalty",      type=float, default=PADDING_PENALTY_WEIGHT,
                     help="Weight on padding ratio in composite score.")
     ap.add_argument("--top-configs",  type=int, default=3,
                     help="Print profiling for the top-N configs per M.")
-    ap.add_argument("--output",       default="moe_tune_config.json")
+    ap.add_argument("--output",       default=None,
+                    help="Output JSON path (default: <repo_root>/moe_tune_config.json).")
     ap.add_argument("--verify",       action="store_true", default=True)
     args = ap.parse_args()
+
+    if args.output is None:
+        # Default: save to repo root so fused_moe_triton.py picks it up automatically
+        repo_root = os.path.dirname(os.path.abspath(__file__))
+        args.output = os.path.join(repo_root, "moe_tune_config.json")
 
     if not torch.cuda.is_available():
         print("CUDA is required."); return
