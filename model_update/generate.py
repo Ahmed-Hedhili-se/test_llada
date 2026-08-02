@@ -12,7 +12,7 @@ low-confidence remasking, block restriction), but:
 import torch
 import torch.nn.functional as F
 
-from .model import concat_kv
+from .model import KVCacheBuffer
 
 MASK_ID = 156895
 
@@ -49,7 +49,7 @@ def _generate_block_cached(
     block_start: int,
     block_end: int,
     steps_per_block: int,
-    cache,
+    cache_buffer: KVCacheBuffer,
     temperature: float,
     remasking: str,
     use_dynamic_experts: bool = False,
@@ -58,7 +58,7 @@ def _generate_block_cached(
 ):
     block_length = block_end - block_start
     device = x.device
-    
+
     block_mask_index = (x[:, block_start:block_end] == MASK_ID)
     num_transfer = get_num_transfer_tokens(block_mask_index, steps_per_block)
 
@@ -75,7 +75,8 @@ def _generate_block_cached(
         suffix_logits, _ = model(
             suffix_ids,
             position_offset=block_start,
-            past_kv=cache,
+            cache_buffer=cache_buffer,
+            write_pos=block_start,
             dynamic_k=dynamic_k,
         )
         logits = suffix_logits[:, :block_length]
@@ -106,15 +107,16 @@ def _generate_block_cached(
         x[:, block_start:block_end] = active_ids
 
     finalized_ids = x[:, block_start:block_end]
-    _, new_kv = model(
+    model(
         finalized_ids,
         position_offset=block_start,
-        past_kv=cache,
+        cache_buffer=cache_buffer,
+        write_pos=block_start,
         dynamic_k=None,
     )
-    cache = concat_kv(cache, new_kv)
-    
-    return x, cache
+    cache_buffer.commit(block_end)
+
+    return x
 
 
 @torch.no_grad()
@@ -140,25 +142,36 @@ def generate_cached(
     steps_per_block = steps // num_blocks
 
     device = prompt_ids.device
-    P = prompt_ids.shape[1]
+    B, P = prompt_ids.shape
+    total_len = P + gen_length
 
-    x = torch.full((1, P + gen_length), MASK_ID, dtype=torch.long, device=device)
+    x = torch.full((B, total_len), MASK_ID, dtype=torch.long, device=device)
     x[:, :P] = prompt_ids
 
-    
-    _, cache = model(prompt_ids, position_offset=0, past_kv=None)
+    cache_buffer = KVCacheBuffer(
+        num_layers=model.cfg.NL,
+        batch_size=B,
+        kvh_local=model.layers[0].self_attn.KVH_local,
+        max_len=total_len,
+        head_dim=model.cfg.HD,
+        dtype=next(model.parameters()).dtype,
+        device=device,
+    )
+
+    model(prompt_ids, position_offset=0, cache_buffer=cache_buffer, write_pos=0)
+    cache_buffer.commit(P)
 
     for block_idx in range(num_blocks):
         block_start = P + block_idx * block_length
         block_end = P + (block_idx + 1) * block_length
 
-        x, cache = _generate_block_cached(
+        x = _generate_block_cached(
             model=model,
             x=x,
             block_start=block_start,
             block_end=block_end,
             steps_per_block=steps_per_block,
-            cache=cache,
+            cache_buffer=cache_buffer,
             temperature=temperature,
             remasking=remasking,
             use_dynamic_experts=use_dynamic_experts,

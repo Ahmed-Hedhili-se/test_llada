@@ -42,6 +42,47 @@ fused_moe = None
 KVCache = List[Tuple[torch.Tensor, torch.Tensor]]
 
 
+class KVCacheBuffer:
+    """
+    Preallocated per-layer K/V buffer for block-wise generation.
+
+    Replaces torch.cat-ing a fresh [prefix; active] tensor on every
+    denoising step: profiling (eval/profile_kv_concat.py) showed that cat
+    cost 45-68% of combined attend-time, exceeding the actual attention
+    math at every context length measured, because it recopies the whole
+    (unchanged) prefix just to append a few new tokens.
+
+    Instead, the full [B, KVH, max_len, HD] tensor is allocated once and
+    each step writes its K/V in place at `write_pos`; attention reads a
+    zero-copy view of the buffer up to that point.
+    """
+
+    def __init__(self, num_layers: int, batch_size: int, kvh_local: int,
+                 max_len: int, head_dim: int, dtype: torch.dtype, device):
+        self.max_len = max_len
+        self.committed_len = 0
+        self.k = [
+            torch.empty(batch_size, kvh_local, max_len, head_dim, dtype=dtype, device=device)
+            for _ in range(num_layers)
+        ]
+        self.v = [
+            torch.empty(batch_size, kvh_local, max_len, head_dim, dtype=dtype, device=device)
+            for _ in range(num_layers)
+        ]
+
+    def write_and_view(self, layer_idx: int, k_new: torch.Tensor, v_new: torch.Tensor, start_pos: int):
+        end_pos = start_pos + k_new.shape[2]
+        if end_pos > self.max_len:
+            raise ValueError(f"KV cache overflow: write to {end_pos} exceeds buffer of {self.max_len}")
+        self.k[layer_idx][:, :, start_pos:end_pos, :] = k_new
+        self.v[layer_idx][:, :, start_pos:end_pos, :] = v_new
+        return self.k[layer_idx][:, :, :end_pos, :], self.v[layer_idx][:, :, :end_pos, :]
+
+    def commit(self, new_committed_len: int):
+        """Mark [0:new_committed_len] as permanent (already-finalized) prefix."""
+        self.committed_len = new_committed_len
+
+
 @dataclass
 class Cfg:
     H: int
@@ -178,11 +219,22 @@ class Attention(nn.Module):
         self.q_norm = RMSNorm(HD, cfg.EPS)
         self.k_norm = RMSNorm(HD, cfg.EPS)
 
-    def forward(self, x, cos, sin, past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None):
+    def forward(
+        self, x, cos, sin,
+        past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        cache_buffer: Optional["KVCacheBuffer"] = None,
+        layer_idx: Optional[int] = None,
+        write_pos: Optional[int] = None,
+    ):
         """
         x: [B, Ta, H] active-block hidden states
         cos/sin: [Ta, HD] rope freqs for the ACTIVE positions (absolute offset already applied)
-        past_kv: optional (k_prefix, v_prefix) each [B, KVH, Tp, HD], already RoPE'd
+        past_kv: optional (k_prefix, v_prefix) each [B, KVH, Tp, HD], already RoPE'd —
+                 cat'd with this call's K/V to build the attend-over tensor.
+        cache_buffer/layer_idx/write_pos: alternative to past_kv. K/V are written
+                 in place into cache_buffer at write_pos and attention reads a
+                 zero-copy view of the buffer, instead of cat-ing a fresh tensor.
+                 Mutually exclusive with past_kv.
         Returns: out [B, Ta, H], (k_active, v_active) each [B, KVH, Ta, HD] (RoPE'd, for caching)
         """
         cfg = self.cfg
@@ -195,13 +247,15 @@ class Attention(nn.Module):
         q = self.q_norm(q.reshape(-1, cfg.HD)).reshape(B, Ta, self.NH_local, cfg.HD)
         k = self.k_norm(k.reshape(-1, cfg.HD)).reshape(B, Ta, self.KVH_local, cfg.HD)
 
-        q = q.transpose(1, 2) 
-        k = k.transpose(1, 2)  
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
         q, k = apply_rope(q, k, cos, sin)
 
-        if past_kv is not None:
+        if cache_buffer is not None:
+            k_full, v_full = cache_buffer.write_and_view(layer_idx, k, v, write_pos)
+        elif past_kv is not None:
             k_prefix, v_prefix = past_kv
             k_full = torch.cat([k_prefix, k], dim=2)
             v_full = torch.cat([v_prefix, v], dim=2)
@@ -280,8 +334,16 @@ class Layer(nn.Module):
         self.post_attention_layernorm = RMSNorm(cfg.H, cfg.EPS)
         self.mlp = TritonFusedMoEBlock(cfg) if use_fused_moe else MoEBlock(cfg)
 
-    def forward(self, x, cos, sin, past_kv=None, dynamic_k: Optional[int] = None):
-        attn_out, kv_new = self.self_attn(self.input_layernorm(x), cos, sin, past_kv)
+    def forward(
+        self, x, cos, sin, past_kv=None, dynamic_k: Optional[int] = None,
+        cache_buffer: Optional["KVCacheBuffer"] = None,
+        layer_idx: Optional[int] = None,
+        write_pos: Optional[int] = None,
+    ):
+        attn_out, kv_new = self.self_attn(
+            self.input_layernorm(x), cos, sin, past_kv,
+            cache_buffer=cache_buffer, layer_idx=layer_idx, write_pos=write_pos,
+        )
         x = x + attn_out
         x = x + self.mlp(self.post_attention_layernorm(x), dynamic_k=dynamic_k)
         return x, kv_new
@@ -302,6 +364,8 @@ class LLaDAMoEKV(nn.Module):
         position_offset: int = 0,
         past_kv: Optional[KVCache] = None,
         dynamic_k: Optional[int] = None,
+        cache_buffer: Optional[KVCacheBuffer] = None,
+        write_pos: Optional[int] = None,
     ):
         """
         input_ids: [B, T] — either the full sequence (past_kv=None, e.g. prefix
@@ -310,6 +374,11 @@ class LLaDAMoEKV(nn.Module):
                    sequence, for correct RoPE.
         past_kv: list of (k,v) per layer for the prefix, or None.
         dynamic_k: override the number of activated experts for this call.
+        cache_buffer/write_pos: preallocated in-place KV cache (see
+                   KVCacheBuffer). Mutually exclusive with past_kv — when
+                   given, K/V for input_ids are written into the buffer at
+                   write_pos and attention reads a view of it, instead of
+                   cat-ing a fresh tensor from past_kv every call.
         Returns: logits [B, T, VS] for input_ids positions only, and
                  new_kv: list of (k,v) per layer for input_ids' own tokens
                  (caller decides whether/when to append these to the cache).
@@ -327,17 +396,12 @@ class LLaDAMoEKV(nn.Module):
         new_kv: KVCache = []
         for i, layer in enumerate(self.layers):
             layer_past = past_kv[i] if past_kv is not None else None
-            x, kv_i = layer(x, cos, sin, layer_past, dynamic_k=dynamic_k)
+            x, kv_i = layer(
+                x, cos, sin, layer_past, dynamic_k=dynamic_k,
+                cache_buffer=cache_buffer, layer_idx=i, write_pos=write_pos,
+            )
             new_kv.append(kv_i)
 
         x = self.norm(x)
         logits = self.lm_head(x)
         return logits, new_kv
-
-def concat_kv(cache: Optional[KVCache], new_kv: KVCache) -> KVCache:
-    if cache is None:
-        return new_kv
-    out = []
-    for (k_old, v_old), (k_new, v_new) in zip(cache, new_kv):
-        out.append((torch.cat([k_old, k_new], dim=2), torch.cat([v_old, v_new], dim=2)))
-    return out
