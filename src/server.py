@@ -268,6 +268,9 @@ def load_model(weight_dir: str, device: str, backend: str):
     global MODEL, TOKENIZER, DEVICE, BACKEND
     DEVICE = device
     BACKEND = backend
+    
+    if "cuda" in device:
+        torch.cuda.set_device(device)
 
     print(f"Loading tokenizer from {weight_dir}...")
     TOKENIZER = AutoTokenizer.from_pretrained(weight_dir, trust_remote_code=True)

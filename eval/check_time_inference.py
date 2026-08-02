@@ -190,6 +190,11 @@ def main():
     # In distributed mode, override device with local rank
     if get_tp_size() > 1:
         args.device = f"cuda:{get_tp_rank()}"
+        
+    if "cuda" in args.device:
+        torch.cuda.set_device(args.device)
+        
+    if get_tp_size() > 1:
         if args.mode in ["both", "baseline"]:
             if get_tp_rank() == 0:
                 print("Warning: Baseline model does not support tensor parallelism! Switching mode to 'optimized'.")
