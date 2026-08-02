@@ -20,9 +20,12 @@ SOLUTION: We bypass lm-eval entirely.  This script:
   5. Computes accuracy against the ground-truth labels.
 
 This approach works correctly for masked diffusion LMs like LLaDA-MoE because:
-  - The model only needs to generate a short answer ("A", "B", "C", or "D").
-  - No logit access required.
-  - No chain-of-thought required.
+  - No logit access required — only generated text.
+  - By default it uses chain-of-thought prompting (model reasons, then ends
+    with "Final Answer: <letter>"), since MMLU-Pro was specifically built to
+    punish models forced to answer without reasoning — bare "answer with only
+    the letter" prompting reliably scores well below published numbers on it.
+    Pass --direct-answer to go back to the old short bare-letter mode.
 
 SUPPORTED TASKS
 ---------------
@@ -89,12 +92,24 @@ _CODE_TASKS = {"humaneval", "mbpp", "mbpp_plus", "humaneval_plus"}
 # Answer choices (up to J for MMLU-Pro)
 CHOICES = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]
 
-SYSTEM_PROMPT = (
+SYSTEM_PROMPT_DIRECT = (
     "You are a helpful, precise assistant. "
     "Answer multiple-choice questions by responding with ONLY the letter "
     "of the correct answer. "
     "Do not explain your answer."
 )
+
+SYSTEM_PROMPT_COT = (
+    "You are a helpful, precise assistant. "
+    "Think through multiple-choice questions step by step, then end your "
+    "response with a new line in exactly this format:\n"
+    "Final Answer: <letter>"
+)
+
+# CoT-friendly generation budget (bare-letter mode uses a much smaller one — see main()).
+DEFAULT_COT_MAX_TOKENS   = 256
+DEFAULT_COT_STEPS        = 128
+DEFAULT_COT_BLOCK_LENGTH = 32
 
 
 # ── Dataset loading ──────────────────────────────────────────────────────────────
@@ -236,31 +251,43 @@ def load_dataset_for_task(task: str, limit: int) -> list[dict]:
 
 # ── Prompt construction ──────────────────────────────────────────────────────────
 
-def build_prompt(item: dict) -> str:
+def build_prompt(item: dict, cot: bool = True) -> str:
     q = item["question"].strip()
     lines = [q, ""]
     valid_letters = CHOICES[:len(item["choices"])]
     for letter, text in zip(valid_letters, item["choices"]):
         lines.append(f"{letter}) {text}")
-    
+
     letters_str = ", ".join(valid_letters[:-1]) + f", or {valid_letters[-1]}" if len(valid_letters) > 1 else valid_letters[0]
-    lines.append(f"\nAnswer with only the letter {letters_str}.")
+    if cot:
+        lines.append(
+            f"\nThink step by step, then end with a new line reading exactly "
+            f"'Final Answer: <letter>', where <letter> is one of {letters_str}."
+        )
+    else:
+        lines.append(f"\nAnswer with only the letter {letters_str}.")
     return "\n".join(lines)
 
 
 # ── Server call ──────────────────────────────────────────────────────────────────
 
-def call_server(base_url: str, prompt: str, timeout: int, gen_config: Optional[dict] = None) -> str:
+def call_server(
+    base_url: str, prompt: str, timeout: int,
+    gen_config: Optional[dict] = None,
+    system_prompt: str = SYSTEM_PROMPT_COT,
+    max_tokens: int = DEFAULT_COT_MAX_TOKENS,
+    steps: int = DEFAULT_COT_STEPS,
+) -> str:
     payload = {
         "model":       "inclusionAI/LLaDA-MoE-7B-A1B-Instruct",
         "messages":    [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user",   "content": prompt},
         ],
         "temperature": 0.0,
         "top_p":       1.0,
-        "max_tokens":  16,
-        "steps":       32,
+        "max_tokens":  max_tokens,
+        "steps":       steps,
     }
     if gen_config:
         payload.update(gen_config)
@@ -274,15 +301,24 @@ def call_server(base_url: str, prompt: str, timeout: int, gen_config: Optional[d
 
 
 def parse_answer(text: str) -> Optional[str]:
-    """Extract the first A/B/C/D letter from model output."""
+    """Extract the model's answer letter, preferring an explicit
+    'Final Answer: <letter>' / 'Answer: <letter>' marker (chain-of-thought
+    mode) over positional heuristics (bare-letter mode)."""
     text = text.strip()
-    # Exact single letter
+    # Explicit "Final Answer: X" / "Answer: X" marker, anywhere in the text
+    # (CoT responses may mention several letters while reasoning — the
+    # explicit marker is the actual decision, so check it first).
+    m = re.search(r"(?:final\s*answer|answer)\s*[:\-]?\s*\(?([A-J])\)?\b", text, re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+    # Exact single letter (bare-letter mode's common case)
     if text.upper() in CHOICES:
         return text.upper()
-    # First letter that is A-J (ignore punctuation / wrapping)
-    m = re.search(r"\b([A-J])\b", text.upper())
-    if m:
-        return m.group(1)
+    # No marker found — fall back to the LAST standalone A-J letter mentioned,
+    # since CoT reasoning tends to walk through options before concluding.
+    matches = re.findall(r"\b([A-J])\b", text.upper())
+    if matches:
+        return matches[-1]
     # Last resort: first A-J character anywhere
     for ch in text.upper():
         if ch in CHOICES:
@@ -298,16 +334,23 @@ def evaluate(
     num_concurrent: int,
     timeout: int,
     gen_config: Optional[dict] = None,
+    cot: bool = True,
+    max_tokens: int = DEFAULT_COT_MAX_TOKENS,
+    steps: int = DEFAULT_COT_STEPS,
 ) -> dict:
     correct = 0
     total   = len(items)
     errors  = 0
     per_subject: dict[str, list[bool]] = {}
+    system_prompt = SYSTEM_PROMPT_COT if cot else SYSTEM_PROMPT_DIRECT
 
     def _eval_one(idx: int, item: dict):
-        prompt    = build_prompt(item)
+        prompt    = build_prompt(item, cot=cot)
         try:
-            raw       = call_server(base_url, prompt, timeout, gen_config=gen_config)
+            raw       = call_server(
+                base_url, prompt, timeout, gen_config=gen_config,
+                system_prompt=system_prompt, max_tokens=max_tokens, steps=steps,
+            )
             predicted = parse_answer(raw)
         except Exception as e:
             return idx, item, None, str(e)
@@ -485,7 +528,28 @@ def main():
             "--backend fast_dense. Ignores --baseline."
         ),
     )
+    ap.add_argument(
+        "--direct-answer", action="store_true",
+        help=(
+            "Use the old bare-letter prompt ('answer with only the letter') "
+            "instead of the default chain-of-thought prompt. MMLU-Pro was built "
+            "to punish non-reasoning answers, so this will score notably lower "
+            "on that task — mainly useful to reproduce old results."
+        ),
+    )
+    ap.add_argument("--max-tokens", type=int, default=None,
+                    help=f"Generation budget. Default: {DEFAULT_COT_MAX_TOKENS} "
+                         f"(CoT) or 16 (--direct-answer).")
+    ap.add_argument("--steps", type=int, default=None,
+                    help=f"Diffusion steps. Default: {DEFAULT_COT_STEPS} "
+                         f"(CoT) or 32 (--direct-answer).")
+    ap.add_argument("--block-length", type=int, default=DEFAULT_COT_BLOCK_LENGTH,
+                    help="Server-side block_length for generation.")
     args = ap.parse_args()
+
+    cot = not args.direct_answer
+    max_tokens = args.max_tokens if args.max_tokens is not None else (DEFAULT_COT_MAX_TOKENS if cot else 16)
+    steps      = args.steps if args.steps is not None else (DEFAULT_COT_STEPS if cot else 32)
 
     if args.task in _CODE_TASKS:
         print(
@@ -502,22 +566,29 @@ def main():
     print(f"Task       : {args.task}")
     print(f"Limit      : {limit if limit else 'full dataset'}")
     print(f"Concurrent : {args.num_concurrent}")
+    print(f"Prompting  : {'chain-of-thought' if cot else 'direct (bare letter)'}")
+    print(f"Max tokens : {max_tokens}  |  Steps: {steps}  |  Block length: {args.block_length}")
     print(f"Seed       : {seed}\n")
 
     print("Loading dataset...", flush=True)
     items = load_dataset_for_task(args.task, limit)
     print(f"Loaded {len(items)} questions.\n")
 
+    base_gen_config = {"block_length": args.block_length}
+
     if args.compare_dynamic_experts:
         configs = [
-            ("Dynamic Experts (top_k=5)", {"use_dynamic_experts": True, "base_k": 5, "min_k": 5}),
-            ("Static Experts (top_k=8)",  {"use_dynamic_experts": False, "base_k": 8, "min_k": 8}),
+            ("Dynamic Experts (top_k=5)", {**base_gen_config, "use_dynamic_experts": True, "base_k": 5, "min_k": 5}),
+            ("Static Experts (top_k=8)",  {**base_gen_config, "use_dynamic_experts": False, "base_k": 8, "min_k": 8}),
         ]
         run_stats = {}
         for label, gen_config in configs:
             print(f"\n{'#'*60}\n  Running: {label}  {gen_config}\n{'#'*60}")
             t0 = time.time()
-            stats = evaluate(items, args.base_url, args.num_concurrent, args.timeout, gen_config=gen_config)
+            stats = evaluate(
+                items, args.base_url, args.num_concurrent, args.timeout,
+                gen_config=gen_config, cot=cot, max_tokens=max_tokens, steps=steps,
+            )
             elapsed = time.time() - t0
             print(f"\nTotal time : {elapsed:.1f}s  ({elapsed/max(len(items),1):.1f}s/question)")
             print_results(stats, args.task, label)
@@ -532,7 +603,10 @@ def main():
         return
 
     t0    = time.time()
-    stats = evaluate(items, args.base_url, args.num_concurrent, args.timeout)
+    stats = evaluate(
+        items, args.base_url, args.num_concurrent, args.timeout,
+        gen_config=base_gen_config, cot=cot, max_tokens=max_tokens, steps=steps,
+    )
     elapsed = time.time() - t0
 
     print(f"\nTotal time : {elapsed:.1f}s  ({elapsed/max(len(items),1):.1f}s/question)")
