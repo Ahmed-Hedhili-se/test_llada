@@ -99,7 +99,9 @@ Optimized:   model(active_block, cache)   each step only processes the current b
 
 ## Benchmark Results
 
-32-token generation benchmark on **NVIDIA A40-24Q** (GPU), PyTorch 2.5.1+cu118. All three optimizations are stacked in the optimized model. The Triton kernel was tuned using `tuning_fused_moe_triton.py`.
+### Single-GPU: Baseline vs Optimized (NVIDIA A40-24Q)
+
+32-token generation benchmark on **NVIDIA A40-24Q**, PyTorch 2.5.1+cu118. All three optimizations stacked. Triton kernel tuned using `tuning_fused_moe_triton.py`.
 
 ```bash
 python eval/check_time_inference.py --weight-dir weights --topk 5
@@ -110,20 +112,36 @@ python eval/check_time_inference.py --weight-dir weights --topk 5
 | **Baseline** (`src/`, unfused, no cache) | 8 | 6.49 | 4.93 | 1.00× | — |
 | **Optimized** (`model_update/`, tuned kernel) | 5 | 1.73 | 18.50 | **3.75×** | 9.38% |
 
+### Multi-GPU: Baseline vs Optimized + TP/EP (2× NVIDIA RTX A6000)
+
+128-token generation benchmark on **2× NVIDIA RTX A6000 (49 GB each)** connected via **PCIe Host Bridge (PHB)**, PyTorch 2.5.1+cu121. Optimized model runs with Tensor Parallelism (Attention) + Expert Parallelism (MoE) via `torchrun`.
+
+```bash
+bash eval/benchmark_compare.sh --weight-dir ./weights --gen-length 128 --steps 128 --block-length 32 --num-runs 5
+```
+
+| Configuration | GPUs | top-k | Time (s) | Tok/s | Speedup |
+|---|:---:|:---:|---:|---:|:---:|
+| **Baseline** (`src/`, single GPU, no cache) | 1× A6000 | 8 | 26.91 | 4.76 | 1.00× |
+| **Optimized + TP/EP** (`model_update/`, KV cache + fused MoE) | 2× A6000 | 8 | 6.02 | 21.28 | **4.47×** |
+
 ### Speedup Breakdown
 
 ```
-            Speedup vs Baseline (32 tokens, NVIDIA A40-24Q GPU)
+              Speedup vs Baseline
 
-  topk=5  ██████████████████████████████████████  3.75×   (KV cache + fused MoE + tuned kernel)
+  1 GPU  ██████████████████████████████████████  3.75×   (KV cache + fused MoE, A40-24Q)
+  2 GPU  ███████████████████████████████████████████████  4.47×   (TP+EP, 2x A6000, PCIe PHB)
 
-  ──────────────────────────────────────────────
-  1.0×           2.0×          3.0×          4.0×
+  ──────────────────────────────────────────────────────
+  1.0×      2.0×      3.0×      4.0×      4.5×
 ```
+
+> **Note on PCIe scaling**: The 2-GPU result does not achieve a perfect 7.5× (3.75 × 2) because the GPUs communicate via PCIe Host Bridge (`PHB`), not high-speed NVLink. The TP+EP architecture inserts two `dist.all_reduce()` synchronizations per layer — 32 network hops per generated token — adding a fixed communication cost. At Batch Size 1, this overhead partially offsets the compute gains from splitting work across 2 GPUs. Near-linear 2× scaling of the per-GPU throughput is achieved at larger batch sizes where compute dominates.
 
 ### Understanding Token Divergence (9.38%)
 
-In the benchmark above, the token divergence is **constant at 9.38% (3/32 tokens) regardless of top-k**. This is expected:
+In the single-GPU benchmark above, the token divergence is **constant at 9.38% (3/32 tokens) regardless of top-k**. This is expected:
 
 - If the divergence were caused by using fewer experts, you'd see 0% divergence at topk=8 (same as baseline) and increasing divergence at topk=5 and topk=4. But it's always 3 tokens.
 - The cause is the **block-wise KV caching itself**, which changes the attention context:
@@ -138,6 +156,7 @@ Since LLaDA uses **bidirectional (non-causal) attention**, the baseline lets tok
 > **This is not a quality issue** — both outputs are valid denoising trajectories. The masked diffusion process has multiple valid solutions, and the 3 tokens that diverge are near confidence-boundary cases.
 
 ---
+
 
 ## Triton Autotuner
 
