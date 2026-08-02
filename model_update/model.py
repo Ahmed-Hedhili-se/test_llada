@@ -67,19 +67,20 @@ class TritonFusedMoEBlock(nn.Module):
     def __init__(self, cfg: Cfg):
         super().__init__()
         self.cfg = cfg
+        self.tp_size = get_tp_size()
+        self.tp_rank = get_tp_rank()
+        self.num_local_experts = cfg.NE // self.tp_size
+        self.local_expert_start = self.tp_rank * self.num_local_experts
+        
         self.gate = nn.Linear(cfg.H, cfg.NE, bias=False)
-        self.w1 = nn.Parameter(torch.empty(cfg.NE, 2 * cfg.EI, cfg.H))
-        self.w2 = nn.Parameter(torch.empty(cfg.NE, cfg.H, cfg.EI))
+        self.w1 = nn.Parameter(torch.empty(self.num_local_experts, 2 * cfg.EI, cfg.H))
+        self.w2 = nn.Parameter(torch.empty(self.num_local_experts, cfg.H, cfg.EI))
 
     def load_state_dict_from_unfused(self, unfused_block: nn.Module):
         with torch.no_grad():
             self.gate.weight.copy_(unfused_block.gate.weight)
-            tp_size = get_tp_size()
-            tp_rank = get_tp_rank()
-            num_local_experts = self.cfg.NE // tp_size
-            local_expert_start = tp_rank * num_local_experts
-            for i in range(num_local_experts):
-                expert = unfused_block.experts[local_expert_start + i]
+            for i in range(self.num_local_experts):
+                expert = unfused_block.experts[i]  # already sliced in MoEBlock
                 w_gate = expert.gate_proj.weight
                 w_up = expert.up_proj.weight
                 self.w1[i].copy_(torch.cat([w_gate, w_up], dim=0))
@@ -97,15 +98,10 @@ class TritonFusedMoEBlock(nn.Module):
         k = dynamic_k if dynamic_k is not None else self.cfg.TOPK
         topk_weights, topk_ids = torch.topk(routing_weights, k, dim=-1)
 
-        tp_size = get_tp_size()
-        if tp_size > 1:
-            tp_rank = get_tp_rank()
-            num_local_experts = self.cfg.NE // tp_size
-            local_expert_start = tp_rank * num_local_experts
-            local_expert_end = local_expert_start + num_local_experts
-
-            mask = (topk_ids >= local_expert_start) & (topk_ids < local_expert_end)
-            topk_ids = (topk_ids - local_expert_start).clamp(min=0, max=num_local_experts - 1)
+        if self.tp_size > 1:
+            local_expert_end = self.local_expert_start + self.num_local_experts
+            mask = (topk_ids >= self.local_expert_start) & (topk_ids < local_expert_end)
+            topk_ids = (topk_ids - self.local_expert_start).clamp(min=0, max=self.num_local_experts - 1)
             topk_weights = topk_weights * mask.float()
 
         out = fused_moe(
