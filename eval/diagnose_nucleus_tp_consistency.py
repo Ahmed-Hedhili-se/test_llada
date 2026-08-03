@@ -10,10 +10,13 @@ each rank from that identical `x` should be bit-identical too — the same
 precondition the existing step-based dynamic_k ramp already relies on. This
 script verifies it empirically rather than just assuming it holds.
 
-Uses DIFFERENT per-rank seeds for model construction (so local attention/expert
-shard weights genuinely differ across ranks, like real sharded pretrained
-weights would) but the SAME seed for the input, so both ranks process identical
-input through genuinely different local computations up to the all-reduce.
+Model construction uses the SAME seed on every rank, so REPLICATED parameters
+(embed_tokens, gate/router, RMSNorm weights) start out identical across ranks —
+matching how load_weights_tp loads those from the same checkpoint on every
+rank in production. Only the genuinely TP-SHARDED parameters (attention
+q/k/v/o, local expert weights) are then explicitly re-randomized per rank
+afterward, simulating real sharded pretrained weights differing per rank.
+Input uses the same seed on every rank too.
 
 Run with (needs >=2 GPUs):
     torchrun --nproc_per_node=2 eval/diagnose_nucleus_tp_consistency.py
@@ -54,11 +57,25 @@ def main():
     device = f"cuda:{tp_rank}"
     torch.cuda.set_device(device)
 
-    # Different seed per rank -> genuinely different local shard weights
-    # (attention q/k/v/o shards, local expert slices), like real sharded
-    # pretrained weights, not an artificially-identical stand-in.
-    torch.manual_seed(1234 + tp_rank)
+    # Same seed on every rank -> replicated params (embed_tokens, gate, RMSNorm
+    # weights) start out identical across ranks, matching production (they're
+    # loaded from the same checkpoint tensor everywhere, never sharded).
+    torch.manual_seed(0)
     model = LLaDAMoEKV(SMALL_CFG, use_fused_moe=False).to(torch.bfloat16).to(device).eval()
+
+    # Now perturb ONLY the genuinely TP-sharded parameters per rank (attention
+    # q/k/v/o shards, local expert weights) with a rank-specific generator —
+    # simulates real sharded pretrained weights differing per rank, without
+    # touching the shared global RNG stream used for input_ids below.
+    rank_gen = torch.Generator(device=device).manual_seed(1234 + tp_rank)
+    with torch.no_grad():
+        for layer in model.layers:
+            attn = layer.self_attn
+            for p in (attn.q_proj.weight, attn.k_proj.weight, attn.v_proj.weight, attn.o_proj.weight):
+                p.copy_(torch.randn(p.shape, generator=rank_gen, device=device, dtype=torch.float32).to(p.dtype))
+            for expert in layer.mlp.experts:
+                for p in (expert.gate_proj.weight, expert.up_proj.weight, expert.down_proj.weight):
+                    p.copy_(torch.randn(p.shape, generator=rank_gen, device=device, dtype=torch.float32).to(p.dtype))
 
     # Same seed across ranks -> identical input on every rank, simulating the
     # real server's broadcast-from-rank0 request without needing comms for it.
