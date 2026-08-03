@@ -1,6 +1,6 @@
 # LLaDA-MoE-7B-A1B-Instruct — Optimized Inference Engine
 
-Self-contained PyTorch reimplementation of [inclusionAI/LLaDA-MoE-7B-A1B-Instruct](https://huggingface.co/inclusionAI/LLaDA-MoE-7B-A1B-Instruct) with three stacked inference optimizations: **Triton Fused MoE**, **Block-wise KV Caching**, and **Reduced Expert Activation (top-k)**. Includes an OpenAI-compatible API server, a full evaluation suite, and an end-to-end-aware Triton autotuner.
+Self-contained PyTorch reimplementation of [inclusionAI/LLaDA-MoE-7B-A1B-Instruct](https://huggingface.co/inclusionAI/LLaDA-MoE-7B-A1B-Instruct) with two stacked inference optimizations: **Triton Fused MoE** and **Block-wise KV Caching**, running the model's native static top-8 expert routing. Includes an OpenAI-compatible API server, a full evaluation suite, and an end-to-end-aware Triton autotuner.
 
 ---
 
@@ -61,7 +61,7 @@ The router selects the **top-k** experts per token, runs each through this FFN, 
 
 ## Optimizations
 
-The `model_update/` directory implements three stacked optimizations over the baseline (`src/`):
+The `model_update/` directory implements two stacked optimizations over the baseline (`src/`):
 
 ### 1. Triton Fused MoE (`fused_moe_triton.py`)
 
@@ -89,11 +89,7 @@ Optimized:   model(active_block, cache)   each step only processes the current b
 
 > **Correctness rule**: A block's K/V is only pushed to the permanent cache *after* it is fully unmasked. Caching mid-denoising K/V would bake in stale masked-token representations.
 
-### 3. Reduced Expert Activation (top-k = 5)
-
-**Problem**: The default top-8 routing activates 8 of 64 experts per token, but early denoising steps operate on noisy `[MASK]` tokens where full expert capacity is unnecessary.
-
-**Solution**: Use fewer experts (e.g., top-5 instead of top-8) to reduce compute per token by **~37%** with minimal quality loss. Configurable via `--topk` at inference time. A `dynamic_k` mechanism also supports ramping from `min_k` to `base_k` across denoising steps.
+> **On reduced expert activation**: an earlier version of this project explored running fewer than 8 experts per token (fixed top-5, a step-based ramp, and per-token adaptive/nucleus thresholding) to cut MoE compute further. All three were evaluated and dropped — the accuracy cost wasn't worth it, and for this checkpoint's router (routing weights are nearly uniform across all 64 experts) adaptive thresholding had no real advantage over a fixed count either. The model now always routes to its native top-8.
 
 ---
 
@@ -101,16 +97,18 @@ Optimized:   model(active_block, cache)   each step only processes the current b
 
 ### Single-GPU: Baseline vs Optimized (NVIDIA A40-24Q)
 
-32-token generation benchmark on **NVIDIA A40-24Q**, PyTorch 2.5.1+cu118. All three optimizations stacked. Triton kernel tuned using `tuning_fused_moe_triton.py`.
+32-token generation benchmark on **NVIDIA A40-24Q**, PyTorch 2.5.1+cu118, Triton kernel tuned using `tuning_fused_moe_triton.py`.
+
+> Historical note: this specific run used top-5 expert activation, an optimization since removed (see note above) — kept here as the original measurement of the KV-cache + fused-MoE speedup, which is independent of expert count. Reproduce at the current static top-8 default with:
 
 ```bash
-python eval/check_time_inference.py --weight-dir weights --topk 5
+python eval/check_time_inference.py --weight-dir weights
 ```
 
 | Configuration | top-k | Time (s) | Tok/s | Speedup | Token Divergence |
 |---|:---:|---:|---:|:---:|:---:|
 | **Baseline** (`src/`, unfused, no cache) | 8 | 6.49 | 4.93 | 1.00× | — |
-| **Optimized** (`model_update/`, tuned kernel) | 5 | 1.73 | 18.50 | **3.75×** | 9.38% |
+| **Optimized** (`model_update/`, tuned kernel, historical top-5 run) | 5 | 1.73 | 18.50 | **3.75×** | 9.38% |
 
 ### Multi-GPU: Baseline vs Optimized + TP/EP (2× NVIDIA RTX A6000)
 
@@ -141,9 +139,9 @@ bash eval/benchmark_compare.sh --weight-dir ./weights --gen-length 128 --steps 1
 
 ### Understanding Token Divergence (9.38%)
 
-In the single-GPU benchmark above, the token divergence is **constant at 9.38% (3/32 tokens) regardless of top-k**. This is expected:
+In the single-GPU benchmark above, the historical top-5 run diverged from baseline by **9.38% (3/32 tokens)** — but this wasn't caused by using fewer experts:
 
-- If the divergence were caused by using fewer experts, you'd see 0% divergence at topk=8 (same as baseline) and increasing divergence at topk=5 and topk=4. But it's always 3 tokens.
+- The original testing (varying top-k across 8, 5, and 4 experts) found the divergence stayed at exactly 3 tokens regardless of expert count.
 - The cause is the **block-wise KV caching itself**, which changes the attention context:
 
 | | Baseline (`src/`) | Optimized (`model_update/`) |
@@ -206,7 +204,6 @@ Verified against the HuggingFace reference implementation:
 | Weight mapping | 3,219 / 3,219 (100%) |
 | Logit cosine similarity | avg **0.9781** across 256 masked positions |
 | Top-1 token match | **91.0%** (233/256) |
-| MMLU Accuracy (`fast_dense`) | **60.0%** (demonstrates strong robustness with `topk=5` and dynamic experts; baseline is 66.0%) |
 | Generation quality | Matches HF generation behavior with exact cosine precision |
 
 ---
@@ -269,7 +266,7 @@ python download_weights.py --dest weights
 python tuning_fused_moe_triton.py --model FULL_CFG
 
 # 2. Run the inference time benchmark
-python eval/check_time_inference.py --weight-dir weights --topk 5
+python eval/check_time_inference.py --weight-dir weights
 
 # 3. Start the OpenAI-compatible API server
 bash start.sh --weight-dir ./weights
@@ -281,12 +278,10 @@ bash start.sh --weight-dir ./weights
 
 ### Inference Time Benchmark
 
-Compare baseline vs optimized model at different top-k values:
+Compare baseline vs optimized model (both run the model's native static top-8 routing):
 
 ```bash
-python eval/check_time_inference.py --weight-dir weights --topk 5    # recommended
-python eval/check_time_inference.py --weight-dir weights --topk 8    # full experts
-python eval/check_time_inference.py --weight-dir weights --topk 4    # fastest
+python eval/check_time_inference.py --weight-dir weights                  # both models
 python eval/check_time_inference.py --weight-dir weights --mode optimized  # skip baseline
 ```
 
@@ -295,7 +290,6 @@ python eval/check_time_inference.py --weight-dir weights --mode optimized  # ski
 | Flag | Default | Description |
 |---|---|---|
 | `--weight-dir` | `weights` | Path to model weight files |
-| `--topk` | `5` | Number of active experts for optimized model |
 | `--gen-length` | `32` | Number of tokens to generate |
 | `--steps` | `32` | Number of denoising steps |
 | `--block-length` | `16` | Block size for KV caching |
@@ -347,7 +341,7 @@ python -m eval.throughput.run_throughput            # concurrent request through
 │   └── server.py                           OpenAI-compatible API server
 │
 ├── model_update/                           ← Optimized implementation
-│   ├── model.py                            KV-cached model with configurable top-k routing
+│   ├── model.py                            KV-cached model, static top-8 routing
 │   ├── generate.py                         Block-wise KV-cached generation loop
 │   ├── fused_moe_triton.py                 Triton grouped-GEMM kernel + dynamic config loader
 │   ├── load_weights.py                     TP-aware safetensors weight loader
@@ -357,8 +351,6 @@ python -m eval.throughput.run_throughput            # concurrent request through
 │   ├── check_time_inference.py             Baseline vs optimized speedup benchmark
 │   ├── time_fraction.py                    Attention vs MoE FFN timing breakdown
 │   ├── check_server.py                     Server smoke test
-│   ├── diagnose_dynamic_experts.py         Token divergence & routing diagnostic
-│   ├── diagnose_real_activation_pruning.py Per-layer routing distribution analysis
 │   ├── correctness/
 │   │   └── run_correctness.py              MMLU / ARC correctness evaluation
 │   └── throughput/

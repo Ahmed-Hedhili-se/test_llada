@@ -9,8 +9,6 @@ low-confidence remasking, block restriction), but:
     purely to compute correct K/V to push into the cache
 """
 
-from typing import Optional
-
 import torch
 import torch.nn.functional as F
 
@@ -39,12 +37,6 @@ def get_num_transfer_tokens(mask_index: torch.Tensor, steps: int) -> torch.Tenso
         num_transfer[i, : remainder[i]] += 1
     return num_transfer
 
-def get_dynamic_k(step, steps_per_block, base_k=8, min_k=5):
-    """Conservative: ramp from min_k to base_k experts."""
-    progress = step / max(steps_per_block - 1, 1)
-    k = min_k + (base_k - min_k) * progress
-    return int(round(k))
-
 def _generate_block_cached(
     model,
     x: torch.Tensor,
@@ -54,13 +46,7 @@ def _generate_block_cached(
     cache_buffer: KVCacheBuffer,
     temperature: float,
     remasking: str,
-    use_dynamic_experts: bool = False,
-    base_k: int = 8,
-    min_k: int = 5,
-    nucleus_p: Optional[float] = None,
 ):
-    assert not (use_dynamic_experts and nucleus_p is not None), \
-        "use_dynamic_experts (step-based ramp) and nucleus_p (per-token adaptive) are mutually exclusive"
     block_length = block_end - block_start
     device = x.device
 
@@ -72,18 +58,11 @@ def _generate_block_cached(
         active_ids = x[:, block_start:block_end]
         mask_index = (active_ids == MASK_ID)
 
-        if use_dynamic_experts:
-            dynamic_k = get_dynamic_k(step, steps_per_block, base_k, min_k)
-        else:
-            dynamic_k = None
-
         suffix_logits, _ = model(
             suffix_ids,
             position_offset=block_start,
             cache_buffer=cache_buffer,
             write_pos=block_start,
-            dynamic_k=dynamic_k,
-            nucleus_p=nucleus_p,
         )
         logits = suffix_logits[:, :block_length]
 
@@ -118,7 +97,6 @@ def _generate_block_cached(
         position_offset=block_start,
         cache_buffer=cache_buffer,
         write_pos=block_start,
-        dynamic_k=None,
     )
     cache_buffer.commit(block_end)
 
@@ -134,20 +112,11 @@ def generate_cached(
     block_length: int = 128,
     temperature: float = 0.0,
     remasking: str = "low_confidence",
-    use_dynamic_experts: bool = False,
-    base_k: int = 8,
-    min_k: int = 5,
-    nucleus_p: Optional[float] = None,
 ) -> torch.Tensor:
     """
     Same signature/semantics as generate.generate(), minus cfg_scale
     (CFG doubles the batch and complicates cache bookkeeping; add back
     once single-sequence caching is verified correct).
-
-    nucleus_p: per-token adaptive expert count (keep experts until cumulative
-    routing weight crosses this threshold) instead of use_dynamic_experts'
-    fixed step-based ramp. Mutually exclusive with use_dynamic_experts. Only
-    supported on the eager MoE path (use_fused_moe=False on the model).
     """
     assert gen_length % block_length == 0, "gen_length must be divisible by block_length"
     num_blocks = gen_length // block_length
@@ -186,10 +155,6 @@ def generate_cached(
             cache_buffer=cache_buffer,
             temperature=temperature,
             remasking=remasking,
-            use_dynamic_experts=use_dynamic_experts,
-            base_k=base_k,
-            min_k=min_k,
-            nucleus_p=nucleus_p,
         )
 
     return x[:, P:]

@@ -53,11 +53,9 @@ def main():
     B = 2
     T_prefix = 128
     T_active = 64
-    dynamic_k = 4 # Example of dynamic experts
 
     print(f"Creating dummy input with Batch Size: {B}")
     print(f"Prefix Length: {T_prefix}, Active Block Length: {T_active}")
-    print(f"Using dynamic_k: {dynamic_k} for MoE")
 
     prefix_ids = torch.randint(0, cfg.VS, (B, T_prefix), device=device)
     active_ids = torch.randint(0, cfg.VS, (B, T_active), device=device)
@@ -71,7 +69,7 @@ def main():
     print("Warming up active block processing...")
     with torch.no_grad():
         for _ in range(3):
-            model(active_ids, position_offset=T_prefix, past_kv=past_kv, dynamic_k=dynamic_k)
+            model(active_ids, position_offset=T_prefix, past_kv=past_kv)
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
 
@@ -83,7 +81,7 @@ def main():
     start_total = time.perf_counter()
     with torch.no_grad():
         for _ in range(num_steps):
-            model(active_ids, position_offset=T_prefix, past_kv=past_kv, dynamic_k=dynamic_k)
+            model(active_ids, position_offset=T_prefix, past_kv=past_kv)
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
     end_total = time.perf_counter()

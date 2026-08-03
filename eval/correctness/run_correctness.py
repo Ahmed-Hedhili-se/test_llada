@@ -58,23 +58,6 @@ Usage:
     python -m eval.correctness.run_correctness \\
         --baseline results/baseline_mmlu.json \\
         --output results/optimised_mmlu.json
-
-    # Compare dynamic experts (top_k=5) vs static (top_k=8) on model_update.
-    # Requires the server to be running with --backend fast_dense.
-    python -m eval.correctness.run_correctness \\
-        --compare-dynamic-experts \\
-        --output results/moe_mmlu.json
-
-    # 3-way: also add nucleus (per-token adaptive) routing to the comparison
-    # above. Requires the server to be running with --backend fast_dense_eager
-    # (nucleus_p isn't implemented for the fused kernel yet).
-    python -m eval.correctness.run_correctness \\
-        --compare-dynamic-experts --nucleus-p 0.95 \\
-        --output results/moe_mmlu.json
-
-    # Single-run nucleus routing only.
-    python -m eval.correctness.run_correctness \\
-        --nucleus-p 0.95 --output results/nucleus_mmlu.json
 """
 
 from __future__ import annotations
@@ -457,38 +440,6 @@ def print_comparison(stats: dict, baseline_path: str, task: str, label: str = "C
     print(f"{'='*60}\n")
 
 
-def print_expert_routing_comparison(run_stats: dict, labels: list, baseline_label: str):
-    """Compare N live evaluate() runs against the same model_update model
-    (e.g. dynamic top-k=5, nucleus-p, static top-k=8) instead of a saved
-    baseline file. Each non-baseline config is diffed against baseline_label
-    using the same +/-1%/2% thresholds used elsewhere in this script."""
-    print(f"\n{'='*60}")
-    print("  Expert Routing — Comparison")
-    print(f"{'='*60}")
-    for label in labels:
-        s = run_stats[label]
-        print(f"  {label:<32} : {s['accuracy']:.4f} ({s['accuracy']*100:.1f}%)  [{s['correct']}/{s['total']}]")
-
-    baseline_acc = run_stats[baseline_label]["accuracy"]
-    for label in labels:
-        if label == baseline_label:
-            continue
-        diff = run_stats[label]["accuracy"] - baseline_acc
-        print(f"\n  {label} vs {baseline_label}: {diff:+.4f} ({diff*100:+.1f}%)")
-        if abs(diff) <= 0.01:
-            print(f"  ✅ PASS: within 1% of {baseline_label}")
-        elif abs(diff) <= 0.02:
-            print(f"  ⚠️  WARNING: within 2% of {baseline_label} (acceptable)")
-        else:
-            print(f"  ❌ FAIL: degrades accuracy by more than 2% vs {baseline_label}")
-    print(f"{'='*60}\n")
-
-
-def _suffixed_path(path: str, suffix: str) -> str:
-    root, ext = os.path.splitext(path)
-    return f"{root}_{suffix}{ext or '.json'}"
-
-
 def save_summary(stats: dict, task: str, output_path: str, seed: int, config_name: str = ""):
     summary = {
         "task":        task,
@@ -536,16 +487,6 @@ def main():
     ap.add_argument("--config-name",    default="",
                     help="Label stored in the summary JSON.")
     ap.add_argument(
-        "--compare-dynamic-experts", action="store_true",
-        help=(
-            "Run the SAME questions twice against the model_update ('fast_dense') "
-            "model — once with dynamic experts (use_dynamic_experts=True, "
-            "base_k=min_k=5) and once static (use_dynamic_experts=False, top_k=8) "
-            "— then compare accuracy. Requires the server to be running with "
-            "--backend fast_dense. Ignores --baseline."
-        ),
-    )
-    ap.add_argument(
         "--direct-answer", action="store_true",
         help=(
             "Use the old bare-letter prompt ('answer with only the letter') "
@@ -562,35 +503,7 @@ def main():
                          f"(CoT) or 32 (--direct-answer).")
     ap.add_argument("--block-length", type=int, default=DEFAULT_COT_BLOCK_LENGTH,
                     help="Server-side block_length for generation.")
-    ap.add_argument(
-        "--use-dynamic-experts", action="store_true",
-        help=(
-            "Single-run mode: route through model_update's dynamic (reduced) "
-            "expert path instead of the default static top-k=8. Combine with "
-            "--base-k/--min-k. Ignored if --compare-dynamic-experts is set "
-            "(that flag already runs both configs)."
-        ),
-    )
-    ap.add_argument("--base-k", type=int, default=5,
-                    help="Max experts for --use-dynamic-experts (default: 5).")
-    ap.add_argument("--min-k", type=int, default=5,
-                    help="Min experts for --use-dynamic-experts (default: 5, i.e. fixed top-k=5).")
-    ap.add_argument(
-        "--nucleus-p", type=float, default=None,
-        help=(
-            "Per-token adaptive expert count: keep experts until their cumulative "
-            "routing weight crosses this threshold (e.g. 0.95), instead of a fixed "
-            "count. Only supported on model_update's eager MoE path — start the "
-            "server with --backend fast_dense_eager, not fast_dense. In single-run "
-            "mode this is mutually exclusive with --use-dynamic-experts. Combined "
-            "with --compare-dynamic-experts, adds a 3rd 'Nucleus' config to that "
-            "comparison instead of replacing the single-run mode."
-        ),
-    )
     args = ap.parse_args()
-
-    assert not (args.use_dynamic_experts and args.nucleus_p is not None), \
-        "--use-dynamic-experts and --nucleus-p are mutually exclusive in single-run mode"
 
     cot = not args.direct_answer
     max_tokens = args.max_tokens if args.max_tokens is not None else (DEFAULT_COT_MAX_TOKENS if cot else 16)
@@ -613,64 +526,18 @@ def main():
     print(f"Concurrent : {args.num_concurrent}")
     print(f"Prompting  : {'chain-of-thought' if cot else 'direct (bare letter)'}")
     print(f"Max tokens : {max_tokens}  |  Steps: {steps}  |  Block length: {args.block_length}")
-    if args.use_dynamic_experts and not args.compare_dynamic_experts:
-        print(f"Experts    : dynamic (base_k={args.base_k}, min_k={args.min_k})")
-    elif args.nucleus_p is not None and not args.compare_dynamic_experts:
-        print(f"Experts    : nucleus (p={args.nucleus_p})")
     print(f"Seed       : {seed}\n")
 
     print("Loading dataset...", flush=True)
     items = load_dataset_for_task(args.task, limit)
     print(f"Loaded {len(items)} questions.\n")
 
-    base_gen_config = {"block_length": args.block_length}
-    if not args.compare_dynamic_experts:
-        if args.use_dynamic_experts:
-            base_gen_config.update({
-                "use_dynamic_experts": True,
-                "base_k": args.base_k,
-                "min_k": args.min_k,
-            })
-        elif args.nucleus_p is not None:
-            base_gen_config["nucleus_p"] = args.nucleus_p
-
-    if args.compare_dynamic_experts:
-        configs = [
-            ("Dynamic Experts (top_k=5)", {**base_gen_config, "use_dynamic_experts": True, "base_k": 5, "min_k": 5}),
-            ("Static Experts (top_k=8)",  {**base_gen_config, "use_dynamic_experts": False, "base_k": 8, "min_k": 8}),
-        ]
-        if args.nucleus_p is not None:
-            configs.append((f"Nucleus (p={args.nucleus_p})", {**base_gen_config, "nucleus_p": args.nucleus_p}))
-        run_stats = {}
-        for label, gen_config in configs:
-            print(f"\n{'#'*60}\n  Running: {label}  {gen_config}\n{'#'*60}")
-            t0 = time.time()
-            stats = evaluate(
-                items, args.base_url, args.num_concurrent, args.timeout,
-                gen_config=gen_config, cot=cot, max_tokens=max_tokens, steps=steps,
-            )
-            elapsed = time.time() - t0
-            print(f"\nTotal time : {elapsed:.1f}s  ({elapsed/max(len(items),1):.1f}s/question)")
-            print_results(stats, args.task, label)
-            run_stats[label] = stats
-
-            if args.output:
-                if "nucleus_p" in gen_config:
-                    suffix = "nucleus"
-                elif gen_config.get("use_dynamic_experts"):
-                    suffix = "dynamic"
-                else:
-                    suffix = "static"
-                save_summary(stats, args.task, _suffixed_path(args.output, suffix), seed, label)
-
-        labels = [label for label, _ in configs]
-        print_expert_routing_comparison(run_stats, labels, baseline_label="Static Experts (top_k=8)")
-        return
+    gen_config = {"block_length": args.block_length}
 
     t0    = time.time()
     stats = evaluate(
         items, args.base_url, args.num_concurrent, args.timeout,
-        gen_config=base_gen_config, cot=cot, max_tokens=max_tokens, steps=steps,
+        gen_config=gen_config, cot=cot, max_tokens=max_tokens, steps=steps,
     )
     elapsed = time.time() - t0
 

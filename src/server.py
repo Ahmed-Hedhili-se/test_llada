@@ -2,16 +2,12 @@
 OpenAI-compatible chat completions server for LLaDA-MoE-7B-A1B-Instruct.
 
 Backends:
-  - "ours"             : Dense baseline (src.generate)
-  - "ours_kv"          : Original sparse-dLLM + SparseD (src.generate_KVcache)
-  - "fast_dense"       : NEW - Fast dense cached + conservative dynamic experts (Option A).
-                         Fused Triton MoE — fast, but does not support nucleus_p.
-  - "fast_dense_eager" : Same as fast_dense but keeps the eager (unfused) MoE blocks —
-                         needed for nucleus_p (per-token adaptive expert routing), which
-                         isn't implemented for the fused kernel yet. Much slower; for
-                         accuracy validation, not throughput.
-  - "dyn_experts"      : NEW - Sparse path + dynamic expert pruning
-  - "hf"               : HuggingFace reference
+  - "ours"        : Dense baseline (src.generate)
+  - "ours_kv"     : Original sparse-dLLM + SparseD (src.generate_KVcache)
+  - "fast_dense"  : Fast dense cached (Option A) — TP+EP, Triton fused MoE,
+                    block-wise KV cache. Static top-8 experts (the model's
+                    native routing config).
+  - "hf"          : HuggingFace reference
 
 Usage:
     python3 -m src.server --weight-dir ./weights --port 8000 --backend fast_dense
@@ -69,14 +65,6 @@ class ChatRequest(BaseModel):
     block_length: int = DEFAULT_BLOCK_LENGTH
     cfg_scale: float = DEFAULT_CFG_SCALE
     remasking: str = DEFAULT_REMASKING
-    # model_update ("fast_dense") only — overrides that backend's MoE expert count.
-    # None means "use this backend's default" (see fast_dense branch below).
-    use_dynamic_experts: Optional[bool] = None
-    base_k: Optional[int] = None
-    min_k: Optional[int] = None
-    # Per-token adaptive expert count (nucleus/top-p style). Mutually exclusive
-    # with use_dynamic_experts. Only supported on the eager MoE path so far.
-    nucleus_p: Optional[float] = None
 
 
 @app.get("/health")
@@ -98,12 +86,12 @@ def set_config(config: dict):
     """Switch generation config at runtime (for testing only)."""
     global BACKEND
     new_backend = config.get("backend")
-    if new_backend in ["ours", "ours_kv", "fast_dense", "fast_dense_eager", "dyn_experts", "hf"]:
+    if new_backend in ["ours", "ours_kv", "fast_dense", "hf"]:
         BACKEND = new_backend
         return {"status": "ok", "backend": BACKEND}
     return JSONResponse(
         status_code=400,
-        content={"error": f"Unknown backend: {new_backend}. Valid: ours, ours_kv, fast_dense, fast_dense_eager, dyn_experts, hf"}
+        content={"error": f"Unknown backend: {new_backend}. Valid: ours, ours_kv, fast_dense, hf"}
     )
 
 
@@ -160,15 +148,10 @@ def chat_completions(req: ChatRequest):
                 cfg_scale=req.cfg_scale,
                 remasking=req.remasking,
             )
-        elif BACKEND in ("fast_dense", "fast_dense_eager"):
+        elif BACKEND == "fast_dense":
             from model_update.model import LLaDAMoEKV
             from model_update.generate import generate_cached
             from model_update.distributed import get_tp_size
-
-            use_dynamic_experts = req.use_dynamic_experts if req.use_dynamic_experts is not None else False
-            base_k = req.base_k if req.base_k is not None else 8
-            min_k = req.min_k if req.min_k is not None else 8
-            nucleus_p = req.nucleus_p
 
             if get_tp_size() > 1:
                 import torch.distributed as dist
@@ -179,10 +162,6 @@ def chat_completions(req: ChatRequest):
                     "steps": steps,
                     "block_length": block_length,
                     "temperature": req.temperature,
-                    "use_dynamic_experts": use_dynamic_experts,
-                    "base_k": base_k,
-                    "min_k": min_k,
-                    "nucleus_p": nucleus_p,
                 }
                 dist.broadcast_object_list([req_obj], src=0)
 
@@ -193,44 +172,6 @@ def chat_completions(req: ChatRequest):
                 steps=steps,
                 block_length=block_length,
                 temperature=req.temperature,
-                use_dynamic_experts=use_dynamic_experts,
-                base_k=base_k,
-                min_k=min_k,
-                nucleus_p=nucleus_p,
-            )
-        elif BACKEND == "dyn_experts":
-            from model_update.model import LLaDAMoEKV
-            from model_update.generate import generate_sparse_cached
-            from model_update.distributed import get_tp_size
-            
-            if get_tp_size() > 1:
-                import torch.distributed as dist
-                req_obj = {
-                    "type": "generate_cached",
-                    "input_ids": input_ids.cpu(),
-                    "gen_length": gen_length,
-                    "steps": steps,
-                    "block_length": block_length,
-                    "temperature": req.temperature,
-                    "use_dynamic_experts": True,
-                    "base_k": 8,
-                    "min_k": 5
-                }
-                dist.broadcast_object_list([req_obj], src=0)
-
-            out_ids = generate_sparse_cached(
-                MODEL,
-                input_ids,
-                gen_length=gen_length,
-                steps=steps,
-                block_length=block_length,
-                temperature=req.temperature,
-                cache_budget=2048,
-                saliency_update_interval=8,
-                sparse_pattern=None,
-                use_dynamic_experts=True,
-                base_k=8,
-                min_k=5,
             )
         elif BACKEND == "hf":
             # HuggingFace's .generate() blocks diffusion models in newer versions.
@@ -300,7 +241,7 @@ def load_model(weight_dir: str, device: str, backend: str):
         from src.model import LLaDAMoE, load_weights
         MODEL = LLaDAMoE().to(torch.bfloat16).to(device).eval()
         load_weights(MODEL, weight_dir, verbose=True)
-    elif backend in ("fast_dense", "fast_dense_eager", "dyn_experts"):
+    elif backend == "fast_dense":
         from model_update.model import LLaDAMoEKV, TritonFusedMoEBlock
         from model_update.distributed import load_weights_tp, get_tp_rank
 
@@ -308,18 +249,11 @@ def load_model(weight_dir: str, device: str, backend: str):
         MODEL = LLaDAMoEKV(use_fused_moe=False).to(torch.bfloat16).eval()
         load_weights_tp(MODEL, weight_dir, verbose=True)
 
-        if backend == "fast_dense_eager":
-            # Stays on the eager MoEBlock path (no Triton fusion) — this is
-            # the only path nucleus_p (adaptive per-token expert routing)
-            # currently supports. Much slower than fast_dense; for
-            # correctness/accuracy validation only, not for throughput.
-            print("Keeping eager (unfused) MoE blocks for nucleus_p support.")
-        else:
-            print("Converting to Fused MoE blocks...")
-            for i, layer in enumerate(MODEL.layers):
-                fused_mlp = TritonFusedMoEBlock(layer.mlp.cfg).to(torch.bfloat16)
-                fused_mlp.load_state_dict_from_unfused(layer.mlp)
-                layer.mlp = fused_mlp
+        print("Converting to Fused MoE blocks...")
+        for i, layer in enumerate(MODEL.layers):
+            fused_mlp = TritonFusedMoEBlock(layer.mlp.cfg).to(torch.bfloat16)
+            fused_mlp.load_state_dict_from_unfused(layer.mlp)
+            layer.mlp = fused_mlp
 
         MODEL = MODEL.to(device)
     elif backend == "ours_kv":
@@ -349,7 +283,7 @@ def main():
     ap.add_argument("--host", default="0.0.0.0")
     # In distributed mode, we override device with local rank
     ap.add_argument("--device", default=f"cuda:{get_tp_rank()}" if torch.cuda.is_available() else "cpu")
-    ap.add_argument("--backend", choices=["ours", "ours_kv", "fast_dense", "fast_dense_eager", "dyn_experts", "hf"], default="ours")
+    ap.add_argument("--backend", choices=["ours", "ours_kv", "fast_dense", "hf"], default="ours")
     args = ap.parse_args()
 
     # Override device if TP is active
@@ -383,10 +317,6 @@ def worker_loop():
                 steps=req["steps"],
                 block_length=req["block_length"],
                 temperature=req["temperature"],
-                use_dynamic_experts=req["use_dynamic_experts"],
-                base_k=req["base_k"],
-                min_k=req["min_k"],
-                nucleus_p=req.get("nucleus_p"),
             )
 
 

@@ -16,7 +16,7 @@ echo " LLaDA-MoE Correctness Benchmark: Option A vs HuggingFace"
 echo "================================================================"
 echo ""
 echo "This script compares:"
-echo "  1. Option A (fast_dense cached + conservative dynamic experts)"
+echo "  1. Option A (fast_dense: KV cache + fused MoE, static top-8)"
 echo "  2. HuggingFace reference implementation"
 echo ""
 echo "================================================================"
@@ -151,7 +151,6 @@ elif abs(diff) <= 0.02:
     print('  ⚠️  Option A within 2% of HuggingFace (acceptable)')
 else:
     print('  ❌ Option A differs from HuggingFace by >2%')
-    print('     Consider tuning: min_k=5, expert_threshold=0.02')
 print()
 "
     echo "----------------------------------------------------------------"

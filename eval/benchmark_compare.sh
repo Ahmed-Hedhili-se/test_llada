@@ -9,7 +9,7 @@
 #  Usage:
 #    bash eval/benchmark_compare.sh [--weight-dir ./weights] \
 #         [--gen-length 64] [--steps 64] [--block-length 32] \
-#         [--num-warmup 1] [--num-runs 3] [--topk 8]
+#         [--num-warmup 1] [--num-runs 3]
 # ============================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -25,7 +25,6 @@ STEPS=64
 BLOCK_LENGTH=32
 NUM_WARMUP=1
 NUM_RUNS=3
-TOPK=8
 NPROC=2
 
 while [[ $# -gt 0 ]]; do
@@ -36,7 +35,6 @@ while [[ $# -gt 0 ]]; do
         --block-length) BLOCK_LENGTH="$2";shift 2 ;;
         --num-warmup)   NUM_WARMUP="$2";  shift 2 ;;
         --num-runs)     NUM_RUNS="$2";    shift 2 ;;
-        --topk)         TOPK="$2";        shift 2 ;;
         --nproc)        NPROC="$2";       shift 2 ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
@@ -50,7 +48,6 @@ COMMON_ARGS=(
     --block-length "$BLOCK_LENGTH"
     --num-warmup "$NUM_WARMUP"
     --num-runs   "$NUM_RUNS"
-    --topk       "$TOPK"
 )
 
 echo ""
@@ -61,7 +58,6 @@ echo "║  Weights     : $WEIGHT_DIR"
 echo "║  Gen Length  : $GEN_LENGTH tokens"
 echo "║  Steps       : $STEPS"
 echo "║  Block Length: $BLOCK_LENGTH"
-echo "║  Top-k       : $TOPK experts"
 echo "║  Warmup / Runs: $NUM_WARMUP / $NUM_RUNS"
 echo "║  TP Size     : $NPROC GPUs"
 echo "╚══════════════════════════════════════════════════════════════╝"

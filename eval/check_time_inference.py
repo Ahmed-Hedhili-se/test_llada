@@ -3,7 +3,7 @@ Inference Time Benchmark: Baseline vs Optimized.
 
 Compares:
   1. Dense Baseline (src/)  — unfused MoE, no KV cache, topk=8
-  2. Optimized     (model_update/) — Triton fused MoE, block-wise KV cache, topk=5
+  2. Optimized     (model_update/) — Triton fused MoE, block-wise KV cache, topk=8
 """
 
 import argparse
@@ -141,13 +141,10 @@ def baseline_generate(model, prompt_ids, gen_length, steps, block_length):
     return x[0, P:]
 
 
-def optimized_generate(model, prompt_ids, gen_length, steps, block_length, topk):
-    """Generation with block-wise KV cache, fused MoE, and fixed topk."""
+def optimized_generate(model, prompt_ids, gen_length, steps, block_length):
+    """Generation with block-wise KV cache, fused MoE, static top-8 experts."""
     from model_update.generate import generate_cached
-    return generate_cached(
-        model, prompt_ids, gen_length, steps, block_length,
-        use_dynamic_experts=True, base_k=topk, min_k=topk,  # fixed topk (no ramp)
-    )
+    return generate_cached(model, prompt_ids, gen_length, steps, block_length)
 
 
 # ── benchmarking ─────────────────────────────────────────────────────────────
@@ -182,7 +179,6 @@ def main():
     ap.add_argument("--gen-length", type=int, default=32)
     ap.add_argument("--steps", type=int, default=32)
     ap.add_argument("--block-length", type=int, default=16)
-    ap.add_argument("--topk", type=int, default=5, help="Fixed top-k experts for the optimized model")
     ap.add_argument("--mode", choices=["both", "baseline", "optimized"], default="both",
                     help="Which model(s) to benchmark")
     args = ap.parse_args()
@@ -212,7 +208,6 @@ def main():
         print(f"  Gen Length       : {args.gen_length}")
         print(f"  Steps            : {args.steps}")
         print(f"  Block Length     : {args.block_length}")
-        print(f"  Optimized top-k  : {args.topk}")
         print(f"  Warmup Runs      : {args.num_warmup}")
         print(f"  Benchmark Runs   : {args.num_runs}")
         print("=" * 80 + "\n")
@@ -268,7 +263,7 @@ def main():
     if args.mode in ["both", "optimized"]:
         if is_master:
             print("=" * 60)
-            print(f"  2. OPTIMIZED  (model_update/, fused MoE, topk={args.topk}, KV cache)")
+            print("  2. OPTIMIZED  (model_update/, fused MoE, topk=8, KV cache)")
             print("=" * 60)
         opt_model, opt_load_time = load_optimized(args.weight_dir, args.device)
         if is_master:
@@ -276,11 +271,11 @@ def main():
 
         set_seed(42)
         opt_tokens = optimized_generate(
-            opt_model, prompt_ids, args.gen_length, args.steps, args.block_length, args.topk
+            opt_model, prompt_ids, args.gen_length, args.steps, args.block_length
         )[0].cpu()
 
         opt_lats = benchmark(
-            lambda: optimized_generate(opt_model, prompt_ids, args.gen_length, args.steps, args.block_length, args.topk),
+            lambda: optimized_generate(opt_model, prompt_ids, args.gen_length, args.steps, args.block_length),
             args.device, args.num_warmup, args.num_runs,
         )
         opt_mean, opt_med, opt_p95 = get_stats(opt_lats)
@@ -309,7 +304,7 @@ def main():
         print(f"| {'Baseline (src/, topk=8, no cache)':<50} | {bl_mean:>10.2f} | {bl_tps:>10.2f} | {'1.00x':>10} |")
     if args.mode in ["both", "optimized"]:
         speed_text = f"{speedup:.2f}x" if args.mode == "both" else "N/A"
-        print(f"| {f'Optimized (model_update/, topk={args.topk}, KV cache)':<50} | {opt_mean:>10.2f} | {opt_tps:>10.2f} | {speed_text:>10} |")
+        print(f"| {'Optimized (model_update/, topk=8, KV cache)':<50} | {opt_mean:>10.2f} | {opt_tps:>10.2f} | {speed_text:>10} |")
     print("=" * 100)
 
     if args.mode == "both" and baseline_tokens is not None and opt_tokens is not None:

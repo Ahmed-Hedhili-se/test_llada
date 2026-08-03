@@ -76,7 +76,6 @@ def diffusion_generate(model, prompt_ids, gen_length=64, steps=64, block_length=
         return generate_cached(
             model, prompt_ids, gen_length=gen_length, steps=steps,
             block_length=block_length, temperature=temperature,
-            use_dynamic_experts=False  # Keep TopK=8 to perfectly match HF for test
         )
 
     import numpy as np
