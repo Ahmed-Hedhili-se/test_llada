@@ -331,6 +331,7 @@ def evaluate(
     cot: bool = True,
     max_tokens: int = DEFAULT_COT_MAX_TOKENS,
     steps: int = DEFAULT_COT_STEPS,
+    transcript_path: Optional[str] = None,
 ) -> dict:
     correct = 0
     total   = len(items)
@@ -389,6 +390,27 @@ def evaluate(
     per_subject_acc = {
         s: sum(v) / len(v) for s, v in per_subject.items() if v
     }
+
+    if transcript_path:
+        records = []
+        for idx, entry in enumerate(results_list):
+            if entry is None:
+                continue
+            item, is_correct, raw = entry
+            records.append({
+                "idx":       idx,
+                "subject":   item.get("subject", "unknown"),
+                "question":  item["question"],
+                "choices":   item["choices"],
+                "expected":  CHOICES[item["answer_idx"]],
+                "predicted": parse_answer(raw) if is_correct is not None else None,
+                "correct":   is_correct,
+                "raw_response": raw,
+            })
+        os.makedirs(os.path.dirname(transcript_path) if os.path.dirname(transcript_path) else ".", exist_ok=True)
+        with open(transcript_path, "w") as f:
+            json.dump(records, f, indent=2)
+        print(f"Transcripts saved to {transcript_path}")
 
     return {
         "accuracy":         accuracy,
@@ -503,6 +525,15 @@ def main():
                          f"(CoT) or 32 (--direct-answer).")
     ap.add_argument("--block-length", type=int, default=DEFAULT_COT_BLOCK_LENGTH,
                     help="Server-side block_length for generation.")
+    ap.add_argument(
+        "--save-transcripts", default=None,
+        help=(
+            "Path to save full per-question transcripts (question, choices, "
+            "expected, predicted, and the raw model response) as JSON — for "
+            "diagnosing whether wrong answers are reasoning failures or "
+            "answer-extraction failures. Not saved by default."
+        ),
+    )
     args = ap.parse_args()
 
     cot = not args.direct_answer
@@ -538,6 +569,7 @@ def main():
     stats = evaluate(
         items, args.base_url, args.num_concurrent, args.timeout,
         gen_config=gen_config, cot=cot, max_tokens=max_tokens, steps=steps,
+        transcript_path=args.save_transcripts,
     )
     elapsed = time.time() - t0
 
