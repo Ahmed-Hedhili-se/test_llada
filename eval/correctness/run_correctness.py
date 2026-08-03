@@ -64,6 +64,17 @@ Usage:
     python -m eval.correctness.run_correctness \\
         --compare-dynamic-experts \\
         --output results/moe_mmlu.json
+
+    # 3-way: also add nucleus (per-token adaptive) routing to the comparison
+    # above. Requires the server to be running with --backend fast_dense_eager
+    # (nucleus_p isn't implemented for the fused kernel yet).
+    python -m eval.correctness.run_correctness \\
+        --compare-dynamic-experts --nucleus-p 0.95 \\
+        --output results/moe_mmlu.json
+
+    # Single-run nucleus routing only.
+    python -m eval.correctness.run_correctness \\
+        --nucleus-p 0.95 --output results/nucleus_mmlu.json
 """
 
 from __future__ import annotations
@@ -446,24 +457,30 @@ def print_comparison(stats: dict, baseline_path: str, task: str, label: str = "C
     print(f"{'='*60}\n")
 
 
-def print_dynamic_experts_comparison(label_a: str, stats_a: dict, label_b: str, stats_b: dict):
-    """Compare two live evaluate() runs against the same model_update model
-    (e.g. dynamic top-k=5 experts vs. static top-k=8) instead of a saved
-    baseline file."""
-    acc_a, acc_b = stats_a["accuracy"], stats_b["accuracy"]
-    diff = acc_a - acc_b
+def print_expert_routing_comparison(run_stats: dict, labels: list, baseline_label: str):
+    """Compare N live evaluate() runs against the same model_update model
+    (e.g. dynamic top-k=5, nucleus-p, static top-k=8) instead of a saved
+    baseline file. Each non-baseline config is diffed against baseline_label
+    using the same +/-1%/2% thresholds used elsewhere in this script."""
     print(f"\n{'='*60}")
-    print("  Dynamic vs Static Experts — Comparison")
+    print("  Expert Routing — Comparison")
     print(f"{'='*60}")
-    print(f"  {label_a:<32} : {acc_a:.4f} ({acc_a*100:.1f}%)  [{stats_a['correct']}/{stats_a['total']}]")
-    print(f"  {label_b:<32} : {acc_b:.4f} ({acc_b*100:.1f}%)  [{stats_b['correct']}/{stats_b['total']}]")
-    print(f"  Difference (A - B)               : {diff:+.4f} ({diff*100:+.1f}%)")
-    if abs(diff) <= 0.01:
-        print("  ✅ PASS: dynamic experts within 1% of static top-k=8")
-    elif abs(diff) <= 0.02:
-        print("  ⚠️  WARNING: dynamic experts within 2% of static top-k=8 (acceptable)")
-    else:
-        print("  ❌ FAIL: dynamic experts degrade accuracy by more than 2%")
+    for label in labels:
+        s = run_stats[label]
+        print(f"  {label:<32} : {s['accuracy']:.4f} ({s['accuracy']*100:.1f}%)  [{s['correct']}/{s['total']}]")
+
+    baseline_acc = run_stats[baseline_label]["accuracy"]
+    for label in labels:
+        if label == baseline_label:
+            continue
+        diff = run_stats[label]["accuracy"] - baseline_acc
+        print(f"\n  {label} vs {baseline_label}: {diff:+.4f} ({diff*100:+.1f}%)")
+        if abs(diff) <= 0.01:
+            print(f"  ✅ PASS: within 1% of {baseline_label}")
+        elif abs(diff) <= 0.02:
+            print(f"  ⚠️  WARNING: within 2% of {baseline_label} (acceptable)")
+        else:
+            print(f"  ❌ FAIL: degrades accuracy by more than 2% vs {baseline_label}")
     print(f"{'='*60}\n")
 
 
@@ -558,7 +575,22 @@ def main():
                     help="Max experts for --use-dynamic-experts (default: 5).")
     ap.add_argument("--min-k", type=int, default=5,
                     help="Min experts for --use-dynamic-experts (default: 5, i.e. fixed top-k=5).")
+    ap.add_argument(
+        "--nucleus-p", type=float, default=None,
+        help=(
+            "Per-token adaptive expert count: keep experts until their cumulative "
+            "routing weight crosses this threshold (e.g. 0.95), instead of a fixed "
+            "count. Only supported on model_update's eager MoE path — start the "
+            "server with --backend fast_dense_eager, not fast_dense. In single-run "
+            "mode this is mutually exclusive with --use-dynamic-experts. Combined "
+            "with --compare-dynamic-experts, adds a 3rd 'Nucleus' config to that "
+            "comparison instead of replacing the single-run mode."
+        ),
+    )
     args = ap.parse_args()
+
+    assert not (args.use_dynamic_experts and args.nucleus_p is not None), \
+        "--use-dynamic-experts and --nucleus-p are mutually exclusive in single-run mode"
 
     cot = not args.direct_answer
     max_tokens = args.max_tokens if args.max_tokens is not None else (DEFAULT_COT_MAX_TOKENS if cot else 16)
@@ -583,6 +615,8 @@ def main():
     print(f"Max tokens : {max_tokens}  |  Steps: {steps}  |  Block length: {args.block_length}")
     if args.use_dynamic_experts and not args.compare_dynamic_experts:
         print(f"Experts    : dynamic (base_k={args.base_k}, min_k={args.min_k})")
+    elif args.nucleus_p is not None and not args.compare_dynamic_experts:
+        print(f"Experts    : nucleus (p={args.nucleus_p})")
     print(f"Seed       : {seed}\n")
 
     print("Loading dataset...", flush=True)
@@ -590,18 +624,23 @@ def main():
     print(f"Loaded {len(items)} questions.\n")
 
     base_gen_config = {"block_length": args.block_length}
-    if args.use_dynamic_experts and not args.compare_dynamic_experts:
-        base_gen_config.update({
-            "use_dynamic_experts": True,
-            "base_k": args.base_k,
-            "min_k": args.min_k,
-        })
+    if not args.compare_dynamic_experts:
+        if args.use_dynamic_experts:
+            base_gen_config.update({
+                "use_dynamic_experts": True,
+                "base_k": args.base_k,
+                "min_k": args.min_k,
+            })
+        elif args.nucleus_p is not None:
+            base_gen_config["nucleus_p"] = args.nucleus_p
 
     if args.compare_dynamic_experts:
         configs = [
             ("Dynamic Experts (top_k=5)", {**base_gen_config, "use_dynamic_experts": True, "base_k": 5, "min_k": 5}),
             ("Static Experts (top_k=8)",  {**base_gen_config, "use_dynamic_experts": False, "base_k": 8, "min_k": 8}),
         ]
+        if args.nucleus_p is not None:
+            configs.append((f"Nucleus (p={args.nucleus_p})", {**base_gen_config, "nucleus_p": args.nucleus_p}))
         run_stats = {}
         for label, gen_config in configs:
             print(f"\n{'#'*60}\n  Running: {label}  {gen_config}\n{'#'*60}")
@@ -616,11 +655,16 @@ def main():
             run_stats[label] = stats
 
             if args.output:
-                suffix = "dynamic" if gen_config["use_dynamic_experts"] else "static"
+                if "nucleus_p" in gen_config:
+                    suffix = "nucleus"
+                elif gen_config.get("use_dynamic_experts"):
+                    suffix = "dynamic"
+                else:
+                    suffix = "static"
                 save_summary(stats, args.task, _suffixed_path(args.output, suffix), seed, label)
 
-        (label_a, _), (label_b, _) = configs
-        print_dynamic_experts_comparison(label_a, run_stats[label_a], label_b, run_stats[label_b])
+        labels = [label for label, _ in configs]
+        print_expert_routing_comparison(run_stats, labels, baseline_label="Static Experts (top_k=8)")
         return
 
     t0    = time.time()

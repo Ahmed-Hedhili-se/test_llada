@@ -102,6 +102,27 @@ class Cfg:
         return self.H // self.NH
 
 
+def nucleus_mask_weights(vals: torch.Tensor, nucleus_p: float) -> torch.Tensor:
+    """
+    Zero out routing weights beyond a per-token nucleus (top-p) threshold instead of
+    a fixed count. `vals` are the top-TOPK routing weights, sorted descending (as
+    returned by torch.topk). A slot is kept iff the cumulative weight *before* it is
+    still < nucleus_p — this always keeps at least the first (highest-weight) slot.
+
+    nucleus_p >= 1.0 is a required passthrough (kept unmasked) rather than relying on
+    cumsum reaching exactly 1.0 in floating point, so it is byte-identical to the
+    unmasked (native top-TOPK) path.
+
+    No renormalization after masking — matches the existing fixed-k truncation
+    (torch.topk dropping ranks beyond k also doesn't renormalize the survivors).
+    """
+    if nucleus_p >= 1.0:
+        return vals
+    cum_before = torch.cumsum(vals, dim=-1) - vals
+    keep_mask = cum_before < nucleus_p
+    return vals * keep_mask.to(vals.dtype)
+
+
 from .fused_moe_triton import fused_moe
 
 class TritonFusedMoEBlock(nn.Module):
@@ -127,9 +148,17 @@ class TritonFusedMoEBlock(nn.Module):
                 self.w1[i].copy_(torch.cat([w_gate, w_up], dim=0))
                 self.w2[i].copy_(expert.down_proj.weight)
 
-    def forward(self, x: torch.Tensor, dynamic_k: Optional[int] = None) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, dynamic_k: Optional[int] = None, nucleus_p: Optional[float] = None,
+    ) -> torch.Tensor:
         if x.device.type == "cpu":
             raise NotImplementedError("Triton Fused MoE requires a CUDA GPU.")
+        if nucleus_p is not None:
+            raise NotImplementedError(
+                "nucleus_p routing is not yet implemented for the fused Triton MoE path "
+                "(Stage 3 of the adaptive-routing plan) — only MoEBlock (use_fused_moe=False) "
+                "supports it so far."
+            )
 
         B, T, H = x.shape
         x_flat = x.view(B * T, H)
@@ -296,14 +325,21 @@ class MoEBlock(nn.Module):
         self.gate = nn.Linear(cfg.H, cfg.NE, bias=False)
         self.experts = nn.ModuleList([ExpertMLP(cfg) for _ in range(self.num_local_experts)])
 
-    def forward(self, x, dynamic_k: Optional[int] = None):
+    def forward(self, x, dynamic_k: Optional[int] = None, nucleus_p: Optional[float] = None):
+        assert dynamic_k is None or nucleus_p is None, "dynamic_k and nucleus_p are mutually exclusive"
         cfg = self.cfg
         B, T, _ = x.shape
         x_flat = x.view(B * T, cfg.H)
 
-        routing_weights = F.softmax(self.gate(x_flat), dim=-1, dtype=torch.float32)
-        k = dynamic_k if dynamic_k is not None else cfg.TOPK
-        routing_weights, selected_experts = torch.topk(routing_weights, k, dim=-1)
+        routing_weights_full = F.softmax(self.gate(x_flat), dim=-1, dtype=torch.float32)
+
+        if nucleus_p is not None:
+            vals, selected_experts = torch.topk(routing_weights_full, cfg.TOPK, dim=-1)
+            routing_weights = nucleus_mask_weights(vals, nucleus_p)
+        else:
+            k = dynamic_k if dynamic_k is not None else cfg.TOPK
+            routing_weights, selected_experts = torch.topk(routing_weights_full, k, dim=-1)
+
         expert_mask = F.one_hot(selected_experts, num_classes=cfg.NE).permute(2, 1, 0)
 
         routing_weights = routing_weights.to(x.dtype)
@@ -336,6 +372,7 @@ class Layer(nn.Module):
 
     def forward(
         self, x, cos, sin, past_kv=None, dynamic_k: Optional[int] = None,
+        nucleus_p: Optional[float] = None,
         cache_buffer: Optional["KVCacheBuffer"] = None,
         layer_idx: Optional[int] = None,
         write_pos: Optional[int] = None,
@@ -345,7 +382,7 @@ class Layer(nn.Module):
             cache_buffer=cache_buffer, layer_idx=layer_idx, write_pos=write_pos,
         )
         x = x + attn_out
-        x = x + self.mlp(self.post_attention_layernorm(x), dynamic_k=dynamic_k)
+        x = x + self.mlp(self.post_attention_layernorm(x), dynamic_k=dynamic_k, nucleus_p=nucleus_p)
         return x, kv_new
 
 
@@ -364,6 +401,7 @@ class LLaDAMoEKV(nn.Module):
         position_offset: int = 0,
         past_kv: Optional[KVCache] = None,
         dynamic_k: Optional[int] = None,
+        nucleus_p: Optional[float] = None,
         cache_buffer: Optional[KVCacheBuffer] = None,
         write_pos: Optional[int] = None,
     ):
@@ -373,7 +411,13 @@ class LLaDAMoEKV(nn.Module):
         position_offset: absolute starting position of input_ids in the full
                    sequence, for correct RoPE.
         past_kv: list of (k,v) per layer for the prefix, or None.
-        dynamic_k: override the number of activated experts for this call.
+        dynamic_k: override the number of activated experts for this call
+                   with a fixed count (mutually exclusive with nucleus_p).
+        nucleus_p: per-token adaptive expert count — keep experts until their
+                   cumulative routing weight crosses this threshold, instead
+                   of a fixed count. Only supported by MoEBlock (eager path),
+                   not yet by TritonFusedMoEBlock. Mutually exclusive with
+                   dynamic_k.
         cache_buffer/write_pos: preallocated in-place KV cache (see
                    KVCacheBuffer). Mutually exclusive with past_kv — when
                    given, K/V for input_ids are written into the buffer at
@@ -397,7 +441,7 @@ class LLaDAMoEKV(nn.Module):
         for i, layer in enumerate(self.layers):
             layer_past = past_kv[i] if past_kv is not None else None
             x, kv_i = layer(
-                x, cos, sin, layer_past, dynamic_k=dynamic_k,
+                x, cos, sin, layer_past, dynamic_k=dynamic_k, nucleus_p=nucleus_p,
                 cache_buffer=cache_buffer, layer_idx=i, write_pos=write_pos,
             )
             new_kv.append(kv_i)

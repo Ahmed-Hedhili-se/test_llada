@@ -23,7 +23,13 @@ def set_seed(seed: int):
 
 
 def run_diagnostic():
-    parser = argparse.ArgumentParser(description="Token-level correctness & routing diagnostic for Dynamic Experts")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Token-level correctness & routing diagnostic comparing a dense "
+            "(static top-8) baseline against either the dynamic-k step ramp "
+            "(default) or per-token nucleus routing (--nucleus-p)."
+        )
+    )
     parser.add_argument("--weight-dir", type=str, default="weights")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--gen-length", type=int, default=128)
@@ -32,7 +38,16 @@ def run_diagnostic():
     parser.add_argument("--num-trials", type=int, default=5)
     parser.add_argument("--base-k", type=int, default=8)
     parser.add_argument("--min-k", type=int, default=5)
+    parser.add_argument(
+        "--nucleus-p", type=float, default=None,
+        help=(
+            "Compare dense baseline against per-token nucleus routing (keep "
+            "experts until cumulative routing weight crosses this threshold) "
+            "instead of the fixed step-based --base-k/--min-k ramp."
+        ),
+    )
     args = parser.parse_args()
+    variant_label = f"Nucleus (p={args.nucleus_p})" if args.nucleus_p is not None else "Dynamic Experts"
 
     print("================================================================")
     print(" Diagnostic: Token Divergence & Routing Statistics")
@@ -41,7 +56,10 @@ def run_diagnostic():
     print(f" Generation L    : {args.gen_length}")
     print(f" Block Length    : {args.block_length}")
     print(f" Total Steps     : {args.steps}")
-    print(f" Dynamic K Ramp  : min_k={args.min_k} -> base_k={args.base_k}")
+    if args.nucleus_p is not None:
+        print(f" Variant         : Nucleus (p={args.nucleus_p})")
+    else:
+        print(f" Variant         : Dynamic K Ramp (min_k={args.min_k} -> base_k={args.base_k})")
     print(f" Number of Trials: {args.num_trials}")
     print("================================================================\n")
 
@@ -123,19 +141,29 @@ def run_diagnostic():
             use_dynamic_experts=False,
         )
 
-        # 2. Dynamic Experts (use_dynamic_experts=True) with routing hooks
+        # 2. Variant run (nucleus_p or the dynamic-k ramp) with routing hooks
         hooks = [layer.mlp.register_forward_hook(make_moe_hook(i)) for i, layer in enumerate(model.layers)]
         set_seed(seed)
-        out_dyn = generate_cached(
-            model=model,
-            prompt_ids=prompt_ids,
-            gen_length=args.gen_length,
-            steps=args.steps,
-            block_length=args.block_length,
-            use_dynamic_experts=True,
-            base_k=args.base_k,
-            min_k=args.min_k,
-        )
+        if args.nucleus_p is not None:
+            out_dyn = generate_cached(
+                model=model,
+                prompt_ids=prompt_ids,
+                gen_length=args.gen_length,
+                steps=args.steps,
+                block_length=args.block_length,
+                nucleus_p=args.nucleus_p,
+            )
+        else:
+            out_dyn = generate_cached(
+                model=model,
+                prompt_ids=prompt_ids,
+                gen_length=args.gen_length,
+                steps=args.steps,
+                block_length=args.block_length,
+                use_dynamic_experts=True,
+                base_k=args.base_k,
+                min_k=args.min_k,
+            )
         for h in hooks:
             h.remove()
 
@@ -163,7 +191,7 @@ def run_diagnostic():
     avg_div = sum(trial_divergence_rates) / len(trial_divergence_rates)
     max_div = max(trial_divergence_rates)
 
-    print("\n================ DIAGNOSTIC 1: TOKEN DIVERGENCE SUMMARY ================")
+    print(f"\n================ DIAGNOSTIC 1: TOKEN DIVERGENCE ({variant_label} vs Dense) ================")
     print(f" Average Token Divergence Rate : {avg_div:.2f}%")
     print(f" Maximum Token Divergence Rate : {max_div:.2f}%")
     print("=========================================================================")

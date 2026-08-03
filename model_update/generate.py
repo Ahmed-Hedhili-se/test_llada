@@ -9,6 +9,8 @@ low-confidence remasking, block restriction), but:
     purely to compute correct K/V to push into the cache
 """
 
+from typing import Optional
+
 import torch
 import torch.nn.functional as F
 
@@ -55,7 +57,10 @@ def _generate_block_cached(
     use_dynamic_experts: bool = False,
     base_k: int = 8,
     min_k: int = 5,
+    nucleus_p: Optional[float] = None,
 ):
+    assert not (use_dynamic_experts and nucleus_p is not None), \
+        "use_dynamic_experts (step-based ramp) and nucleus_p (per-token adaptive) are mutually exclusive"
     block_length = block_end - block_start
     device = x.device
 
@@ -78,6 +83,7 @@ def _generate_block_cached(
             cache_buffer=cache_buffer,
             write_pos=block_start,
             dynamic_k=dynamic_k,
+            nucleus_p=nucleus_p,
         )
         logits = suffix_logits[:, :block_length]
 
@@ -131,11 +137,17 @@ def generate_cached(
     use_dynamic_experts: bool = False,
     base_k: int = 8,
     min_k: int = 5,
+    nucleus_p: Optional[float] = None,
 ) -> torch.Tensor:
     """
     Same signature/semantics as generate.generate(), minus cfg_scale
     (CFG doubles the batch and complicates cache bookkeeping; add back
     once single-sequence caching is verified correct).
+
+    nucleus_p: per-token adaptive expert count (keep experts until cumulative
+    routing weight crosses this threshold) instead of use_dynamic_experts'
+    fixed step-based ramp. Mutually exclusive with use_dynamic_experts. Only
+    supported on the eager MoE path (use_fused_moe=False on the model).
     """
     assert gen_length % block_length == 0, "gen_length must be divisible by block_length"
     num_blocks = gen_length // block_length
@@ -177,6 +189,7 @@ def generate_cached(
             use_dynamic_experts=use_dynamic_experts,
             base_k=base_k,
             min_k=min_k,
+            nucleus_p=nucleus_p,
         )
 
     return x[:, P:]
