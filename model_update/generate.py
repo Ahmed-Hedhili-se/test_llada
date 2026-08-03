@@ -91,9 +91,17 @@ def _generate_block_cached(
         active_ids[transfer_index] = x0[transfer_index]
         x[:, block_start:block_end] = active_ids
 
-    finalized_ids = x[:, block_start:block_end]
+    # Recompute K/V for this block AND everything after it (still MASK at this
+    # point), not just the block in isolation -- the model was trained to always
+    # see the full sequence length with mask placeholders for ungenerated
+    # content, so committing K/V computed from a truncated view (missing the
+    # "there's more sequence after me" context) is out-of-distribution and
+    # causes premature EOS collapse in later blocks. Only [block_start:block_end)
+    # actually gets committed; the freshly-computed K/V for future blocks is
+    # provisional and gets overwritten again once those blocks are processed.
+    remaining_ids = x[:, block_start:]
     model(
-        finalized_ids,
+        remaining_ids,
         position_offset=block_start,
         cache_buffer=cache_buffer,
         write_pos=block_start,
@@ -139,7 +147,16 @@ def generate_cached(
         device=device,
     )
 
-    model(prompt_ids, position_offset=0, cache_buffer=cache_buffer, write_pos=0)
+    # Prime the cache by running the FULL sequence (prompt + mask-filled
+    # generation region), not just prompt_ids in isolation -- the model was
+    # trained to always see the whole sequence length with mask placeholders
+    # for ungenerated content, so caching K/V computed from the prompt alone
+    # (as if nothing followed it) is out-of-distribution and causes the
+    # cached path to collapse to premature EOS from the very first step. Only
+    # [0:P) actually gets committed; the freshly-computed K/V for the
+    # (all-MASK) generation region is provisional and gets overwritten once
+    # block 0 is processed.
+    model(x, position_offset=0, cache_buffer=cache_buffer, write_pos=0)
     cache_buffer.commit(P)
 
     for block_idx in range(num_blocks):
