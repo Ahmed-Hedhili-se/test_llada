@@ -120,22 +120,24 @@ bash eval/benchmark_compare.sh --weight-dir ./weights --gen-length 128 --steps 1
 
 | Configuration | GPUs | top-k | Time (s) | Tok/s | Speedup |
 |---|:---:|:---:|---:|---:|:---:|
-| **Baseline** (`src/`, single GPU, no cache) | 1× A6000 | 8 | 26.91 | 4.76 | 1.00× |
-| **Optimized + TP/EP** (`model_update/`, KV cache + fused MoE) | 2× A6000 | 8 | 6.02 | 21.28 | **4.47×** |
+| **Baseline** (`src/`, single GPU, no cache) | 1× A6000 | 8 | 26.19 | 4.89 | 1.00× |
+| **Optimized + TP/EP** (`model_update/`, KV cache + fused MoE, vectorized MoE alignment) | 2× A6000 | 8 | 4.26 | 30.04 | **6.15×** |
+
+> **Update**: `model_update/fused_moe_triton.py::moe_align_block_size` originally built its per-expert token/padding bookkeeping in a Python loop that called `.item()` twice per expert (128 host-device syncs per MoE call, ~70k over a full generation run) — each one stalls the CPU until the GPU catches up, serializing what should be back-to-back kernel launches. Rewriting it as a fully vectorized GPU computation (single sync at the end, to size the output tensor) raised this benchmark from 4.47× to **6.15×**. Verified bit-identical output against the original implementation (`eval/test_moe_align_block_size.py`).
 
 ### Speedup Breakdown
 
 ```
               Speedup vs Baseline
 
-  1 GPU  ██████████████████████████████████████  3.75×   (KV cache + fused MoE, A40-24Q)
-  2 GPU  ███████████████████████████████████████████████  4.47×   (TP+EP, 2x A6000, PCIe PHB)
+  1 GPU  ██████████████████████████████████████  3.75×   (KV cache + fused MoE, A40-24Q, historical top-5 run)
+  2 GPU  ██████████████████████████████████████████████████████████████  6.15×   (TP+EP, 2x A6000, PCIe PHB, vectorized MoE alignment)
 
-  ──────────────────────────────────────────────────────
-  1.0×      2.0×      3.0×      4.0×      4.5×
+  ────────────────────────────────────────────────────────────────────
+  1.0×      2.0×      3.0×      4.0×      5.0×      6.0×
 ```
 
-> **Note on PCIe scaling**: The 2-GPU result does not achieve a perfect 7.5× (3.75 × 2) because the GPUs communicate via PCIe Host Bridge (`PHB`), not high-speed NVLink. The TP+EP architecture inserts two `dist.all_reduce()` synchronizations per layer — 32 network hops per generated token — adding a fixed communication cost. At Batch Size 1, this overhead partially offsets the compute gains from splitting work across 2 GPUs. Near-linear 2× scaling of the per-GPU throughput is achieved at larger batch sizes where compute dominates.
+> **Note on PCIe scaling**: The 1-GPU and 2-GPU rows above aren't a clean doubling comparison — different hardware (A40-24Q vs A6000) and expert count (historical top-5 vs current top-8) — so treat each as its own measurement, not a scaling ratio. Separately, the 2-GPU TP+EP architecture inserts two `dist.all_reduce()` synchronizations per layer — 32 network hops per generated token — over PCIe Host Bridge (`PHB`) rather than high-speed NVLink, adding a fixed communication cost. At Batch Size 1, this overhead partially offsets the compute gains from splitting work across 2 GPUs. Near-linear 2× per-GPU-throughput scaling is achieved at larger batch sizes where compute dominates.
 
 ### Understanding Token Divergence (9.38%)
 
