@@ -109,7 +109,30 @@ def fused_moe_kernel(
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 def moe_align_block_size(topk_ids: torch.Tensor, block_size: int, num_experts: int):
+    """
+    Sort/pad (token, expert) assignment pairs into block_size-aligned
+    per-expert groups for the grouped-GEMM kernel below.
+
+    Vectorized: the previous implementation looped over `range(num_experts)`
+    in Python and called `.item()` twice per expert (2 x num_experts
+    host-device syncs per call -- 128 for num_experts=64). Each `.item()`
+    blocks the CPU until the GPU catches up, serializing what should be
+    back-to-back kernel launches; with 16 MoE layers x dozens of forward
+    passes per generation call, that loop alone issued tens of thousands of
+    stalls. This version computes every expert's destination offsets with
+    cumulative sums and writes them in a single scatter, entirely on GPU,
+    syncing only once at the very end -- an unavoidable `.item()` to size
+    the output tensor, since the total padded length is genuinely
+    data-dependent -- instead of once per expert.
+
+    Output shapes/dtypes/values are identical to the original for any
+    input (see eval/test_moe_align_block_size.py, which checks this
+    directly against a frozen copy of the original loop).
+    """
     num_tokens, top_k = topk_ids.shape
+    device = topk_ids.device
+    num_valid_tokens = num_tokens * top_k
+
     flatten_ids = topk_ids.flatten()
     sorted_indices = torch.argsort(flatten_ids, stable=True)
     sorted_expert_ids = flatten_ids[sorted_indices]
@@ -117,27 +140,32 @@ def moe_align_block_size(topk_ids: torch.Tensor, block_size: int, num_experts: i
     expert_counts = torch.bincount(sorted_expert_ids, minlength=num_experts)
     padded_expert_counts = ((expert_counts + block_size - 1) // block_size) * block_size
 
-    # Python loop is fine here since num_experts (e.g. 64) is very small.
-    padded_tokens = []
-    padded_experts = []
-    offset = 0
-    for e in range(num_experts):
-        count = expert_counts[e].item()
-        padded_count = padded_expert_counts[e].item()
-        
-        if count > 0:
-            padded_tokens.append(sorted_indices[offset : offset + count])
-        if padded_count > count:
-            padding = torch.full((padded_count - count,), num_tokens * top_k, dtype=sorted_indices.dtype, device=sorted_indices.device)
-            padded_tokens.append(padding)
-            
-        if padded_count > 0:
-            padded_experts.extend([e] * (padded_count // block_size))
-        offset += count
+    # Exclusive cumulative offsets (real and padded) per expert.
+    real_offsets = torch.cumsum(expert_counts, dim=0) - expert_counts
+    padded_offsets = torch.cumsum(padded_expert_counts, dim=0) - padded_expert_counts
 
-    sorted_token_ids = torch.cat(padded_tokens) if padded_tokens else torch.empty(0, dtype=sorted_indices.dtype, device=sorted_indices.device)
-    expert_ids = torch.tensor(padded_experts, dtype=torch.int32, device=sorted_indices.device)
-    num_tokens_post_padded = torch.tensor([sorted_token_ids.size(0)], dtype=torch.int32, device=sorted_indices.device)
+    # sorted_indices/sorted_expert_ids are already grouped by expert (the
+    # stable sort above), so a real pair's rank within its own expert's
+    # group is just its position minus that expert's real (unpadded)
+    # starting offset -- no per-expert loop needed to compute it.
+    positions = torch.arange(num_valid_tokens, device=device)
+    rank_within_expert = positions - real_offsets[sorted_expert_ids]
+    dest = padded_offsets[sorted_expert_ids] + rank_within_expert
+
+    total_padded_len = int(padded_expert_counts.sum().item())  # one sync, not 128
+
+    sorted_token_ids = torch.full(
+        (total_padded_len,), num_valid_tokens, dtype=sorted_indices.dtype, device=device
+    )
+    sorted_token_ids.scatter_(0, dest, sorted_indices)
+
+    num_blocks_per_expert = padded_expert_counts // block_size
+    expert_ids = torch.repeat_interleave(
+        torch.arange(num_experts, device=device, dtype=torch.int32),
+        num_blocks_per_expert,
+    )
+
+    num_tokens_post_padded = torch.tensor([total_padded_len], dtype=torch.int32, device=device)
 
     return sorted_token_ids, expert_ids, num_tokens_post_padded
 
