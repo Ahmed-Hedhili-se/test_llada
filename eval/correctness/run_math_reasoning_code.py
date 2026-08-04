@@ -252,14 +252,37 @@ def extract_final_answer(text: str) -> Optional[str]:
     return lines[-1] if lines else None
 
 
-def _grade_gsm8k(predicted: Optional[str], expected: str) -> bool:
-    if predicted is None:
-        return False
-    pred_nums = re.findall(r"-?\d+\.?\d*", predicted.replace(",", ""))
-    if not pred_nums:
-        return False
+def _grade_gsm8k(predicted: Optional[str], expected: str, raw: str = "") -> bool:
+    r"""
+    Numeric match, with a fallback for the "Final Answer:" marker line being
+    immediately followed by a multi-line LaTeX block (e.g.
+    'Final Answer:\n\[\n\boxed{16\n\]' -- note the missing closing brace,
+    which real generations produce). extract_final_answer()'s single-line
+    regex only sees the '\[' on the first line in that case and finds no
+    digits, even though the correct answer is right there one line down.
+    When that happens, search the full raw response for the last \boxed{...}
+    (robust to a missing closing brace), then finally the last number
+    anywhere in the raw text, before giving up.
+    """
+    if predicted is not None:
+        pred_nums = re.findall(r"-?\d+\.?\d*", predicted.replace(",", ""))
+        if pred_nums:
+            return _numeric_match(pred_nums[-1], expected)
+
+    boxed = re.findall(r"\\boxed\{?\s*(-?\d[\d,]*\.?\d*)", raw)
+    if boxed:
+        return _numeric_match(boxed[-1].replace(",", ""), expected)
+
+    all_nums = re.findall(r"-?\d+\.?\d*", raw.replace(",", ""))
+    if all_nums:
+        return _numeric_match(all_nums[-1], expected)
+
+    return False
+
+
+def _numeric_match(pred_num: str, expected: str) -> bool:
     try:
-        return abs(float(pred_nums[-1]) - float(expected)) < 1e-4
+        return abs(float(pred_num) - float(expected)) < 1e-4
     except ValueError:
         return False
 
@@ -270,13 +293,13 @@ def _normalize_short_answer(s: str) -> str:
     return s.lower()
 
 
-def _grade_bbh(predicted: Optional[str], expected: str) -> bool:
+def _grade_bbh(predicted: Optional[str], expected: str, raw: str = "") -> bool:
     if predicted is None:
         return False
     return _normalize_short_answer(predicted) == _normalize_short_answer(expected)
 
 
-def _grade_cruxeval(predicted: Optional[str], expected: str) -> bool:
+def _grade_cruxeval(predicted: Optional[str], expected: str, raw: str = "") -> bool:
     if predicted is None:
         return False
 
@@ -292,14 +315,14 @@ def _grade_cruxeval(predicted: Optional[str], expected: str) -> bool:
     return re.sub(r"\s+", "", norm(predicted)) == re.sub(r"\s+", "", norm(expected))
 
 
-GRADERS: dict[str, Callable[[Optional[str], str], bool]] = {
+GRADERS: dict[str, Callable[[Optional[str], str, str], bool]] = {
     "gsm8k": _grade_gsm8k,
     "bbh": _grade_bbh,
     "cruxeval": _grade_cruxeval,
 }
 
 
-def grader_for(task: str) -> Callable[[Optional[str], str], bool]:
+def grader_for(task: str) -> Callable[[Optional[str], str, str], bool]:
     base_task = task.split("_")[0] if task.startswith("bbh_") else task
     return GRADERS[base_task]
 
@@ -308,7 +331,7 @@ def grader_for(task: str) -> Callable[[Optional[str], str], bool]:
 
 def evaluate(
     items: list[TaskItem],
-    grade_fn: Callable[[Optional[str], str], bool],
+    grade_fn: Callable[[Optional[str], str, str], bool],
     system_prompt: str,
     base_url: str,
     num_concurrent: int,
@@ -332,7 +355,7 @@ def evaluate(
             predicted = extract_final_answer(raw)
         except Exception as e:
             return idx, item, None, str(e)
-        is_correct = grade_fn(predicted, item.expected)
+        is_correct = grade_fn(predicted, item.expected, raw)
         return idx, item, is_correct, raw
 
     results_list = [None] * total
