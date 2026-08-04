@@ -76,7 +76,7 @@ def load_baseline(weight_dir, device):
     return model, time.perf_counter() - t0
 
 
-def load_optimized(weight_dir, device, compile_attn=False):
+def load_optimized(weight_dir, device):
     """Load the optimized model from model_update/ with Triton fused MoE."""
     from model_update.model import LLaDAMoEKV, FULL_CFG, TritonFusedMoEBlock
     from model_update.distributed import load_weights_tp
@@ -93,8 +93,6 @@ def load_optimized(weight_dir, device, compile_attn=False):
     except Exception as e:
         print(f"  [Rank {get_tp_rank()}] Warning: Failed to load weights: {e}")
     model = model.to(device)
-    if compile_attn:
-        model.compile_attention()
     if "cuda" in device:
         torch.cuda.synchronize()
     return model, time.perf_counter() - t0
@@ -183,10 +181,6 @@ def main():
     ap.add_argument("--block-length", type=int, default=16)
     ap.add_argument("--mode", choices=["both", "baseline", "optimized"], default="both",
                     help="Which model(s) to benchmark")
-    ap.add_argument("--compile", action="store_true",
-                    help="torch.compile the optimized model's Attention blocks "
-                         "(the only slice of the step outside the Triton MoE kernel "
-                         "large enough to matter; see eval/time_fraction.py)")
     args = ap.parse_args()
 
     # In distributed mode, override device with local rank
@@ -216,7 +210,6 @@ def main():
         print(f"  Block Length     : {args.block_length}")
         print(f"  Warmup Runs      : {args.num_warmup}")
         print(f"  Benchmark Runs   : {args.num_runs}")
-        print(f"  Compile Attn     : {args.compile}")
         print("=" * 80 + "\n")
 
     if not os.path.isdir(args.weight_dir):
@@ -272,7 +265,7 @@ def main():
             print("=" * 60)
             print("  2. OPTIMIZED  (model_update/, fused MoE, topk=8, KV cache)")
             print("=" * 60)
-        opt_model, opt_load_time = load_optimized(args.weight_dir, args.device, compile_attn=args.compile)
+        opt_model, opt_load_time = load_optimized(args.weight_dir, args.device)
         if is_master:
             print(f"  Loaded in {opt_load_time:.2f}s")
 

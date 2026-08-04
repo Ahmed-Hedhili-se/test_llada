@@ -402,33 +402,3 @@ class LLaDAMoEKV(nn.Module):
         x = self.norm(x)
         logits = self.lm_head(x)
         return logits, new_kv
-
-    def compile_attention(self):
-        """
-        torch.compile each layer's Attention.forward in place (assigned as an
-        instance attribute, not module wrapping) so state_dict keys and direct
-        submodule access (q_proj/k_proj/... used by load_weights_tp) are
-        unaffected. Call after weights are loaded and the model is on its
-        target device.
-
-        Scoped to Attention only: profiling (eval/time_fraction.py) showed
-        the Triton MoE kernel is 83-86% of per-step time at FULL_CFG, far
-        outside what torch.compile can touch — Attention is ~7-9%, the only
-        slice worth compiling here. Not yet validated under tp_size > 1
-        (dist.all_reduce inside Attention.forward).
-
-        All NL layers' Attention.forward share one underlying code object,
-        and Dynamo's compile cache is keyed per code object across all
-        instances/calls — so every distinct (layer_idx, active-block shape)
-        combination competes for the same cache_size_limit slots, since
-        layer_idx is used to index cache_buffer.k[layer_idx] (a plain
-        Python list) and must be guarded as a specialized constant. NL=16
-        layers x (num_blocks+1) shape variants routinely exceeds the
-        default limit of 8, which silently falls back to eager for the
-        overflow (one warning, no error, no exception) rather than failing
-        loudly — so raise it generously before compiling.
-        """
-        import torch._dynamo as dynamo
-        dynamo.config.cache_size_limit = max(dynamo.config.cache_size_limit, 256)
-        for layer in self.layers:
-            layer.self_attn.forward = torch.compile(layer.self_attn.forward)
