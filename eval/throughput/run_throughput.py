@@ -56,25 +56,42 @@ async def send_request(session: aiohttp.ClientSession, base_url: str, prompt: st
     }
 
 
-async def run_benchmark(base_url: str, concurrency: int, max_tokens: int,
+async def run_benchmark(base_urls: list[str], concurrency: int, max_tokens: int,
                          steps: int, block_length: int, n_requests: int):
+    """
+    base_urls: one or more independent backend URLs. Prompts are round-robined
+    across them and a SINGLE semaphore of size `concurrency` is shared across
+    all of them -- so "N backends at --concurrency C" and "1 backend at
+    --concurrency C" both offer the same total in-flight load, making them a
+    fair apples-to-apples comparison (e.g. one TP+EP instance vs. len(base_urls)
+    independent data-parallel replicas, each replica a separate single-GPU
+    server process -- see eval/throughput/README or the DP launch commands
+    in the project history for how to start replicas on distinct ports/GPUs).
+    """
     prompts = (PROMPTS * ((n_requests // len(PROMPTS)) + 1))[:n_requests]
     connector = aiohttp.TCPConnector(limit=concurrency)
 
     async with aiohttp.ClientSession(connector=connector) as session:
-        # Warm up
-        print("Warming up...", flush=True)
-        await send_request(session, base_url, prompts[0], max_tokens, steps, block_length)
+        # Warm up every backend once, not just the first.
+        print(f"Warming up {len(base_urls)} backend(s)...", flush=True)
+        await asyncio.gather(*[
+            send_request(session, url, prompts[0], max_tokens, steps, block_length)
+            for url in base_urls
+        ])
 
-        print(f"Running {n_requests} requests (concurrency={concurrency})...", flush=True)
+        print(f"Running {n_requests} requests across {len(base_urls)} backend(s) "
+              f"(total concurrency={concurrency})...", flush=True)
         t_start = time.perf_counter()
 
         sem = asyncio.Semaphore(concurrency)
-        async def bounded(p):
+        async def bounded(p, url):
             async with sem:
-                return await send_request(session, base_url, p, max_tokens, steps, block_length)
+                return await send_request(session, url, p, max_tokens, steps, block_length)
 
-        results = await asyncio.gather(*[bounded(p) for p in prompts])
+        # Round-robin assignment across backends.
+        results = await asyncio.gather(*[
+            bounded(p, base_urls[i % len(base_urls)]) for i, p in enumerate(prompts)
+        ])
         t_total = time.perf_counter() - t_start
 
     ok = [r for r in results if r["ok"]]
@@ -85,8 +102,9 @@ async def run_benchmark(base_url: str, concurrency: int, max_tokens: int,
     print(f"\n{'='*60}")
     print(f"  LLaDA-MoE Throughput Benchmark")
     print(f"{'='*60}")
+    print(f"  Backends:          {len(base_urls)} ({', '.join(base_urls)})")
     print(f"  Requests:          {len(ok)}/{n_requests} succeeded")
-    print(f"  Concurrency:       {concurrency}")
+    print(f"  Concurrency:       {concurrency} (total, shared across backends)")
     print(f"  max_tokens:        {max_tokens}  steps={steps}  block={block_length}")
     print(f"  Total wall time:   {t_total:.1f}s")
     print(f"  Prompt tokens:     {total_in}")
@@ -103,7 +121,15 @@ async def run_benchmark(base_url: str, concurrency: int, max_tokens: int,
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--base-url", default="http://localhost:8000")
+    ap.add_argument("--base-url", default="http://localhost:8000",
+                    help="Single backend URL (default mode: one TP+EP instance).")
+    ap.add_argument(
+        "--base-urls", default=None,
+        help="Comma-separated list of independent backend URLs to round-robin "
+             "across, e.g. for comparing N data-parallel replicas against a "
+             "single TP+EP instance at the same total --concurrency "
+             "(http://localhost:8000,http://localhost:8001). Overrides --base-url.",
+    )
     ap.add_argument("--concurrency", type=int, default=1)
     ap.add_argument("--max-tokens", type=int, default=128)
     ap.add_argument("--steps", type=int, default=128)
@@ -111,8 +137,10 @@ def main():
     ap.add_argument("--n-requests", type=int, default=16)
     args = ap.parse_args()
 
+    base_urls = args.base_urls.split(",") if args.base_urls else [args.base_url]
+
     asyncio.run(run_benchmark(
-        args.base_url, args.concurrency, args.max_tokens,
+        base_urls, args.concurrency, args.max_tokens,
         args.steps, args.block_length, args.n_requests,
     ))
 
