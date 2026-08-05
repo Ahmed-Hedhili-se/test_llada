@@ -37,10 +37,15 @@ practical grounds beyond just "the paper uses it":
 
   gsm8k    : Math.      Grade-school math word problems (Cobbe et al., 2021).
              Free-form numeric answer, ground truth after "#### " in the
-             dataset's reference solution. Uses 5-shot prompting by default
-             (the canonical Wei et al., 2022 exemplar set -- see
-             GSM8K_FEWSHOT_EXAMPLES), matching common GSM8K reporting
-             convention; pass --num-fewshot 0 for a zero-shot ablation.
+             dataset's reference solution. Uses 4-shot prompting by default,
+             matching inclusionAI/dInfer's own gsm8k-llada-moe.yaml task
+             config verbatim (exemplars, prompt template, generation
+             lengths) -- see GSM8K_FEWSHOT_EXAMPLES and GSM8K_GEN_DEFAULTS.
+             dInfer is Ant Group's inference framework for LLaDA-MoE/LLaDA2,
+             the most authoritative source available for how the_paper.pdf's
+             own numbers were likely produced (https://github.com/
+             inclusionAI/dInfer). Pass --num-fewshot 0 for a zero-shot
+             ablation against this default.
   bbh      : Reasoning. BIG-Bench-Hard, 27 diverse reasoning tasks (Suzgun
              et al., 2022). Free-form short answer (word/phrase/number/
              "(A)"-style letter depending on subtask). NOTE: this runs
@@ -72,21 +77,29 @@ of the same number.
               before/after comparison tool, not a reproduction target.
 
 Even where a Table 3 number exists, it isn't an exact-reproduction bar
-unless generation config matches: the paper's own eval (Section 4) uses
-semi-autoregressive sampling with gen_length=1024, block_length=64 for all
-generative benchmarks, while this script inherits run_correctness.py's CoT
-defaults (max_tokens=256, steps=128, block_length=32) -- smaller budget,
-different block size. block_length and steps are coupled (num_blocks =
+unless generation config matches. gsm8k's defaults (GSM8K_GEN_DEFAULTS:
+max_tokens=1024, block_length=64) match both the paper's Section 4
+("gen_length of 1024 and a block length of 64") and dInfer's
+gsm8k-llada-moe.yaml directly -- the closest alignment available without
+inclusionAI publishing exact reproduction code. bbh/cruxeval still use
+run_correctness.py's smaller CoT defaults (max_tokens=256, block_length=32),
+since no equivalent authoritative config was found for them.
+
+block_length and steps are coupled regardless of task (num_blocks =
 gen_length / block_length; steps_per_block = steps / num_blocks, how many
 denoising refinement passes each block gets) -- raising block_length
-without also raising --steps proportionally *reduces* steps_per_block and
-can hurt quality rather than help it. If aligning with the paper's setup,
-scale both together (e.g. --max-tokens 1024 --block-length 64 --steps 256
-preserves this file's default steps_per_block=16); don't copy gen_length/
-block_length alone. Also note gsm8k defaults to 5-shot now (see above),
-which narrows one likely source of the gap to the paper's number, but the
-paper doesn't state its own few-shot count/exemplars, so exact
-reproduction still isn't guaranteed.
+without also raising steps proportionally *reduces* steps_per_block and
+can hurt quality rather than help it. dInfer's yaml doesn't specify a step
+count for gsm8k (steps is a model_update/-specific KV-cache parameter, not
+an lm-eval-harness concept), so GSM8K_GEN_DEFAULTS' steps=256 is *derived*
+(preserves this file's steps_per_block=16 at the larger block_length), not
+sourced from dInfer -- don't treat it as equally authoritative as
+max_tokens/block_length.
+
+Even with all of this, exact reproduction of Table 3's 82.41 isn't
+guaranteed: dInfer's config is the most authoritative source found, but
+"most authoritative found" is not the same as "confirmed identical to
+what produced the paper's number."
 
 Usage:
     python eval/correctness/run_math_reasoning_code.py --task gsm8k    --limit 400 --output results/gsm8k.json
@@ -129,53 +142,125 @@ PAPER_REFERENCE_TABLE3 = {
     "cruxeval": 42.38,
 }
 
-# The canonical 5-shot GSM8K exemplar set from Wei et al., 2022 ("Chain-of-
-# Thought Prompting Elicits Reasoning in Large Language Models"), reused
-# as the de facto standard GSM8K few-shot set across the field (e.g.
-# lm-evaluation-harness's default gsm8k task). Drawn from the style of
-# GSM8K's own training distribution, not the test split evaluated here --
-# no leakage risk. Reformatted to end in "Final Answer: <number>" so the
-# model also learns our exact grading marker, not just the reasoning style.
-# Default is all 5; use --num-fewshot to change the count (0 = zero-shot,
-# for an ablation against this default).
+# gsm8k's generation defaults, aligned with inclusionAI/dInfer's
+# evaluations/tasks/gsm8k/gsm8k-llada-moe.yaml (max_tokens/block_length --
+# dInfer specifies gen_length=1024, block_length=64, matching the_paper.pdf
+# Section 4's stated config) plus a derived `steps`: dInfer doesn't specify
+# a diffusion step count (that's a model_update/-specific KV-cache
+# generation parameter, not an lm-eval-harness concept), so 256 here is
+# chosen to preserve this file's steps_per_block=16 density (steps_per_block
+# = steps / (max_tokens / block_length)) at the larger block_length, not
+# copied from any source -- see the module docstring's coupling note.
+GSM8K_GEN_DEFAULTS = {"max_tokens": 1024, "steps": 256, "block_length": 64}
+
+# The exact 4-shot GSM8K exemplar set from inclusionAI/dInfer's
+# evaluations/tasks/gsm8k/gsm8k-llada-moe.yaml -- dInfer is Ant Group's own
+# inference framework for diffusion LMs, built specifically for LLaDA-MoE
+# and LLaDA2, and this task config is the LLaDA-MoE-specific variant
+# (https://github.com/inclusionAI/dInfer). This is the most authoritative
+# source available for how the_paper.pdf's Table 3 GSM8K=82.41 was likely
+# produced -- far more likely than a guessed convention. Reproduced verbatim
+# (these are themselves lm-evaluation-harness's standard default GSM8K
+# exemplars: Angelo/Melanie studying, Mark's basketball, Bella's marbles,
+# fruit baskets). Answers end in "The answer is <number>", NOT
+# "Final Answer:" -- that's their convention, not ours; SYSTEM_PROMPT_GSM8K
+# and extract_final_answer() below were updated to match it rather than
+# impose our own marker on top of theirs.
 GSM8K_FEWSHOT_EXAMPLES = [
     (
-        "Roger has 5 tennis balls. He buys 2 more cans of tennis balls. "
-        "Each can has 3 tennis balls. How many tennis balls does he have now?",
-        "Roger started with 5 balls. 2 cans of 3 tennis balls each is "
-        "2 x 3 = 6 tennis balls. 5 + 6 = 11.\nFinal Answer: 11",
+        "Angelo and Melanie want to plan how many hours over the next week "
+        "they should study together for their test next week. They have 2 "
+        "chapters of their textbook to study and 4 worksheets to memorize. "
+        "They figure out that they should dedicate 3 hours to each chapter "
+        "of their textbook and 1.5 hours for each worksheet. If they plan "
+        "to study no more than 4 hours each day, how many days should they "
+        "plan to study total over the next week if they take a 10-minute "
+        "break every hour, include 3 10-minute snack breaks each day, and "
+        "30 minutes for lunch each day?",
+        "Angelo and Melanie think they should dedicate 3 hours to each of "
+        "the 2 chapters, 3 hours x 2 chapters = 6 hours total.\n"
+        "For the worksheets they plan to dedicate 1.5 hours for each "
+        "worksheet, 1.5 hours x 4 worksheets = 6 hours total.\n"
+        "Angelo and Melanie need to start with planning 12 hours to study, "
+        "at 4 hours a day, 12 / 4 = 3 days.\n"
+        "However, they need to include time for breaks and lunch. Every "
+        "hour they want to include a 10-minute break, so 12 total hours x "
+        "10 minutes = 120 extra minutes for breaks.\n"
+        "They also want to include 3 10-minute snack breaks, 3 x 10 "
+        "minutes = 30 minutes.\n"
+        "And they want to include 30 minutes for lunch each day, so 120 "
+        "minutes for breaks + 30 minutes for snack breaks + 30 minutes for "
+        "lunch = 180 minutes, or 180 / 60 minutes per hour = 3 extra "
+        "hours.\n"
+        "So Angelo and Melanie want to plan 12 hours to study + 3 hours of "
+        "breaks = 15 hours total.\n"
+        "They want to study no more than 4 hours each day, 15 hours / 4 "
+        "hours each day = 3.75\n"
+        "They will need to plan to study 4 days to allow for all the time "
+        "they need.\nThe answer is 4",
     ),
     (
-        "A robe takes 2 bolts of blue fiber and half that much white fiber. "
-        "How many bolts in total does it take?",
-        "It takes 2 bolts of blue fiber. White fiber is half that much, "
-        "so 2 / 2 = 1 bolt. Total: 2 + 1 = 3.\nFinal Answer: 3",
+        "Mark's basketball team scores 25 2 pointers, 8 3 pointers and 10 "
+        "free throws.  Their opponents score double the 2 pointers but "
+        "half the 3 pointers and free throws.  What's the total number of "
+        "points scored by both teams added together?",
+        "Mark's team scores 25 2 pointers, meaning they scored 25*2= 50 "
+        "points in 2 pointers.\n"
+        "His team also scores 6 3 pointers, meaning they scored 8*3= 24 "
+        "points in 3 pointers\n"
+        "They scored 10 free throws, and free throws count as one point "
+        "so they scored 10*1=10 points in free throws.\n"
+        "All together his team scored 50+24+10= 84 points\n"
+        "Mark's opponents scored double his team's number of 2 pointers, "
+        "meaning they scored 50*2=100 points in 2 pointers.\n"
+        "His opponents scored half his team's number of 3 pointers, "
+        "meaning they scored 24/2= 12 points in 3 pointers.\n"
+        "They also scored half Mark's team's points in free throws, "
+        "meaning they scored 10/2=5 points in free throws.\n"
+        "All together Mark's opponents scored 100+12+5=117 points\n"
+        "The total score for the game is both team's scores added "
+        "together, so it is 84+117=201 points\nThe answer is 201",
     ),
     (
-        "Weng earns $12 an hour for babysitting. Yesterday, she just did "
-        "50 minutes of babysitting. How much did she earn?",
-        "Weng earns 12 / 60 = $0.2 per minute. Working 50 minutes, she "
-        "earned 0.2 x 50 = $10.\nFinal Answer: 10",
+        "Bella has two times as many marbles as frisbees. She also has 20 "
+        "more frisbees than deck cards. If she buys 2/5 times more of "
+        "each item, what would be the total number of the items she will "
+        "have if she currently has 60 marbles?",
+        "When Bella buys 2/5 times more marbles, she'll have increased "
+        "the number of marbles by 2/560 = 24\n"
+        "The total number of marbles she'll have is 60+24 = 84\n"
+        "If Bella currently has 60 marbles, and she has two times as many "
+        "marbles as frisbees, she has 60/2 = 30 frisbees.\n"
+        "If Bella buys 2/5 times more frisbees, she'll have 2/530 = 12 "
+        "more frisbees.\n"
+        "The total number of frisbees she'll have will increase to "
+        "30+12 = 42\n"
+        "Bella also has 20 more frisbees than deck cards, meaning she has "
+        "30-20 = 10 deck cards\n"
+        "If she buys 2/5 times more deck cards, she'll have 2/5*10 = 4 "
+        "more deck cards.\nThe total number of deck cards she'll have is "
+        "10+4 = 14\n"
+        "Together, Bella will have a total of 14+42+84 = 140 items\n"
+        "The answer is 140",
     ),
     (
-        "Betty is saving money for a new wallet which costs $100. Betty "
-        "has only half of the money she needs. Her parents decided to "
-        "give her $15 for that purpose, and her grandparents twice as "
-        "much as her parents. How much more money does Betty need to buy "
-        "the wallet?",
-        "Betty has 100 / 2 = $50. Her parents give her $15. Her "
-        "grandparents give her 15 x 2 = $30. In total Betty has "
-        "50 + 15 + 30 = $95. She still needs 100 - 95 = $5.\n"
-        "Final Answer: 5",
-    ),
-    (
-        "Julie is reading a 120-page book. Yesterday, she was able to "
-        "read 12 pages and today, she read twice as many pages as "
-        "yesterday. If she wants to read half of the remaining pages "
-        "tomorrow, how many pages should she read?",
-        "Today Julie read 12 x 2 = 24 pages. So far she has read "
-        "12 + 24 = 36 pages. She has 120 - 36 = 84 pages left. Half of "
-        "that is 84 / 2 = 42.\nFinal Answer: 42",
+        "A group of 4 fruit baskets contains 9 apples, 15 oranges, and 14 "
+        "bananas in the first three baskets and 2 less of each fruit in "
+        "the fourth basket. How many fruits are there?",
+        "For the first three baskets, the number of apples and oranges in "
+        "one basket is 9+15=24\n"
+        "In total, together with bananas, the number of fruits in one "
+        "basket is 24+14=38 for the first three baskets.\n"
+        "Since there are three baskets each having 38 fruits, there are "
+        "3*38=114 fruits in the first three baskets.\n"
+        "The number of apples in the fourth basket is 9-2=7\n"
+        "There are also 15-2=13 oranges in the fourth basket\n"
+        "The combined number of oranges and apples in the fourth basket "
+        "is 13+7=20\n"
+        "The fourth basket also contains 14-2=12 bananas.\n"
+        "In total, the fourth basket has 20+12=32 fruits.\n"
+        "The four baskets together have 32+114=146 fruits.\n"
+        "The answer is 146",
     ),
 ]
 
@@ -214,14 +299,21 @@ def _load_datasets_or_die():
 
 
 def _build_gsm8k_fewshot_prefix(num_fewshot: int) -> str:
+    """Renders exemplars with the same 'Question/Please reason step by
+    step/Answer' template as the real question (matches dInfer's doc_to_text,
+    which lm-eval-harness applies uniformly to fewshot examples and the
+    actual query)."""
     if num_fewshot <= 0:
         return ""
     examples = GSM8K_FEWSHOT_EXAMPLES[:num_fewshot]
-    blocks = [f"Question: {q}\nAnswer: {a}" for q, a in examples]
+    blocks = [
+        f"Question: {q}\nPlease reason step by step\nAnswer: {a}"
+        for q, a in examples
+    ]
     return "\n\n".join(blocks) + "\n\n"
 
 
-def _load_gsm8k(limit: int, num_fewshot: int = 5) -> list[TaskItem]:
+def _load_gsm8k(limit: int, num_fewshot: int = 4) -> list[TaskItem]:
     load_dataset = _load_datasets_or_die()
     ds = load_dataset("gsm8k", "main")["test"]
     prefix = _build_gsm8k_fewshot_prefix(num_fewshot)
@@ -233,7 +325,8 @@ def _load_gsm8k(limit: int, num_fewshot: int = 5) -> list[TaskItem]:
             continue
         expected = answer_text.split("####")[-1].strip().replace(",", "")
         items.append(TaskItem(
-            prompt=f"{prefix}Question: {row['question'].strip()}\nAnswer:",
+            prompt=f"{prefix}Question: {row['question'].strip()}\n"
+                   f"Please reason step by step\nAnswer:",
             expected=expected,
             subject="gsm8k",
         ))
@@ -298,7 +391,7 @@ def _load_cruxeval(limit: int) -> list[TaskItem]:
     return items
 
 
-def load_task(task: str, limit: int, num_fewshot: int = 5) -> tuple[list[TaskItem], str]:
+def load_task(task: str, limit: int, num_fewshot: int = 4) -> tuple[list[TaskItem], str]:
     """Returns (items, system_prompt). num_fewshot only affects gsm8k."""
     if task == "gsm8k":
         return _load_gsm8k(limit, num_fewshot), SYSTEM_PROMPT_GSM8K
@@ -322,10 +415,9 @@ def load_task(task: str, limit: int, num_fewshot: int = 5) -> tuple[list[TaskIte
 # ── Prompts ──────────────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT_GSM8K = (
-    "You are a helpful, precise assistant skilled at solving math word "
-    "problems. Think through the problem step by step, then end your "
-    "response with a new line in exactly this format:\n"
-    "Final Answer: <number>"
+    "You are a helpful assistant. Solve the math word problem, reasoning "
+    "step by step in the same style as the worked examples above, then "
+    "state your final numeric answer the same way they do."
 )
 
 SYSTEM_PROMPT_BBH = (
@@ -352,10 +444,21 @@ SYSTEM_PROMPT_CRUXEVAL = (
 # ── Answer extraction & grading ─────────────────────────────────────────────────
 
 def extract_final_answer(text: str) -> Optional[str]:
-    """Text after an explicit 'Final Answer:' marker; falls back to the last
-    non-empty line if the model didn't use the marker."""
+    """Text after an explicit 'Final Answer:' marker (bbh/cruxeval's
+    convention) or 'The answer is ...' (gsm8k's dInfer-aligned convention,
+    since its fewshot exemplars demonstrate that phrasing, not ours) --
+    whichever appears. Uses the FIRST match of either pattern, not the
+    last: with a fewshot completion-style prompt the model can drift into
+    hallucinating a new "Question: ..." after its real answer (the server
+    has no stop-sequence support to cut it off -- see ChatRequest in
+    src/server.py), and the real answer is always the first occurrence,
+    before any such drift. Falls back to the last non-empty line if
+    neither marker appears."""
     text = text.strip()
     m = re.search(r"final\s*answer\s*[:\-]\s*(.+)", text, re.IGNORECASE)
+    if m:
+        return m.group(1).strip().splitlines()[0].strip()
+    m = re.search(r"the\s+answer\s+is\s*[:\-]?\s*(.+)", text, re.IGNORECASE)
     if m:
         return m.group(1).strip().splitlines()[0].strip()
     lines = [l.strip() for l in text.splitlines() if l.strip()]
@@ -554,19 +657,27 @@ def main():
                     help="Path to a previous summary JSON for delta comparison.")
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--config-name", default="", help="Label stored in the summary JSON.")
-    ap.add_argument("--max-tokens", type=int, default=DEFAULT_COT_MAX_TOKENS,
-                    help="Generation budget.")
-    ap.add_argument("--steps", type=int, default=DEFAULT_COT_STEPS, help="Diffusion steps.")
-    ap.add_argument("--block-length", type=int, default=DEFAULT_COT_BLOCK_LENGTH,
-                    help="Server-side block_length for generation.")
+    ap.add_argument("--max-tokens", type=int, default=None,
+                    help=f"Generation budget. Default: {GSM8K_GEN_DEFAULTS['max_tokens']} "
+                         f"for gsm8k (matches dInfer's gsm8k-llada-moe.yaml / the paper's "
+                         f"gen_length=1024), {DEFAULT_COT_MAX_TOKENS} otherwise.")
+    ap.add_argument("--steps", type=int, default=None,
+                    help=f"Diffusion steps. Default: {GSM8K_GEN_DEFAULTS['steps']} for "
+                         f"gsm8k (preserves this file's steps_per_block density at "
+                         f"block_length=64 -- not from dInfer, which doesn't specify "
+                         f"this), {DEFAULT_COT_STEPS} otherwise.")
+    ap.add_argument("--block-length", type=int, default=None,
+                    help=f"Server-side block_length. Default: "
+                         f"{GSM8K_GEN_DEFAULTS['block_length']} for gsm8k (matches "
+                         f"dInfer / the paper), {DEFAULT_COT_BLOCK_LENGTH} otherwise.")
     ap.add_argument(
         "--save-transcripts", default=None,
         help="Path to save full per-question transcripts as JSON. Not saved by default.",
     )
     ap.add_argument(
-        "--num-fewshot", type=int, default=5,
-        help="Number of worked examples to prepend for gsm8k (0-5, default 5, "
-             "matching common GSM8K reporting convention). Ignored by bbh/cruxeval.",
+        "--num-fewshot", type=int, default=4,
+        help="Number of worked examples to prepend for gsm8k (default 4, matching "
+             "dInfer's gsm8k-llada-moe.yaml). Ignored by bbh/cruxeval.",
     )
     args = ap.parse_args()
 
@@ -574,11 +685,20 @@ def main():
     random.seed(seed)
     limit = args.limit if args.limit > 0 else 0
 
+    if args.task == "gsm8k":
+        max_tokens = args.max_tokens if args.max_tokens is not None else GSM8K_GEN_DEFAULTS["max_tokens"]
+        steps = args.steps if args.steps is not None else GSM8K_GEN_DEFAULTS["steps"]
+        block_length = args.block_length if args.block_length is not None else GSM8K_GEN_DEFAULTS["block_length"]
+    else:
+        max_tokens = args.max_tokens if args.max_tokens is not None else DEFAULT_COT_MAX_TOKENS
+        steps = args.steps if args.steps is not None else DEFAULT_COT_STEPS
+        block_length = args.block_length if args.block_length is not None else DEFAULT_COT_BLOCK_LENGTH
+
     print(f"\nTarget     : {args.base_url}")
     print(f"Task       : {args.task}")
     print(f"Limit      : {limit if limit else 'full dataset'}")
     print(f"Concurrent : {args.num_concurrent}")
-    print(f"Max tokens : {args.max_tokens}  |  Steps: {args.steps}  |  Block length: {args.block_length}")
+    print(f"Max tokens : {max_tokens}  |  Steps: {steps}  |  Block length: {block_length}")
     if args.task == "gsm8k":
         print(f"Few-shot   : {args.num_fewshot}")
     print(f"Seed       : {seed}\n")
@@ -588,13 +708,13 @@ def main():
     print(f"Loaded {len(items)} questions.\n")
 
     grade_fn = grader_for(args.task)
-    gen_config = {"block_length": args.block_length}
+    gen_config = {"block_length": block_length}
 
     t0 = time.time()
     stats = evaluate(
         items, grade_fn, system_prompt, args.base_url, args.num_concurrent,
-        args.timeout, gen_config=gen_config, max_tokens=args.max_tokens,
-        steps=args.steps, transcript_path=args.save_transcripts,
+        args.timeout, gen_config=gen_config, max_tokens=max_tokens,
+        steps=steps, transcript_path=args.save_transcripts,
     )
     elapsed = time.time() - t0
 
@@ -605,7 +725,7 @@ def main():
     else:
         print_results(stats, args.task, "Results")
 
-    print_paper_reference(stats, args.task, args.max_tokens, args.block_length)
+    print_paper_reference(stats, args.task, max_tokens, block_length)
 
     if args.output:
         save_summary(stats, args.task, args.output, seed, args.config_name)
