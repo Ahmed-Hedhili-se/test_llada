@@ -197,13 +197,39 @@ def invoke_fused_moe_kernel(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor,
         **kernel_kwargs,
     )
 
+def _silu_and_mul(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+    """Split out so it can be torch.compile'd on its own: this is the
+    un-fused step sitting between fused_moe's two Triton GEMM kernels --
+    F.silu(gate) then a separate elementwise mul, two eager CUDA kernel
+    launches per call today. Unlike the Attention.forward compile attempt
+    (found to give ~0 benefit -- attention was only ~7-9% of per-step time
+    at B=1, and the ops inside it are already either fused SDPA or
+    irreducible GEMMs with nothing left to fuse), this is pure elementwise
+    math with no control flow and no host syncs: a batched-serving trace
+    found ~19,700 idle GPU gaps averaging ~8us each, the signature of
+    kernel-launch overhead from many small ops -- fusing two kernels into
+    one here directly reduces kernel *count*, a different mechanism than
+    what the B=1 test ruled out."""
+    return torch.nn.functional.silu(gate) * up
+
+
+# M (token count reaching this call) varies a lot across batch sizes and
+# active-block lengths; each distinct M is a separate compiled graph.
+# Default cache_size_limit (8) silently falls back to eager for anything
+# past the first few shapes seen -- same trap hit compiling Attention
+# earlier. Raise it generously up front rather than rediscover this.
+import torch._dynamo as _dynamo
+_dynamo.config.cache_size_limit = max(_dynamo.config.cache_size_limit, 256)
+_silu_and_mul_compiled = torch.compile(_silu_and_mul)
+
+
 def fused_moe(hidden_states: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor,
               gating_output: torch.Tensor, topk_ids: torch.Tensor):
     # This standalone fused_moe handles the W1 (Gate+Up) and W2 (Down) projections.
     M, K = hidden_states.shape
     E, N, _ = w1.shape
     top_k = topk_ids.shape[1]
-    
+
     config = get_best_config(M, E)
 
     # 1. Align Block Size
@@ -217,10 +243,10 @@ def fused_moe(hidden_states: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor,
         mul_routed_weight=False, top_k=top_k, config=config
     )
 
-    # 3. Activation: F.silu(gate) * up
+    # 3. Activation: F.silu(gate) * up (compiled -- one fused kernel instead of two)
     # W1 is usually [Gate, Up] concatenated.
     gate, up = intermediate_cache1.chunk(2, dim=-1)
-    intermediate_cache2 = (torch.nn.functional.silu(gate) * up).view(M * topk_ids.shape[1], N // 2)
+    intermediate_cache2 = _silu_and_mul_compiled(gate, up).view(M * topk_ids.shape[1], N // 2)
 
     # 4. Second GEMM: (activated) @ W2
     intermediate_cache3 = torch.empty((M, topk_ids.shape[1], w2.shape[1]), device=hidden_states.device, dtype=hidden_states.dtype)
