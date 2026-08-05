@@ -1,32 +1,20 @@
 """
 Regression test for the vectorized model_update/fused_moe_triton.py::moe_align_block_size.
 
-History: the original implementation looped over `range(num_experts)` in
-Python and called `.item()` twice per expert (128 host-device syncs per
-call for num_experts=64). A first vectorization pass (cumsum + scatter)
-got that down to one `.item()`, sizing the output to the exact padded
-length. This version removes that last sync too, by allocating a
-WORST-CASE-sized buffer instead (computed from static shape info alone --
-num_valid_tokens, num_experts, block_size -- never a tensor read), which
-is what makes the function safe to call from inside CUDA graph capture
-(no host sync anywhere, no data-dependent tensor shape).
-
-Consequence for this test: the current version's raw output tensors are
-larger than the reference's (padded to a fixed worst-case size, not the
-exact data-dependent size) -- so this file compares the REAL prefix (up
-to num_tokens_post_padded) against the reference's full output, rather
-than asserting whole-array equality/shape-equality like the previous
-version of this test did.
+The original implementation looped over `range(num_experts)` in Python and
+called `.item()` twice per expert (128 host-device syncs per call for
+num_experts=64) purely to build Python-side padding bookkeeping. The
+vectorized replacement computes the same sort/pad/scatter entirely with
+GPU tensor ops, syncing only once at the end to size the output tensor.
 
 This file:
   1. Keeps a frozen copy of the original loop-based implementation as a
      reference oracle.
-  2. Asserts the real (non-padding) portion of the vectorized version's
-     output is bit-identical to the reference's full output across
-     randomized configs and the specific edge cases that are easy to get
-     wrong in a rewrite: zero-count ("vanishing") experts, exact
-     block-size multiples (no padding), heavy padding, single-expert
-     concentration, and empty input.
+  2. Asserts the vectorized version produces bit-identical output
+     (dtype, shape, and values) across randomized configs and the specific
+     edge cases that are easy to get wrong in a rewrite: zero-count
+     ("vanishing") experts, exact block-size multiples (no padding),
+     heavy padding, single-expert concentration, and empty input.
   3. Runs a CUDA-only end-to-end sanity check of fused_moe() itself
      (which calls moe_align_block_size internally) against a naive
      per-expert PyTorch loop, to confirm the full pipeline -- not just the
@@ -88,36 +76,15 @@ def _assert_equivalent(topk_ids, block_size, num_experts, label):
     ref_ids, ref_experts, ref_padded = _reference_moe_align_block_size(topk_ids, block_size, num_experts)
     new_ids, new_experts, new_padded = moe_align_block_size(topk_ids, block_size, num_experts)
 
-    ref_len = int(ref_padded.item())
-    new_len = int(new_padded.item())
-    assert ref_len == new_len, f"[{label}] num_tokens_post_padded: ref={ref_len} new={new_len}"
+    assert ref_ids.dtype == new_ids.dtype, f"[{label}] sorted_token_ids dtype: {ref_ids.dtype} vs {new_ids.dtype}"
+    assert ref_ids.shape == new_ids.shape, f"[{label}] sorted_token_ids shape: {ref_ids.shape} vs {new_ids.shape}"
+    assert torch.equal(ref_ids, new_ids), f"[{label}] sorted_token_ids values differ"
 
-    # Real-data dtype/values must match the reference exactly, up to the
-    # (identical) real padded length -- the new version's buffers are
-    # allocated to a fixed worst-case size beyond that, which the
-    # reference never had, so only this prefix is a fair comparison.
-    assert new_ids.dtype == ref_ids.dtype, f"[{label}] sorted_token_ids dtype: {ref_ids.dtype} vs {new_ids.dtype}"
-    assert new_ids.shape[0] >= ref_len, f"[{label}] sorted_token_ids too short: {new_ids.shape[0]} < {ref_len}"
-    assert torch.equal(new_ids[:ref_len], ref_ids), f"[{label}] sorted_token_ids real-prefix values differ"
+    assert ref_experts.dtype == new_experts.dtype, f"[{label}] expert_ids dtype mismatch"
+    assert ref_experts.shape == new_experts.shape, f"[{label}] expert_ids shape: {ref_experts.shape} vs {new_experts.shape}"
+    assert torch.equal(ref_experts, new_experts), f"[{label}] expert_ids values differ"
 
-    num_real_blocks = ref_len // block_size
-    assert new_experts.dtype == ref_experts.dtype, f"[{label}] expert_ids dtype mismatch"
-    assert new_experts.shape[0] >= num_real_blocks, f"[{label}] expert_ids too short"
-    assert torch.equal(new_experts[:num_real_blocks], ref_experts), f"[{label}] expert_ids real-prefix values differ"
-
-    # The padding region isn't required to hold any specific value, but it
-    # must never be able to corrupt a real kernel result if some future
-    # change accidentally read it: sorted_token_ids' sentinel there must
-    # stay >= num_valid_tokens (masked out by the kernel's token_mask),
-    # and expert_ids' junk there must stay a valid expert index (in range,
-    # never used to index out of bounds even if misread).
-    num_tokens, top_k = topk_ids.shape
-    num_valid_tokens = num_tokens * top_k
-    if new_ids.shape[0] > ref_len:
-        assert (new_ids[ref_len:] >= num_valid_tokens).all(), f"[{label}] padding region of sorted_token_ids is not sentinel-safe"
-    if new_experts.shape[0] > num_real_blocks:
-        tail = new_experts[num_real_blocks:]
-        assert (tail >= 0).all() and (tail < num_experts).all(), f"[{label}] padding region of expert_ids out of valid range"
+    assert torch.equal(ref_padded, new_padded), f"[{label}] num_tokens_post_padded: {ref_padded} vs {new_padded}"
 
 
 def test_moe_align_block_size_matches_reference_randomized():

@@ -111,12 +111,6 @@ _new_request_event = threading.Event()
 PROFILE_BATCHES = os.environ.get("PROFILE_BATCHES", "0") == "1"
 PROFILE_DIR = os.environ.get("PROFILE_DIR", "traces")
 
-# Opt-in, off by default, NOT validated on real hardware as written -- see
-# CUDAGraphRunner's docstring in model_update/model.py before enabling this
-# anywhere near production traffic. Run eval/test_cuda_graph_forward.py and
-# eval/diagnose_cache_vs_dense.py with this on, on a real GPU, first.
-USE_CUDA_GRAPH = os.environ.get("USE_CUDA_GRAPH", "0") == "1"
-
 
 def _run_batch(batch: list["_PendingRequest"]):
     if not batch:
@@ -135,7 +129,6 @@ def _run_batch(batch: list["_PendingRequest"]):
             steps=first.steps,
             block_length=first.block_length,
             temperature=first.temperature,
-            use_cuda_graph=USE_CUDA_GRAPH,
         )
         if PROFILE_BATCHES:
             # Chrome/Perfetto trace JSON -- shows actual GPU busy vs idle
@@ -506,10 +499,6 @@ def main():
         if args.backend == "fast_dense" and get_tp_size() == 1:
             print(f"Starting batch worker (max_size={BATCH_MAX_SIZE}, wait={BATCH_WAIT_S}s, "
                   f"poll={BATCH_POLL_INTERVAL_S}s)...")
-            if USE_CUDA_GRAPH:
-                print("USE_CUDA_GRAPH=1 -- opt-in, NOT validated on real hardware as written. "
-                      "See CUDAGraphRunner's docstring in model_update/model.py before trusting "
-                      "output from this path.")
             threading.Thread(target=_batch_worker, daemon=True).start()
         uvicorn.run(app, host=args.host, port=args.port)
 
