@@ -27,15 +27,50 @@ def add_gumbel_noise(logits: torch.Tensor, temperature: float) -> torch.Tensor:
 
 
 def get_num_transfer_tokens(mask_index: torch.Tensor, steps: int) -> torch.Tensor:
+    """Vectorized: the original `num_transfer[i, :remainder[i]] += 1` loop
+    used a per-row tensor as a slice bound, which implicitly calls
+    `__index__` (a hidden host sync, once per batch row per block) -- the
+    same class of cost eval/test_moe_align_block_size.py's vectorization
+    eliminated for MoE routing, just smaller blast radius here since this
+    runs once per block rather than once per step. `positions < remainder`
+    reproduces the same "first `remainder[i]` columns get one extra" pattern
+    with a single broadcast comparison instead."""
     mask_num = mask_index.sum(dim=1, keepdim=True)
     base = mask_num // steps
     remainder = mask_num % steps
-    num_transfer = torch.zeros(
-        mask_num.size(0), steps, device=mask_index.device, dtype=torch.int64
-    ) + base
-    for i in range(mask_num.size(0)):
-        num_transfer[i, : remainder[i]] += 1
-    return num_transfer
+    positions = torch.arange(steps, device=mask_index.device).unsqueeze(0)
+    return base + (positions < remainder).to(base.dtype)
+
+
+def select_transfer_indices(confidence: torch.Tensor, num_transfer_step: torch.Tensor) -> torch.Tensor:
+    """
+    For each batch row, select the top-k highest-confidence positions to
+    reveal this step, where k = num_transfer_step[row] (can differ per row).
+
+    Vectorized: the original looped per batch row, calling `.item()` on
+    that row's transfer count and running an independent torch.topk() per
+    row -- a host sync PER ROW PER STEP, the exact bottleneck a trace-
+    profiling investigation found (thousands of ~8us idle gaps between
+    kernel launches in a batched generation run). torch.topk has no
+    per-row-k mode, so instead: one topk call at the batch's max k, then
+    mask each row down to its own (smaller-or-equal) k. topk's output is
+    sorted descending, so "keep the first k_j of max_k" is exactly the
+    top-k_j for row j -- the same result as calling topk(k=k_j) directly
+    for that row, not an approximation (see eval/test_select_transfer_indices.py).
+
+    confidence: [B, T] float, -inf at positions that must not be selected.
+    num_transfer_step: [B] int, how many positions each row should reveal.
+    Returns: [B, T] bool mask.
+    """
+    transfer_index = torch.zeros_like(confidence, dtype=torch.bool)
+    max_k = int(num_transfer_step.max().item())  # one sync, not one per row
+    if max_k > 0:
+        _, topk_idx = torch.topk(confidence, k=max_k, dim=-1)
+        positions = torch.arange(max_k, device=confidence.device).unsqueeze(0)
+        keep_mask = positions < num_transfer_step.unsqueeze(1)
+        transfer_index.scatter_(1, topk_idx, keep_mask)
+    return transfer_index
+
 
 def _generate_block_cached(
     model,
@@ -80,12 +115,7 @@ def _generate_block_cached(
         x0 = torch.where(mask_index, x0, active_ids)
         confidence = torch.where(mask_index, x0_p, torch.full_like(x0_p, -torch.inf))
 
-        transfer_index = torch.zeros_like(x0, dtype=torch.bool)
-        for j in range(confidence.shape[0]):
-            k = num_transfer[j, step].item()
-            if k > 0:
-                _, sel = torch.topk(confidence[j], k=int(k))
-                transfer_index[j, sel] = True
+        transfer_index = select_transfer_indices(confidence, num_transfer[:, step])
 
         active_ids = active_ids.clone()
         active_ids[transfer_index] = x0[transfer_index]
