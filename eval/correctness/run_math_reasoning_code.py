@@ -49,6 +49,34 @@ practical grounds beyond just "the paper uses it":
              predict its return value (Gu et al., 2024). Ground truth is
              precomputed by the dataset authors.
 
+PAPER REFERENCE VALUES -- Table 3, not Table 1
+------------------------------------------------
+The paper has two result tables: Table 1 is the Base checkpoint (pretrain
+only, no SFT); Table 3 is the Instruct checkpoint. Every model this repo
+serves and every prompt this harness sends (chat-formatted, CoT-instructed)
+targets the Instruct model, so **Table 3 is the correct reference, never
+Table 1** -- they are different checkpoints, not a stricter/looser version
+of the same number.
+
+    Task      Table 3 (Instruct) value
+    --------  -------------------------
+    gsm8k     82.41
+    cruxeval  42.38
+    bbh       *no Table 3 entry* -- Table 3's Reasoning Tasks row only
+              reports Drop/KorBench. BBH=52.71 exists ONLY in Table 1, for
+              the Base checkpoint -- not a valid reference for the Instruct
+              model served here. Treat this task's score as a same-model
+              before/after comparison tool, not a reproduction target.
+
+Even where a Table 3 number exists, it isn't an exact-reproduction bar
+unless generation config matches: the paper's own eval (Section 4) uses
+semi-autoregressive sampling with gen_length=1024, block_length=64 for all
+generative benchmarks, while this script inherits run_correctness.py's CoT
+defaults (max_tokens=256, steps=128, block_length=32) -- smaller budget,
+different block size. Pass --max-tokens 1024 --block-length 64 (and a
+matching --steps) to align with the paper's setup if an exact comparison
+is needed; the defaults are tuned for faster iteration, not reproduction.
+
 Usage:
     python eval/correctness/run_math_reasoning_code.py --task gsm8k    --limit 400 --output results/gsm8k.json
     python eval/correctness/run_math_reasoning_code.py --task bbh      --limit 400 --output results/bbh.json
@@ -77,6 +105,18 @@ from eval.correctness.run_correctness import (
 )
 
 DEFAULT_TASK = "gsm8k"
+
+# LLaDA-MoE-7B-A1B-Instruct scores from the_paper.pdf, Table 3 (Instruct
+# checkpoint -- NOT Table 1, which is the Base/pre-SFT checkpoint this repo
+# does not serve). "bbh" is deliberately absent: Table 3 never reports a BBH
+# score for the Instruct model (Table 1's 52.71 is Base-only, a different
+# checkpoint). See the module docstring's "PAPER REFERENCE VALUES" section
+# for the generation-config caveat (paper uses gen_length=1024/block=64;
+# this script's CoT defaults are smaller).
+PAPER_REFERENCE_TABLE3 = {
+    "gsm8k": 82.41,
+    "cruxeval": 42.38,
+}
 
 # All 27 canonical BIG-Bench-Hard tasks (Suzgun et al., 2022).
 BBH_SUBTASKS = [
@@ -488,8 +528,45 @@ def main():
     else:
         print_results(stats, args.task, "Results")
 
+    print_paper_reference(stats, args.task, args.max_tokens, args.block_length)
+
     if args.output:
         save_summary(stats, args.task, args.output, seed, args.config_name)
+
+
+def print_paper_reference(stats: dict, task: str, max_tokens: int, block_length: int) -> None:
+    """the_paper.pdf Table 3 (LLaDA-MoE-7B-A1B-Instruct) comparison -- see
+    PAPER_REFERENCE_TABLE3 and the module docstring for why Table 3, not
+    Table 1, and why BBH has no entry."""
+    base_task = task.split("_")[0] if task.startswith("bbh_") else task
+
+    if base_task == "bbh":
+        print(
+            "  Paper reference (Table 3) : none -- the Instruct model's "
+            "Reasoning Tasks row only reports Drop/KorBench. Table 1's "
+            "BBH=52.71 is the Base (pre-SFT) checkpoint, not a valid "
+            "reference here. Use this score for before/after comparisons "
+            "on this repo's own changes, not paper reproduction.\n"
+        )
+        return
+
+    ref = PAPER_REFERENCE_TABLE3.get(base_task)
+    if ref is None:
+        return
+
+    acc_pct = stats["accuracy"] * 100
+    diff = acc_pct - ref
+    print(f"  Paper reference (Table 3, Instruct) : {ref:.2f}%")
+    print(f"  This run                            : {acc_pct:.2f}%  ({diff:+.2f} pts)")
+    if (max_tokens, block_length) != (1024, 64):
+        print(
+            "  Note: paper's own eval used gen_length=1024, block_length=64 "
+            f"(Section 4); this run used max_tokens={max_tokens}, "
+            f"block_length={block_length} -- not an exact-reproduction "
+            "config, treat the delta above as directional.\n"
+        )
+    else:
+        print()
 
 
 if __name__ == "__main__":
