@@ -82,7 +82,9 @@ request_lock = threading.Lock()
 
 BATCH_MAX_SIZE = int(os.environ.get("BATCH_MAX_SIZE", 8))
 BATCH_WAIT_S = float(os.environ.get("BATCH_WAIT_S", 0.05))
+BATCH_POLL_INTERVAL_S = float(os.environ.get("BATCH_POLL_INTERVAL_S", 0.005))
 BATCH_REQUEST_TIMEOUT_S = float(os.environ.get("BATCH_REQUEST_TIMEOUT_S", 300))
+MAX_THREADPOOL_WORKERS = int(os.environ.get("MAX_THREADPOOL_WORKERS", 128))
 
 
 class _PendingRequest:
@@ -109,6 +111,11 @@ _new_request_event = threading.Event()
 def _run_batch(batch: list["_PendingRequest"]):
     if not batch:
         return
+    # Visibility into what's actually forming -- this was the open question
+    # from the concurrency investigation: does the collection window really
+    # produce batches near BATCH_MAX_SIZE, or fall back to 1-2 under GIL
+    # contention? No way to know without this line.
+    print(f"[batch] size={len(batch)} key={batch[0].key}", flush=True)
     try:
         from model_update.generate import generate_cached
         input_ids = torch.cat([r.input_ids for r in batch], dim=0)
@@ -134,30 +141,44 @@ def _run_batch(batch: list["_PendingRequest"]):
 
 def _batch_worker():
     """Runs on a dedicated background thread, started once at server startup
-    (see main()). Collects requests for BATCH_WAIT_S after the first one
-    arrives, groups whatever matches the first request's key (capped at
-    BATCH_MAX_SIZE), and runs that group as one generate_cached() call.
+    (see main()).
+
+    Early-exit polling, not a fixed sleep-then-check: once the first request
+    of a new group arrives, poll every BATCH_POLL_INTERVAL_S for either (a)
+    BATCH_MAX_SIZE matching-key requests having accumulated, or (b)
+    BATCH_WAIT_S total having elapsed since the group started -- whichever
+    comes first. A fixed `sleep(BATCH_WAIT_S)` (the original version) always
+    pays the full window even when a large burst arrives almost immediately,
+    which matters a lot at higher target concurrency (e.g. 64): a burst that
+    large will usually hit BATCH_MAX_SIZE well before BATCH_WAIT_S elapses,
+    and there's no reason to keep those requests waiting once it has.
     Anything left over (mismatched key, or over the cap) stays queued for
-    the next round."""
+    the next round with a fresh deadline."""
     while True:
         _new_request_event.wait()
-        time.sleep(BATCH_WAIT_S)
-        with _pending_lock:
-            if not _pending_queue:
-                _new_request_event.clear()
-                continue
-            key = _pending_queue[0].key
-            batch, remaining = [], []
-            for req in _pending_queue:
-                if req.key == key and len(batch) < BATCH_MAX_SIZE:
-                    batch.append(req)
-                else:
-                    remaining.append(req)
-            _pending_queue[:] = remaining
-            if not _pending_queue:
-                _new_request_event.clear()
-            # else: event stays set, next loop iteration handles the rest
-            # without waiting for a new arrival.
+        deadline = time.monotonic() + BATCH_WAIT_S
+        while True:
+            with _pending_lock:
+                if not _pending_queue:
+                    _new_request_event.clear()
+                    batch = []
+                    break
+                key = _pending_queue[0].key
+                matching = sum(1 for r in _pending_queue if r.key == key)
+                if matching >= BATCH_MAX_SIZE or time.monotonic() >= deadline:
+                    batch, remaining = [], []
+                    for req in _pending_queue:
+                        if req.key == key and len(batch) < BATCH_MAX_SIZE:
+                            batch.append(req)
+                        else:
+                            remaining.append(req)
+                    _pending_queue[:] = remaining
+                    if not _pending_queue:
+                        _new_request_event.clear()
+                    # else: event stays set, loop continues immediately for
+                    # the remainder rather than waiting for a new arrival.
+                    break
+            time.sleep(BATCH_POLL_INTERVAL_S)
         _run_batch(batch)
 
 
@@ -426,7 +447,17 @@ def main():
         worker_loop()
     else:
         if args.backend == "fast_dense" and get_tp_size() == 1:
-            print(f"Starting batch worker (max_size={BATCH_MAX_SIZE}, wait={BATCH_WAIT_S}s)...")
+            # chat_completions() is a sync `def`, so FastAPI/Starlette runs
+            # each request in a worker thread via anyio's threadpool, whose
+            # default capacity (~40) can otherwise queue requests before
+            # they even reach _batch_worker -- indistinguishable from
+            # batching "not helping" unless raised explicitly for higher
+            # target concurrency (e.g. 64).
+            import anyio.to_thread
+            anyio.to_thread.current_default_thread_limiter().total_tokens = MAX_THREADPOOL_WORKERS
+            print(f"Raised ASGI threadpool capacity to {MAX_THREADPOOL_WORKERS}.")
+            print(f"Starting batch worker (max_size={BATCH_MAX_SIZE}, wait={BATCH_WAIT_S}s, "
+                  f"poll={BATCH_POLL_INTERVAL_S}s)...")
             threading.Thread(target=_batch_worker, daemon=True).start()
         uvicorn.run(app, host=args.host, port=args.port)
 
