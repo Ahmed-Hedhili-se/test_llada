@@ -57,7 +57,8 @@ async def send_request(session: aiohttp.ClientSession, base_url: str, prompt: st
 
 
 async def run_benchmark(base_urls: list[str], concurrency: int, max_tokens: int,
-                         steps: int, block_length: int, n_requests: int):
+                         steps: int, block_length: int, n_requests: int,
+                         fixed_prompt: bool = False):
     """
     base_urls: one or more independent backend URLs. Prompts are round-robined
     across them and a SINGLE semaphore of size `concurrency` is shared across
@@ -67,8 +68,17 @@ async def run_benchmark(base_urls: list[str], concurrency: int, max_tokens: int,
     independent data-parallel replicas, each replica a separate single-GPU
     server process -- see eval/throughput/README or the DP launch commands
     in the project history for how to start replicas on distinct ports/GPUs).
+
+    fixed_prompt: send PROMPTS[0] for every request instead of cycling
+    through PROMPTS. src/server.py's request batching only groups requests
+    with an IDENTICAL tokenized prompt length (see _PendingRequest.key) --
+    varied prompts would mostly miss each other and never batch, so this
+    flag is needed to actually exercise batching in this benchmark.
     """
-    prompts = (PROMPTS * ((n_requests // len(PROMPTS)) + 1))[:n_requests]
+    prompts = (
+        [PROMPTS[0]] * n_requests if fixed_prompt
+        else (PROMPTS * ((n_requests // len(PROMPTS)) + 1))[:n_requests]
+    )
     connector = aiohttp.TCPConnector(limit=concurrency)
 
     async with aiohttp.ClientSession(connector=connector) as session:
@@ -135,6 +145,13 @@ def main():
     ap.add_argument("--steps", type=int, default=128)
     ap.add_argument("--block-length", type=int, default=32)
     ap.add_argument("--n-requests", type=int, default=16)
+    ap.add_argument(
+        "--fixed-prompt", action="store_true",
+        help="Send the same prompt for every request instead of cycling "
+             "through PROMPTS. Needed to exercise server-side batching, "
+             "which only groups requests with an identical tokenized "
+             "prompt length (see src/server.py's _PendingRequest.key).",
+    )
     args = ap.parse_args()
 
     base_urls = args.base_urls.split(",") if args.base_urls else [args.base_url]
@@ -142,6 +159,7 @@ def main():
     asyncio.run(run_benchmark(
         base_urls, args.concurrency, args.max_tokens,
         args.steps, args.block_length, args.n_requests,
+        fixed_prompt=args.fixed_prompt,
     ))
 
 

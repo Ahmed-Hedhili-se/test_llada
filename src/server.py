@@ -24,7 +24,7 @@ from typing import Optional
 import torch
 import uvicorn
 import threading
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from transformers import AutoTokenizer
@@ -46,6 +46,119 @@ DEFAULT_CFG_SCALE    = 0.0
 DEFAULT_REMASKING    = "low_confidence"
 
 request_lock = threading.Lock()
+
+# ── Server-side request batching (fast_dense, single-GPU only) ─────────────────
+#
+# Scoped deliberately narrowly: only BACKEND == "fast_dense" with tp_size == 1
+# (a plain single-GPU instance, e.g. one DP replica) routes through here. TP+EP
+# (tp_size > 1) keeps the original one-request-at-a-time request_lock path
+# below completely unchanged -- batching a request there would mean the batch
+# itself has to survive dist.broadcast_object_list() to worker_loop() every
+# step, which is real additional distributed-coordination surface area on top
+# of code that's already the most failure-prone part of this project (see
+# INVESTIGATION_LOG.md's KV-cache collapse bug). Validate batching's actual
+# throughput win on the simple path first.
+#
+# model_update/generate.py's _generate_block_cached already handles a batch
+# dimension B generically (get_num_transfer_tokens and the per-row top-k
+# selection both operate per batch row already) -- no changes needed there.
+# What's missing is purely server-side: collecting concurrent requests into
+# one generate_cached() call instead of serializing them one at a time.
+#
+# Batching is restricted to requests that share an IDENTICAL
+# (gen_length, steps, block_length, prompt_token_length) key. Different
+# prompt lengths would need padding + an attention mask, which nothing in
+# model_update/model.py supports today (F.scaled_dot_product_attention is
+# always called with attn_mask=None) -- unsafe to fake without it, so
+# mismatched requests simply go in separate batches rather than being forced
+# together.
+#
+# Known limitation carried over from generate.py, not introduced here: the
+# per-batch-row confidence top-k loop in _generate_block_cached calls
+# `.item()` once per row per step -- B=8 batching means 8x the host syncs of
+# B=1, the same class of cost eval/test_moe_align_block_size.py's vectorization
+# eliminated for MoE routing. Not fixed here; worth revisiting if profiling
+# shows it eating into batching's win.
+
+BATCH_MAX_SIZE = int(os.environ.get("BATCH_MAX_SIZE", 8))
+BATCH_WAIT_S = float(os.environ.get("BATCH_WAIT_S", 0.05))
+BATCH_REQUEST_TIMEOUT_S = float(os.environ.get("BATCH_REQUEST_TIMEOUT_S", 300))
+
+
+class _PendingRequest:
+    def __init__(self, input_ids, gen_length, steps, block_length, temperature):
+        self.input_ids = input_ids
+        self.gen_length = gen_length
+        self.steps = steps
+        self.block_length = block_length
+        self.temperature = temperature
+        self.event = threading.Event()
+        self.result = None
+        self.error = None
+
+    @property
+    def key(self):
+        return (self.gen_length, self.steps, self.block_length, self.input_ids.shape[1])
+
+
+_pending_lock = threading.Lock()
+_pending_queue: list["_PendingRequest"] = []
+_new_request_event = threading.Event()
+
+
+def _run_batch(batch: list["_PendingRequest"]):
+    if not batch:
+        return
+    try:
+        from model_update.generate import generate_cached
+        input_ids = torch.cat([r.input_ids for r in batch], dim=0)
+        first = batch[0]
+        with torch.no_grad():
+            out_ids = generate_cached(
+                MODEL,
+                input_ids,
+                gen_length=first.gen_length,
+                steps=first.steps,
+                block_length=first.block_length,
+                temperature=first.temperature,
+            )
+        for i, req in enumerate(batch):
+            req.result = out_ids[i : i + 1]
+    except Exception as e:
+        for req in batch:
+            req.error = e
+    finally:
+        for req in batch:
+            req.event.set()
+
+
+def _batch_worker():
+    """Runs on a dedicated background thread, started once at server startup
+    (see main()). Collects requests for BATCH_WAIT_S after the first one
+    arrives, groups whatever matches the first request's key (capped at
+    BATCH_MAX_SIZE), and runs that group as one generate_cached() call.
+    Anything left over (mismatched key, or over the cap) stays queued for
+    the next round."""
+    while True:
+        _new_request_event.wait()
+        time.sleep(BATCH_WAIT_S)
+        with _pending_lock:
+            if not _pending_queue:
+                _new_request_event.clear()
+                continue
+            key = _pending_queue[0].key
+            batch, remaining = [], []
+            for req in _pending_queue:
+                if req.key == key and len(batch) < BATCH_MAX_SIZE:
+                    batch.append(req)
+                else:
+                    remaining.append(req)
+            _pending_queue[:] = remaining
+            if not _pending_queue:
+                _new_request_event.clear()
+            # else: event stays set, next loop iteration handles the rest
+            # without waiting for a new arrival.
+        _run_batch(batch)
 
 
 class Message(BaseModel):
@@ -122,38 +235,54 @@ def chat_completions(req: ChatRequest):
     if steps % (gen_length // block_length) != 0:
         steps = (gen_length // block_length) * max(1, steps // (gen_length // block_length))
 
-    t0 = time.time()
-    with torch.no_grad(), request_lock:
-        if BACKEND == "ours":
-            from src.generate import generate
-            out_ids = generate(
-                MODEL,
-                input_ids,
-                gen_length=gen_length,
-                steps=steps,
-                block_length=block_length,
-                temperature=req.temperature,
-                cfg_scale=req.cfg_scale,
-                remasking=req.remasking,
-            )
-        elif BACKEND == "ours_kv":
-            from src.generate_KVcache import generate_cached as generate_kv
-            out_ids = generate_kv(
-                MODEL,
-                input_ids,
-                gen_length=gen_length,
-                steps=steps,
-                block_length=block_length,
-                temperature=req.temperature,
-                cfg_scale=req.cfg_scale,
-                remasking=req.remasking,
-            )
-        elif BACKEND == "fast_dense":
-            from model_update.model import LLaDAMoEKV
-            from model_update.generate import generate_cached
-            from model_update.distributed import get_tp_size
+    from model_update.distributed import get_tp_size
 
-            if get_tp_size() > 1:
+    t0 = time.time()
+
+    if BACKEND == "fast_dense" and get_tp_size() == 1:
+        # Batched path -- see the "Server-side request batching" block above
+        # for why this is scoped to single-GPU only.
+        pending = _PendingRequest(input_ids, gen_length, steps, block_length, req.temperature)
+        with _pending_lock:
+            _pending_queue.append(pending)
+            _new_request_event.set()
+        if not pending.event.wait(timeout=BATCH_REQUEST_TIMEOUT_S):
+            raise HTTPException(status_code=504, detail="Timed out waiting for a batch slot")
+        if pending.error is not None:
+            raise HTTPException(status_code=500, detail=str(pending.error))
+        out_ids = pending.result
+    else:
+        with torch.no_grad(), request_lock:
+            if BACKEND == "ours":
+                from src.generate import generate
+                out_ids = generate(
+                    MODEL,
+                    input_ids,
+                    gen_length=gen_length,
+                    steps=steps,
+                    block_length=block_length,
+                    temperature=req.temperature,
+                    cfg_scale=req.cfg_scale,
+                    remasking=req.remasking,
+                )
+            elif BACKEND == "ours_kv":
+                from src.generate_KVcache import generate_cached as generate_kv
+                out_ids = generate_kv(
+                    MODEL,
+                    input_ids,
+                    gen_length=gen_length,
+                    steps=steps,
+                    block_length=block_length,
+                    temperature=req.temperature,
+                    cfg_scale=req.cfg_scale,
+                    remasking=req.remasking,
+                )
+            elif BACKEND == "fast_dense":
+                # Only reached here when get_tp_size() > 1 (TP+EP) -- the
+                # single-GPU case is routed through the batched path above.
+                from model_update.model import LLaDAMoEKV
+                from model_update.generate import generate_cached
+
                 import torch.distributed as dist
                 req_obj = {
                     "type": "generate_cached",
@@ -165,32 +294,32 @@ def chat_completions(req: ChatRequest):
                 }
                 dist.broadcast_object_list([req_obj], src=0)
 
-            out_ids = generate_cached(
-                MODEL,
-                input_ids,
-                gen_length=gen_length,
-                steps=steps,
-                block_length=block_length,
-                temperature=req.temperature,
-            )
-        elif BACKEND == "hf":
-            # HuggingFace's .generate() blocks diffusion models in newer versions.
-            # We wrap the HF model to return logits and use our diffusion generate loop.
-            from src.generate import generate
-            class HFWrapper:
-                def __init__(self, m): self.m = m
-                def __call__(self, x, **kwargs): return self.m(x, **kwargs).logits
-            
-            out_ids = generate(
-                HFWrapper(MODEL),
-                input_ids,
-                gen_length=gen_length,
-                steps=steps,
-                block_length=block_length,
-                temperature=req.temperature,
-                cfg_scale=req.cfg_scale,
-                remasking=req.remasking,
-            )
+                out_ids = generate_cached(
+                    MODEL,
+                    input_ids,
+                    gen_length=gen_length,
+                    steps=steps,
+                    block_length=block_length,
+                    temperature=req.temperature,
+                )
+            elif BACKEND == "hf":
+                # HuggingFace's .generate() blocks diffusion models in newer versions.
+                # We wrap the HF model to return logits and use our diffusion generate loop.
+                from src.generate import generate
+                class HFWrapper:
+                    def __init__(self, m): self.m = m
+                    def __call__(self, x, **kwargs): return self.m(x, **kwargs).logits
+
+                out_ids = generate(
+                    HFWrapper(MODEL),
+                    input_ids,
+                    gen_length=gen_length,
+                    steps=steps,
+                    block_length=block_length,
+                    temperature=req.temperature,
+                    cfg_scale=req.cfg_scale,
+                    remasking=req.remasking,
+                )
     elapsed = time.time() - t0
 
     generated = out_ids[0].tolist()
@@ -291,11 +420,14 @@ def main():
         args.device = f"cuda:{get_tp_rank()}"
 
     load_model(args.weight_dir, args.device, args.backend)
-    
+
     if get_tp_size() > 1 and get_tp_rank() != 0:
         print(f"Rank {get_tp_rank()} waiting for generation tasks...")
         worker_loop()
     else:
+        if args.backend == "fast_dense" and get_tp_size() == 1:
+            print(f"Starting batch worker (max_size={BATCH_MAX_SIZE}, wait={BATCH_WAIT_S}s)...")
+            threading.Thread(target=_batch_worker, daemon=True).start()
         uvicorn.run(app, host=args.host, port=args.port)
 
 
