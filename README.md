@@ -241,6 +241,8 @@ When scaling to multiple GPUs at **Batch Size 1**, you may observe that 2 GPUs d
 
 ### Concurrent Request Throughput: TP+EP vs Data-Parallel Replicas
 
+> **Decision rule, confirmed by measurement on both sides**: for a **single request**, use **TP+EP** — 4.26s for 128 tokens, 6.15× vs baseline, because both GPUs cooperate on that one generation. For **concurrent requests**, use **DP** — ~2× better throughput and tail latency than a single TP+EP instance at matched load (`--concurrency 8`, validated across two independent test rounds). They optimize different things, and this server can only give you one per deployment — pick based on actual traffic pattern, not whichever number looks better in isolation. Full data and the mechanism behind the flip below.
+
 The TP+EP setup above is optimized for **single-request latency**, not concurrent throughput — those are different questions, and conflating them leads to the wrong serving topology.
 
 **Why they diverge**: `src/server.py` serializes every generation through one `request_lock` (`threading.Lock()`), because the TP worker process (`worker_loop()`, rank 1) is a simple `while True: receive one broadcast → run one generation → loop` with no concept of handling more than one request at a time. A single TP+EP instance therefore processes exactly **one generation at a time, system-wide**, no matter how many concurrent requests arrive — they queue behind the lock rather than executing in parallel.
