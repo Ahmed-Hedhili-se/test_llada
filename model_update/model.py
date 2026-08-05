@@ -533,4 +533,19 @@ class CUDAGraphRunner:
         graph, static_input, static_logits, static_new_kv = self._graphs[key]
         static_input.copy_(input_ids)
         graph.replay()
-        return static_logits, static_new_kv
+        # .clone() the logits, not the raw static buffer: graph.replay()
+        # overwrites static_logits IN PLACE, so returning it directly would
+        # hand back the same Python tensor object on every call -- any
+        # caller holding a reference from a previous call would silently
+        # see it change to the NEW result the next time replay() runs (this
+        # is exactly what eval/test_cuda_graph_forward.py's check 3 caught:
+        # two "different" calls returning what looked like identical output
+        # because they were, in fact, the same underlying storage). Every
+        # ordinary eager PyTorch call returns a fresh tensor; this restores
+        # that contract for logits specifically. static_new_kv is left
+        # aliased on purpose -- its k/v entries are views into cache_buffer,
+        # which already has this exact same live-mutation contract in plain
+        # eager mode (write_and_view always returns a view into the same
+        # persistent buffer), so cloning it here would be new, wasted cost
+        # for a risk that isn't actually new.
+        return static_logits.clone(), static_new_kv
