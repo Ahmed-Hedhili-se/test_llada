@@ -236,7 +236,50 @@ When scaling to multiple GPUs at **Batch Size 1**, you may observe that 2 GPUs d
 - The TP+EP architecture requires two synchronous `dist.all_reduce()` operations per layer (one for Attention, one for MoE).
 - For a 16-layer model, this means 32 network hops per generated token.
 - If your GPUs are connected via standard PCIe (e.g., `PHB` in `nvidia-smi topo -m`) rather than high-speed NVLink, these `all_reduce` calls add ~1-2 milliseconds of pure network delay per token. 
-- While compute time is halved, the added network latency limits the maximum theoretical speedup for small batch sizes. Near-linear scaling is achieved at larger batch sizes (e.g., concurrent API requests) where compute time dominates the fixed network latency.
+- While compute time is halved, the added network latency limits the maximum theoretical speedup for small batch sizes. Near-linear scaling is achieved at larger *model*-batch sizes (multiple sequences processed together in one forward pass), where compute time dominates the fixed network latency.
+- **This does not extend to concurrent API requests as currently served** — see the next section. `src/server.py` processes one request at a time regardless of TP+EP, so concurrent load doesn't get the benefit described above at all; it queues instead.
+
+### Concurrent Request Throughput: TP+EP vs Data-Parallel Replicas
+
+The TP+EP setup above is optimized for **single-request latency**, not concurrent throughput — those are different questions, and conflating them leads to the wrong serving topology.
+
+**Why they diverge**: `src/server.py` serializes every generation through one `request_lock` (`threading.Lock()`), because the TP worker process (`worker_loop()`, rank 1) is a simple `while True: receive one broadcast → run one generation → loop` with no concept of handling more than one request at a time. A single TP+EP instance therefore processes exactly **one generation at a time, system-wide**, no matter how many concurrent requests arrive — they queue behind the lock rather than executing in parallel.
+
+**Data-Parallel (DP) replicas** sidestep this: two independent single-GPU server processes (via `CUDA_VISIBLE_DEVICES`, one per physical GPU), each with its own separate lock, load-balanced by round-robining requests across both. Two independent queues instead of one.
+
+#### Benchmark: concurrent requests, 128-token generation each (`eval/throughput/run_throughput.py`, 2× A6000, `--concurrency 8`)
+
+```bash
+# TP+EP (1 instance, both GPUs cooperating per request)
+torchrun --nproc_per_node=2 --master_port=29501 src/server.py --weight-dir ./weights --port 8000 --backend fast_dense
+python -m eval.throughput.run_throughput --base-url http://localhost:8000 --concurrency 8 --n-requests 32
+
+# DP (2 independent single-GPU replicas -- note the distinct MASTER_PORT per
+# replica, since init_distributed() hardcodes 29500 when unset and two
+# replicas on one machine would otherwise collide on it)
+CUDA_VISIBLE_DEVICES=0 MASTER_ADDR=localhost MASTER_PORT=29500 RANK=0 WORLD_SIZE=1 \
+  python -m src.server --weight-dir ./weights --port 8000 --backend fast_dense --device cuda:0 &
+CUDA_VISIBLE_DEVICES=1 MASTER_ADDR=localhost MASTER_PORT=29501 RANK=0 WORLD_SIZE=1 \
+  python -m src.server --weight-dir ./weights --port 8001 --backend fast_dense --device cuda:0 &
+python -m eval.throughput.run_throughput --base-urls http://localhost:8000,http://localhost:8001 --concurrency 8 --n-requests 32
+```
+
+| Requests | Configuration | Output tok/s | p95 latency | p99 latency |
+|---:|---|---:|---:|---:|
+| 8  | TP+EP (1 instance) | 26.0 | 34.15s | 34.15s |
+| 8  | DP (2 replicas)     | 47.0 | 17.04s | 17.04s |
+| 32 | TP+EP (1 instance) | 26.0 | 34.78s | 34.79s |
+| 32 | DP (2 replicas)     | 46.6 | 17.31s | 17.34s |
+| 64 | TP+EP (1 instance) | 25.9 | 34.78s | 34.88s |
+| 64 | DP (2 replicas)     | 46.8 | 17.15s | 17.19s |
+
+**Result: DP gives ~1.8× higher throughput and ~2× lower tail latency than TP+EP under concurrent load, consistently across request counts (8/32/64) — not a one-off measurement.**
+
+The mechanism is plain queueing, not a GPU-compute-efficiency difference. TP+EP's single `request_lock` means `--concurrency 8` fully queues behind one lock: tail latency ≈ 8 × solo-request-time ≈ 8 × 4.26s ≈ 34s, matching the measured 34.15–34.88s almost exactly. DP splits the same 8 requests across two independently-locked queues of depth 4 each, roughly halving the wait: ≈ 4 × 4.26s ≈ 17s, again matching. Aggregate throughput follows the same arithmetic (solo tokens/request ÷ solo time, independent of which topology is queuing the requests).
+
+**Takeaway**: for concurrent multi-user serving on this hardware, prefer DP replicas over a single TP+EP instance — same 2 GPUs, ~2× better throughput and latency-under-load. TP+EP remains the right choice for single-request latency specifically (6.15× speedup, see the Multi-GPU benchmark above) — a lone DP replica only gets the single-GPU speedup, not the TP+EP-combined one.
+
+**Neither topology is a true fix for concurrency at scale.** Both are workarounds for `model_update/generate.py`'s `generate_cached` processing one request at a time. The model architecture already operates over a generic batch dimension — `KVCacheBuffer` takes `batch_size`, and `TritonFusedMoEBlock.forward` flattens `[B, T, H] → [B*T, H]` so tokens from different sequences in a batch share expert routing naturally — but nothing in `src/server.py` collects concurrent requests into a batched `generate_cached()` call. Real continuous/dynamic batching (the approach production inference engines use) would beat both topologies measured here: it removes the lock bottleneck entirely, improves MoE tokens-per-expert utilization (the same inefficiency the Triton kernel work targets), and doesn't require duplicating the full model per GPU the way DP does. That remains unimplemented.
 
 ---
 
