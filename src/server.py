@@ -108,6 +108,10 @@ _pending_queue: list["_PendingRequest"] = []
 _new_request_event = threading.Event()
 
 
+PROFILE_BATCHES = os.environ.get("PROFILE_BATCHES", "0") == "1"
+PROFILE_DIR = os.environ.get("PROFILE_DIR", "traces")
+
+
 def _run_batch(batch: list["_PendingRequest"]):
     if not batch:
         return
@@ -120,15 +124,37 @@ def _run_batch(batch: list["_PendingRequest"]):
         from model_update.generate import generate_cached
         input_ids = torch.cat([r.input_ids for r in batch], dim=0)
         first = batch[0]
-        with torch.no_grad():
-            out_ids = generate_cached(
-                MODEL,
-                input_ids,
-                gen_length=first.gen_length,
-                steps=first.steps,
-                block_length=first.block_length,
-                temperature=first.temperature,
+        gen_kwargs = dict(
+            gen_length=first.gen_length,
+            steps=first.steps,
+            block_length=first.block_length,
+            temperature=first.temperature,
+        )
+        if PROFILE_BATCHES:
+            # Chrome/Perfetto trace JSON -- shows actual GPU busy vs idle
+            # time during this batch's generate_cached() call, not just
+            # wall-clock totals. Open at chrome://tracing or
+            # https://ui.perfetto.dev/ (load the file). One trace per
+            # batch, named with its size so it's identifiable alongside
+            # the [batch] log line above. Real overhead from the profiler
+            # itself, so this is gated off by default -- one-off
+            # diagnostic capture, not for production.
+            os.makedirs(PROFILE_DIR, exist_ok=True)
+            with torch.no_grad(), torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+            ) as prof:
+                out_ids = generate_cached(MODEL, input_ids, **gen_kwargs)
+            trace_path = os.path.join(
+                PROFILE_DIR, f"batch_size{len(batch)}_{int(time.time() * 1000)}.json"
             )
+            prof.export_chrome_trace(trace_path)
+            print(f"[profile] wrote {trace_path}", flush=True)
+        else:
+            with torch.no_grad():
+                out_ids = generate_cached(MODEL, input_ids, **gen_kwargs)
         for i, req in enumerate(batch):
             req.result = out_ids[i : i + 1]
     except Exception as e:
