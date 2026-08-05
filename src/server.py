@@ -139,13 +139,19 @@ def _run_batch(batch: list["_PendingRequest"]):
             # the [batch] log line above. Real overhead from the profiler
             # itself, so this is gated off by default -- one-off
             # diagnostic capture, not for production.
+            # CUDA-only, not CPU+CUDA: tracing every Python-level op
+            # dispatch/call-stack entry across 128 steps x 16 layers x a
+            # 63-sequence batch produced 500-640MB trace files in practice
+            # -- impractical to transfer and likely to hang a browser
+            # viewer even if transferred. CUDA-only answers the actual
+            # question (is the GPU busy or idle) directly, at a small
+            # fraction of the size. Set PROFILE_CPU=1 to add CPU activity
+            # back for a deeper look, at the same size cost.
             os.makedirs(PROFILE_DIR, exist_ok=True)
-            with torch.no_grad(), torch.profiler.profile(
-                activities=[
-                    torch.profiler.ProfilerActivity.CPU,
-                    torch.profiler.ProfilerActivity.CUDA,
-                ],
-            ) as prof:
+            activities = [torch.profiler.ProfilerActivity.CUDA]
+            if os.environ.get("PROFILE_CPU", "0") == "1":
+                activities.insert(0, torch.profiler.ProfilerActivity.CPU)
+            with torch.no_grad(), torch.profiler.profile(activities=activities) as prof:
                 out_ids = generate_cached(MODEL, input_ids, **gen_kwargs)
             trace_path = os.path.join(
                 PROFILE_DIR, f"batch_size{len(batch)}_{int(time.time() * 1000)}.json"
