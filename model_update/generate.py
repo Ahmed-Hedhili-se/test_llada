@@ -81,6 +81,7 @@ def _generate_block_cached(
     cache_buffer: KVCacheBuffer,
     temperature: float,
     remasking: str,
+    graph_runner=None,
 ):
     block_length = block_end - block_start
     device = x.device
@@ -93,7 +94,14 @@ def _generate_block_cached(
         active_ids = x[:, block_start:block_end]
         mask_index = (active_ids == MASK_ID)
 
-        suffix_logits, _ = model(
+        # graph_runner (if given -- opt-in, see generate_cached's
+        # use_cuda_graph) replaces only this repeated per-step call, not
+        # the once-per-block finalize call below or the once-per-generation
+        # prime call in generate_cached: those each run once, so capturing
+        # them wouldn't amortize the capture cost the way this one does
+        # (called steps_per_block times per block with an identical shape).
+        forward = graph_runner if graph_runner is not None else model
+        suffix_logits, _ = forward(
             suffix_ids,
             position_offset=block_start,
             cache_buffer=cache_buffer,
@@ -150,11 +158,22 @@ def generate_cached(
     block_length: int = 128,
     temperature: float = 0.0,
     remasking: str = "low_confidence",
+    use_cuda_graph: bool = False,
 ) -> torch.Tensor:
     """
     Same signature/semantics as generate.generate(), minus cfg_scale
     (CFG doubles the batch and complicates cache bookkeeping; add back
     once single-sequence caching is verified correct).
+
+    use_cuda_graph: capture+replay each denoising step's model forward as
+    a CUDA graph instead of dispatching it normally every time. OFF by
+    default -- opt-in, and NOT validated end-to-end on real hardware as
+    written (see CUDAGraphRunner's docstring in model_update/model.py for
+    the full list of correctness-relevant invariants it relies on). Only
+    affects the per-step calls inside a block's denoising loop -- the
+    prime call (once per generation) and each block's finalize call (once
+    per block) stay ordinary eager calls, since capturing something that
+    runs once doesn't amortize the capture cost.
     """
     assert gen_length % block_length == 0, "gen_length must be divisible by block_length"
     num_blocks = gen_length // block_length
@@ -189,6 +208,14 @@ def generate_cached(
     model(x, position_offset=0, cache_buffer=cache_buffer, write_pos=0)
     cache_buffer.commit(P)
 
+    # Fresh runner per generate_cached() call, matching cache_buffer's own
+    # per-call lifetime -- see CUDAGraphRunner's docstring (invariant 4) for
+    # why graphs must never be reused across different cache_buffers.
+    graph_runner = None
+    if use_cuda_graph:
+        from .model import CUDAGraphRunner
+        graph_runner = CUDAGraphRunner(model)
+
     for block_idx in range(num_blocks):
         block_start = P + block_idx * block_length
         block_end = P + (block_idx + 1) * block_length
@@ -202,6 +229,7 @@ def generate_cached(
             cache_buffer=cache_buffer,
             temperature=temperature,
             remasking=remasking,
+            graph_runner=graph_runner,
         )
 
     return x[:, P:]

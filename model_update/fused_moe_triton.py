@@ -113,21 +113,33 @@ def moe_align_block_size(topk_ids: torch.Tensor, block_size: int, num_experts: i
     Sort/pad (token, expert) assignment pairs into block_size-aligned
     per-expert groups for the grouped-GEMM kernel below.
 
-    Vectorized: the previous implementation looped over `range(num_experts)`
-    in Python and called `.item()` twice per expert (2 x num_experts
-    host-device syncs per call -- 128 for num_experts=64). Each `.item()`
-    blocks the CPU until the GPU catches up, serializing what should be
-    back-to-back kernel launches; with 16 MoE layers x dozens of forward
-    passes per generation call, that loop alone issued tens of thousands of
-    stalls. This version computes every expert's destination offsets with
-    cumulative sums and writes them in a single scatter, entirely on GPU,
-    syncing only once at the very end -- an unavoidable `.item()` to size
-    the output tensor, since the total padded length is genuinely
-    data-dependent -- instead of once per expert.
+    Fully zero-host-sync: output shapes depend only on topk_ids.shape and
+    the static block_size/num_experts config, never on runtime tensor
+    VALUES. This matters beyond raw speed -- it's what makes this function
+    (and therefore the whole MoE forward) safe to capture as a CUDA graph,
+    which requires every tensor allocation's size to be known before
+    replay, not read back from a data-dependent value mid-capture.
 
-    Output shapes/dtypes/values are identical to the original for any
-    input (see eval/test_moe_align_block_size.py, which checks this
-    directly against a frozen copy of the original loop).
+    History: the original implementation looped over `range(num_experts)`
+    in Python with 2 x num_experts `.item()` calls per call (128 for
+    num_experts=64). A first vectorization pass (cumsum + scatter, no
+    per-expert loop) got that down to a single `.item()` -- sizing
+    `sorted_token_ids` to the EXACT padded length, which is genuinely
+    data-dependent. This version removes that last sync too, by allocating
+    a WORST-CASE-sized buffer instead: the maximum possible padded length
+    regardless of how tokens are distributed across experts (padding adds
+    at most block_size-1 per expert, so `ceil(num_valid_tokens/block_size)
+    + num_experts` blocks is always enough, computed from static shape
+    info alone -- no tensor read required). The Triton kernel already
+    reads num_tokens_post_padded from GPU memory at kernel-launch time
+    (`tl.load(num_tokens_post_padded_ptr)`), not from Python, so grid
+    positions beyond the real (smaller) padded length just early-return --
+    correctness is unaffected, at the cost of a few redundant, cheap,
+    parallel, immediately-returning grid programs.
+
+    Verified numerically identical to the exact-sized version for any
+    input, up to the point where the real data ends (see
+    eval/test_moe_align_block_size.py).
     """
     num_tokens, top_k = topk_ids.shape
     device = topk_ids.device
@@ -152,20 +164,33 @@ def moe_align_block_size(topk_ids: torch.Tensor, block_size: int, num_experts: i
     rank_within_expert = positions - real_offsets[sorted_expert_ids]
     dest = padded_offsets[sorted_expert_ids] + rank_within_expert
 
-    total_padded_len = int(padded_expert_counts.sum().item())  # one sync, not 128
+    # Fixed upper bound from STATIC shape info only (num_valid_tokens,
+    # num_experts, block_size are all Python ints derived from .shape /
+    # config, never a tensor read) -- no .item(), no data dependence.
+    max_blocks = -(-num_valid_tokens // block_size) + num_experts  # ceil(num_valid_tokens/block_size) + num_experts
+    max_padded_len = max_blocks * block_size
 
     sorted_token_ids = torch.full(
-        (total_padded_len,), num_valid_tokens, dtype=sorted_indices.dtype, device=device
+        (max_padded_len,), num_valid_tokens, dtype=sorted_indices.dtype, device=device
     )
     sorted_token_ids.scatter_(0, dest, sorted_indices)
 
-    num_blocks_per_expert = padded_expert_counts // block_size
-    expert_ids = torch.repeat_interleave(
-        torch.arange(num_experts, device=device, dtype=torch.int32),
-        num_blocks_per_expert,
-    )
+    # Map each of the max_blocks possible block-positions to the expert
+    # that owns it. block_start_per_expert is a monotonically
+    # non-decreasing, block-size-aligned cumsum, so a single searchsorted
+    # stands in for what would otherwise need a per-expert range-fill loop:
+    # for block position b, the owning expert is the last one whose start
+    # is <= b. Position 0 always maps to expert 0 (block_start_per_expert[0]
+    # is always 0 by construction of the exclusive cumsum), so this never
+    # goes negative in practice; .clamp is defensive, not load-bearing.
+    block_start_per_expert = padded_offsets // block_size
+    block_positions = torch.arange(max_blocks, device=device)
+    expert_ids = (torch.searchsorted(block_start_per_expert, block_positions, right=True) - 1)
+    expert_ids = expert_ids.clamp(min=0).to(torch.int32)
 
-    num_tokens_post_padded = torch.tensor([total_padded_len], dtype=torch.int32, device=device)
+    # Real (data-dependent) total, computed and consumed entirely on-device
+    # -- the kernel reads this via tl.load, never the host.
+    num_tokens_post_padded = padded_expert_counts.sum(dtype=torch.int32).view(1)
 
     return sorted_token_ids, expert_ids, num_tokens_post_padded
 
