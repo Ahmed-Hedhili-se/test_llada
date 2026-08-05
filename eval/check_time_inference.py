@@ -141,10 +141,10 @@ def baseline_generate(model, prompt_ids, gen_length, steps, block_length):
     return x[0, P:]
 
 
-def optimized_generate(model, prompt_ids, gen_length, steps, block_length):
+def optimized_generate(model, prompt_ids, gen_length, steps, block_length, use_cuda_graph=False):
     """Generation with block-wise KV cache, fused MoE, static top-8 experts."""
     from model_update.generate import generate_cached
-    return generate_cached(model, prompt_ids, gen_length, steps, block_length)
+    return generate_cached(model, prompt_ids, gen_length, steps, block_length, use_cuda_graph=use_cuda_graph)
 
 
 # ── benchmarking ─────────────────────────────────────────────────────────────
@@ -181,6 +181,12 @@ def main():
     ap.add_argument("--block-length", type=int, default=16)
     ap.add_argument("--mode", choices=["both", "baseline", "optimized"], default="both",
                     help="Which model(s) to benchmark")
+    ap.add_argument("--use-cuda-graph", action="store_true",
+                    help="Opt-in, unvalidated-at-scale CUDA graph capture/replay for the "
+                         "optimized path's per-step forward (see CUDAGraphRunner's docstring "
+                         "in model_update/model.py). Only affects --mode optimized/both's "
+                         "optimized run. Run this flag on and off with the same args and "
+                         "compare both the printed decoded output and the tok/s number.")
     args = ap.parse_args()
 
     # In distributed mode, override device with local rank
@@ -210,6 +216,7 @@ def main():
         print(f"  Block Length     : {args.block_length}")
         print(f"  Warmup Runs      : {args.num_warmup}")
         print(f"  Benchmark Runs   : {args.num_runs}")
+        print(f"  Use CUDA Graph   : {args.use_cuda_graph}")
         print("=" * 80 + "\n")
 
     if not os.path.isdir(args.weight_dir):
@@ -271,11 +278,15 @@ def main():
 
         set_seed(42)
         opt_tokens = optimized_generate(
-            opt_model, prompt_ids, args.gen_length, args.steps, args.block_length
+            opt_model, prompt_ids, args.gen_length, args.steps, args.block_length,
+            use_cuda_graph=args.use_cuda_graph,
         )[0].cpu()
 
         opt_lats = benchmark(
-            lambda: optimized_generate(opt_model, prompt_ids, args.gen_length, args.steps, args.block_length),
+            lambda: optimized_generate(
+                opt_model, prompt_ids, args.gen_length, args.steps, args.block_length,
+                use_cuda_graph=args.use_cuda_graph,
+            ),
             args.device, args.num_warmup, args.num_runs,
         )
         opt_mean, opt_med, opt_p95 = get_stats(opt_lats)
@@ -304,7 +315,10 @@ def main():
         print(f"| {'Baseline (src/, topk=8, no cache)':<50} | {bl_mean:>10.2f} | {bl_tps:>10.2f} | {'1.00x':>10} |")
     if args.mode in ["both", "optimized"]:
         speed_text = f"{speedup:.2f}x" if args.mode == "both" else "N/A"
-        print(f"| {'Optimized (model_update/, topk=8, KV cache)':<50} | {opt_mean:>10.2f} | {opt_tps:>10.2f} | {speed_text:>10} |")
+        opt_label = "Optimized (model_update/, topk=8, KV cache)"
+        if args.use_cuda_graph:
+            opt_label += " +graph"
+        print(f"| {opt_label:<50} | {opt_mean:>10.2f} | {opt_tps:>10.2f} | {speed_text:>10} |")
     print("=" * 100)
 
     if args.mode == "both" and baseline_tokens is not None and opt_tokens is not None:
