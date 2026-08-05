@@ -281,7 +281,49 @@ The mechanism is plain queueing, not a GPU-compute-efficiency difference. TP+EP'
 
 **Takeaway**: for concurrent multi-user serving on this hardware, prefer DP replicas over a single TP+EP instance — same 2 GPUs, ~2× better throughput and latency-under-load. TP+EP remains the right choice for single-request latency specifically (6.15× speedup, see the Multi-GPU benchmark above) — a lone DP replica only gets the single-GPU speedup, not the TP+EP-combined one.
 
-**Neither topology is a true fix for concurrency at scale.** Both are workarounds for `model_update/generate.py`'s `generate_cached` processing one request at a time. The model architecture already operates over a generic batch dimension — `KVCacheBuffer` takes `batch_size`, and `TritonFusedMoEBlock.forward` flattens `[B, T, H] → [B*T, H]` so tokens from different sequences in a batch share expert routing naturally — but nothing in `src/server.py` collects concurrent requests into a batched `generate_cached()` call. Real continuous/dynamic batching (the approach production inference engines use) would beat both topologies measured here: it removes the lock bottleneck entirely, improves MoE tokens-per-expert utilization (the same inefficiency the Triton kernel work targets), and doesn't require duplicating the full model per GPU the way DP does. That remains unimplemented.
+**Neither topology alone is a true fix for concurrency at scale.** Both are workarounds for `model_update/generate.py`'s `generate_cached` processing one request at a time. The model architecture already operates over a generic batch dimension — `KVCacheBuffer` takes `batch_size`, and `TritonFusedMoEBlock.forward` flattens `[B, T, H] → [B*T, H]` so tokens from different sequences in a batch share expert routing naturally — the gap was purely that nothing in `src/server.py` collected concurrent requests into a batched `generate_cached()` call. That gap is now closed for the single-GPU path (DP replicas or a plain single-GPU deployment) — see the next section for how it works and what it measured. TP+EP's `request_lock` path is intentionally left as-is; batching there would need the batch itself to survive `dist.broadcast_object_list()` to `worker_loop()` every step, real additional distributed-coordination risk on top of code that's already been the most failure-prone part of this project.
+
+### Server-Side Request Batching
+
+#### How it works
+
+`src/server.py` runs a dedicated background thread (`_batch_worker`) that collects concurrent requests instead of processing them one at a time, for `BACKEND == "fast_dense"` with `tp_size == 1` only. Once the first request of a new group arrives, it polls every `BATCH_POLL_INTERVAL_S` (default 5ms) for either `BATCH_MAX_SIZE` (default 8) matching-key requests to accumulate, or `BATCH_WAIT_S` (default 50ms) total to elapse — whichever comes first — then runs that group as one `generate_cached()` call instead of N sequential ones. Requests only batch together if they share an identical `(gen_length, steps, block_length, prompt_token_length)` key: different-length prompts would need padding plus an attention mask, which nothing in `model_update/model.py` supports today (`F.scaled_dot_product_attention` is always called with `attn_mask=None`), so mismatched requests land in separate batches rather than being forced together unsafely.
+
+#### Validation: does it actually form large batches?
+
+```bash
+BATCH_MAX_SIZE=64 PROFILE_BATCHES=1 python -m src.server --weight-dir ./weights --port 8000 --backend fast_dense --device cuda:0
+python -m eval.throughput.run_throughput --base-url http://localhost:8000 --concurrency 64 --n-requests 64 --fixed-prompt
+```
+
+At `--concurrency 64`, the collection window reliably formed batches of 54–63 out of 64 concurrent requests (the small remainder landing in a second batch) — confirmed directly via server-side `[batch] size=N` logging, not inferred from throughput numbers alone. Aggregate throughput reached **194.2 tok/s** at concurrency 64, vs ~26–30 tok/s for the serialized baseline at the same load. Since every request in the dominant batch completes *simultaneously* (one shared `generate_cached()` call), that batch's wall-clock time is directly comparable to what serialization would have taken: `54 × 4.26s ≈ 230s` serialized vs ~33.7s measured — a **~6.8× speedup** for that group.
+
+#### GPU trace analysis (Chrome/Perfetto format via `PROFILE_BATCHES=1`)
+
+Exporting a `torch.profiler` trace per batch and analyzing actual CUDA kernel timing — rather than inferring utilization from wall-clock throughput alone — found:
+
+- **GPU busy 71.7%** of the batch's wall-clock window (batch of 57, 8-token/8-step generation) — decent utilization, not saturated, not wasted.
+- The idle 28.3% was **not** a few large stalls: **19,658 distinct idle gaps averaging ~8μs each** — the signature of kernel-launch overhead accumulating across many small operations, not one fixable bottleneck.
+- Of the busy time, `fused_moe_kernel` (the hand-written Triton kernel) alone accounted for **44.6%** — directly confirming, via hard trace evidence, the MoE-dominance finding from this project's very first profiling (`eval/time_fraction.py`). Attention (`pytorch_flash::flash_fwd_kernel`) was ~1.9%, confirming it's cheap, as established throughout this project.
+
+#### Fixing a real contributor: vectorizing `_generate_block_cached`'s per-row token selection
+
+The trace pointed at a fixable source of the fragmented idle time: `_generate_block_cached`'s confidence-based token-selection loop called `.item()` and ran an independent `torch.topk()` **per batch row, per denoising step** — the same class of host-sync cost `moe_align_block_size`'s vectorization eliminated for MoE routing (see Optimizations above), in a different function. Since `torch.topk` has no per-row-`k` mode, the fix takes one `topk` call at the batch's max `k`, then masks each row down to its own (smaller-or-equal) `k` via a broadcast comparison — `topk`'s output is sorted descending, so "keep the first `k_j` of `max_k`" is exactly the top-`k_j` for row `j`, not an approximation. `get_num_transfer_tokens` (called once per block rather than once per step) had the same root cause — a per-row tensor used as a slice bound implicitly triggers `__index__`, another hidden host sync — fixed the same way. Both are verified against frozen copies of the original loop-based implementations across randomized configs and edge cases in `eval/test_select_transfer_indices.py`, and confirmed bit-exact against real model inference: `eval/diagnose_cache_vs_dense.py`'s diagnostic question produced output identical, character-for-character, to this project's historical pre-fix correctness record.
+
+**Matched-batch-size before/after** (both traces at batch=57, isolating the code change from batch-composition noise — a same-config-different-size comparison at batch=31/33 initially looked *worse* than the batch=57 baseline, purely because a smaller batch has less parallel work to amortize the same fixed overhead over, not because of any regression; re-running until the batch size matched resolved the ambiguity):
+
+| Metric | Before | After | Change |
+|---|---:|---:|---:|
+| Total wall-clock span | 557.18ms | 521.13ms | **−6.5%** |
+| Busy time (actual GPU compute) | 399.71ms | 399.29ms | ~unchanged |
+| Idle time | 157.46ms | 121.85ms | **−22.6%** |
+| Busy % | 71.7% | 76.6% | **+4.9 points** |
+| Idle gaps | 19,658 | 17,773 | −9.6% |
+| Avg gap size | 8.01μs | 6.86μs | −14.4% |
+| Kernel launches | 17,108 | 16,246 | −5.0% |
+| CPU-side launch calls (`cuda_runtime`) | 27,156 | 24,250 | **−10.7%** |
+
+Busy time is essentially untouched, exactly as expected — the fix changes zero math, only removes overhead sitting around it — while every overhead-side metric improved: less idle time, fewer and smaller gaps, fewer kernel launches, fewer CPU-side dispatch calls. Not the dominant lever (MoE's kernel time still dwarfs everything else in this workload), but a real, correctly-attributed, measured 6.5% reduction in wall-clock time for the same batch of work.
 
 ---
 
