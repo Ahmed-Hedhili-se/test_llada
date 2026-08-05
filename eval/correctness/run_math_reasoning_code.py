@@ -37,7 +37,10 @@ practical grounds beyond just "the paper uses it":
 
   gsm8k    : Math.      Grade-school math word problems (Cobbe et al., 2021).
              Free-form numeric answer, ground truth after "#### " in the
-             dataset's reference solution.
+             dataset's reference solution. Uses 5-shot prompting by default
+             (the canonical Wei et al., 2022 exemplar set -- see
+             GSM8K_FEWSHOT_EXAMPLES), matching common GSM8K reporting
+             convention; pass --num-fewshot 0 for a zero-shot ablation.
   bbh      : Reasoning. BIG-Bench-Hard, 27 diverse reasoning tasks (Suzgun
              et al., 2022). Free-form short answer (word/phrase/number/
              "(A)"-style letter depending on subtask). NOTE: this runs
@@ -73,9 +76,17 @@ unless generation config matches: the paper's own eval (Section 4) uses
 semi-autoregressive sampling with gen_length=1024, block_length=64 for all
 generative benchmarks, while this script inherits run_correctness.py's CoT
 defaults (max_tokens=256, steps=128, block_length=32) -- smaller budget,
-different block size. Pass --max-tokens 1024 --block-length 64 (and a
-matching --steps) to align with the paper's setup if an exact comparison
-is needed; the defaults are tuned for faster iteration, not reproduction.
+different block size. block_length and steps are coupled (num_blocks =
+gen_length / block_length; steps_per_block = steps / num_blocks, how many
+denoising refinement passes each block gets) -- raising block_length
+without also raising --steps proportionally *reduces* steps_per_block and
+can hurt quality rather than help it. If aligning with the paper's setup,
+scale both together (e.g. --max-tokens 1024 --block-length 64 --steps 256
+preserves this file's default steps_per_block=16); don't copy gen_length/
+block_length alone. Also note gsm8k defaults to 5-shot now (see above),
+which narrows one likely source of the gap to the paper's number, but the
+paper doesn't state its own few-shot count/exemplars, so exact
+reproduction still isn't guaranteed.
 
 Usage:
     python eval/correctness/run_math_reasoning_code.py --task gsm8k    --limit 400 --output results/gsm8k.json
@@ -118,6 +129,56 @@ PAPER_REFERENCE_TABLE3 = {
     "cruxeval": 42.38,
 }
 
+# The canonical 5-shot GSM8K exemplar set from Wei et al., 2022 ("Chain-of-
+# Thought Prompting Elicits Reasoning in Large Language Models"), reused
+# as the de facto standard GSM8K few-shot set across the field (e.g.
+# lm-evaluation-harness's default gsm8k task). Drawn from the style of
+# GSM8K's own training distribution, not the test split evaluated here --
+# no leakage risk. Reformatted to end in "Final Answer: <number>" so the
+# model also learns our exact grading marker, not just the reasoning style.
+# Default is all 5; use --num-fewshot to change the count (0 = zero-shot,
+# for an ablation against this default).
+GSM8K_FEWSHOT_EXAMPLES = [
+    (
+        "Roger has 5 tennis balls. He buys 2 more cans of tennis balls. "
+        "Each can has 3 tennis balls. How many tennis balls does he have now?",
+        "Roger started with 5 balls. 2 cans of 3 tennis balls each is "
+        "2 x 3 = 6 tennis balls. 5 + 6 = 11.\nFinal Answer: 11",
+    ),
+    (
+        "A robe takes 2 bolts of blue fiber and half that much white fiber. "
+        "How many bolts in total does it take?",
+        "It takes 2 bolts of blue fiber. White fiber is half that much, "
+        "so 2 / 2 = 1 bolt. Total: 2 + 1 = 3.\nFinal Answer: 3",
+    ),
+    (
+        "Weng earns $12 an hour for babysitting. Yesterday, she just did "
+        "50 minutes of babysitting. How much did she earn?",
+        "Weng earns 12 / 60 = $0.2 per minute. Working 50 minutes, she "
+        "earned 0.2 x 50 = $10.\nFinal Answer: 10",
+    ),
+    (
+        "Betty is saving money for a new wallet which costs $100. Betty "
+        "has only half of the money she needs. Her parents decided to "
+        "give her $15 for that purpose, and her grandparents twice as "
+        "much as her parents. How much more money does Betty need to buy "
+        "the wallet?",
+        "Betty has 100 / 2 = $50. Her parents give her $15. Her "
+        "grandparents give her 15 x 2 = $30. In total Betty has "
+        "50 + 15 + 30 = $95. She still needs 100 - 95 = $5.\n"
+        "Final Answer: 5",
+    ),
+    (
+        "Julie is reading a 120-page book. Yesterday, she was able to "
+        "read 12 pages and today, she read twice as many pages as "
+        "yesterday. If she wants to read half of the remaining pages "
+        "tomorrow, how many pages should she read?",
+        "Today Julie read 12 x 2 = 24 pages. So far she has read "
+        "12 + 24 = 36 pages. She has 120 - 36 = 84 pages left. Half of "
+        "that is 84 / 2 = 42.\nFinal Answer: 42",
+    ),
+]
+
 # All 27 canonical BIG-Bench-Hard tasks (Suzgun et al., 2022).
 BBH_SUBTASKS = [
     "boolean_expressions", "causal_judgement", "date_understanding",
@@ -152,9 +213,18 @@ def _load_datasets_or_die():
         sys.exit(1)
 
 
-def _load_gsm8k(limit: int) -> list[TaskItem]:
+def _build_gsm8k_fewshot_prefix(num_fewshot: int) -> str:
+    if num_fewshot <= 0:
+        return ""
+    examples = GSM8K_FEWSHOT_EXAMPLES[:num_fewshot]
+    blocks = [f"Question: {q}\nAnswer: {a}" for q, a in examples]
+    return "\n\n".join(blocks) + "\n\n"
+
+
+def _load_gsm8k(limit: int, num_fewshot: int = 5) -> list[TaskItem]:
     load_dataset = _load_datasets_or_die()
     ds = load_dataset("gsm8k", "main")["test"]
+    prefix = _build_gsm8k_fewshot_prefix(num_fewshot)
 
     items = []
     for row in ds:
@@ -163,7 +233,7 @@ def _load_gsm8k(limit: int) -> list[TaskItem]:
             continue
         expected = answer_text.split("####")[-1].strip().replace(",", "")
         items.append(TaskItem(
-            prompt=row["question"].strip(),
+            prompt=f"{prefix}Question: {row['question'].strip()}\nAnswer:",
             expected=expected,
             subject="gsm8k",
         ))
@@ -228,10 +298,10 @@ def _load_cruxeval(limit: int) -> list[TaskItem]:
     return items
 
 
-def load_task(task: str, limit: int) -> tuple[list[TaskItem], str]:
-    """Returns (items, system_prompt)."""
+def load_task(task: str, limit: int, num_fewshot: int = 5) -> tuple[list[TaskItem], str]:
+    """Returns (items, system_prompt). num_fewshot only affects gsm8k."""
     if task == "gsm8k":
-        return _load_gsm8k(limit), SYSTEM_PROMPT_GSM8K
+        return _load_gsm8k(limit, num_fewshot), SYSTEM_PROMPT_GSM8K
     elif task == "bbh":
         return _load_bbh(None, limit), SYSTEM_PROMPT_BBH
     elif task.startswith("bbh_"):
@@ -493,6 +563,11 @@ def main():
         "--save-transcripts", default=None,
         help="Path to save full per-question transcripts as JSON. Not saved by default.",
     )
+    ap.add_argument(
+        "--num-fewshot", type=int, default=5,
+        help="Number of worked examples to prepend for gsm8k (0-5, default 5, "
+             "matching common GSM8K reporting convention). Ignored by bbh/cruxeval.",
+    )
     args = ap.parse_args()
 
     seed = args.seed if args.seed is not None else random.randint(0, 999_999)
@@ -504,10 +579,12 @@ def main():
     print(f"Limit      : {limit if limit else 'full dataset'}")
     print(f"Concurrent : {args.num_concurrent}")
     print(f"Max tokens : {args.max_tokens}  |  Steps: {args.steps}  |  Block length: {args.block_length}")
+    if args.task == "gsm8k":
+        print(f"Few-shot   : {args.num_fewshot}")
     print(f"Seed       : {seed}\n")
 
     print("Loading dataset...", flush=True)
-    items, system_prompt = load_task(args.task, limit)
+    items, system_prompt = load_task(args.task, limit, args.num_fewshot)
     print(f"Loaded {len(items)} questions.\n")
 
     grade_fn = grader_for(args.task)
