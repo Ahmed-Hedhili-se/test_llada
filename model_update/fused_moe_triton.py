@@ -140,6 +140,15 @@ def moe_align_block_size(topk_ids: torch.Tensor, block_size: int, num_experts: i
     Verified numerically identical to the exact-sized version for any
     input, up to the point where the real data ends (see
     eval/test_moe_align_block_size.py).
+
+    Note: expert_counts intentionally uses zeros().scatter_add_(), not
+    torch.bincount(), despite computing the exact same thing. Found on real
+    hardware (not something code inspection could have caught): bincount's
+    CUDA implementation raises "operation not permitted when stream is
+    capturing" inside torch.cuda.graph() -- it goes through an internal
+    library path with its own stream/allocation behavior that isn't
+    graph-capture-safe, unlike a plain scatter kernel. Every other op in
+    this function was checked against real capture and is fine.
     """
     num_tokens, top_k = topk_ids.shape
     device = topk_ids.device
@@ -149,7 +158,10 @@ def moe_align_block_size(topk_ids: torch.Tensor, block_size: int, num_experts: i
     sorted_indices = torch.argsort(flatten_ids, stable=True)
     sorted_expert_ids = flatten_ids[sorted_indices]
 
-    expert_counts = torch.bincount(sorted_expert_ids, minlength=num_experts)
+    expert_counts = torch.zeros(num_experts, dtype=torch.long, device=device)
+    expert_counts.scatter_add_(
+        0, sorted_expert_ids.long(), torch.ones_like(sorted_expert_ids, dtype=torch.long)
+    )
     padded_expert_counts = ((expert_counts + block_size - 1) // block_size) * block_size
 
     # Exclusive cumulative offsets (real and padded) per expert.
