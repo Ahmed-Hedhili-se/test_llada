@@ -182,6 +182,24 @@ def _batch_worker():
         _run_batch(batch)
 
 
+@app.on_event("startup")
+async def _raise_threadpool_limit():
+    """anyio's thread limiter can only be fetched/set from inside a running
+    event loop -- calling this synchronously in main() before uvicorn.run()
+    starts one raises anyio.NoEventLoopError. A FastAPI startup hook runs
+    after uvicorn's loop is live, so it works here. chat_completions() is a
+    sync `def`, so FastAPI/Starlette runs each request in a worker thread via
+    this threadpool; its default capacity (~40) can otherwise queue requests
+    before they even reach _batch_worker -- indistinguishable from batching
+    "not helping" unless raised explicitly for higher target concurrency
+    (e.g. 64)."""
+    from model_update.distributed import get_tp_size
+    if BACKEND == "fast_dense" and get_tp_size() == 1:
+        import anyio.to_thread
+        anyio.to_thread.current_default_thread_limiter().total_tokens = MAX_THREADPOOL_WORKERS
+        print(f"Raised ASGI threadpool capacity to {MAX_THREADPOOL_WORKERS}.")
+
+
 class Message(BaseModel):
     role: str
     content: str
@@ -447,15 +465,6 @@ def main():
         worker_loop()
     else:
         if args.backend == "fast_dense" and get_tp_size() == 1:
-            # chat_completions() is a sync `def`, so FastAPI/Starlette runs
-            # each request in a worker thread via anyio's threadpool, whose
-            # default capacity (~40) can otherwise queue requests before
-            # they even reach _batch_worker -- indistinguishable from
-            # batching "not helping" unless raised explicitly for higher
-            # target concurrency (e.g. 64).
-            import anyio.to_thread
-            anyio.to_thread.current_default_thread_limiter().total_tokens = MAX_THREADPOOL_WORKERS
-            print(f"Raised ASGI threadpool capacity to {MAX_THREADPOOL_WORKERS}.")
             print(f"Starting batch worker (max_size={BATCH_MAX_SIZE}, wait={BATCH_WAIT_S}s, "
                   f"poll={BATCH_POLL_INTERVAL_S}s)...")
             threading.Thread(target=_batch_worker, daemon=True).start()
