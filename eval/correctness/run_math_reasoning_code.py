@@ -153,6 +153,12 @@ PAPER_REFERENCE_TABLE3 = {
 # copied from any source -- see the module docstring's coupling note.
 GSM8K_GEN_DEFAULTS = {"max_tokens": 1024, "steps": 256, "block_length": 64}
 
+# BBH and CRUX-O use the same paper protocol (Section 4: "gen_length of 1024
+# and a block length of 64") instead of the short CoT default, for a
+# directly comparable config to Table 3's reported numbers.
+BBH_GEN_DEFAULTS = {"max_tokens": 1024, "steps": 256, "block_length": 64}
+CRUXEVAL_GEN_DEFAULTS = {"max_tokens": 1024, "steps": 256, "block_length": 64}
+
 # The exact 4-shot GSM8K exemplar set from inclusionAI/dInfer's
 # evaluations/tasks/gsm8k/gsm8k-llada-moe.yaml -- dInfer is Ant Group's own
 # inference framework for diffusion LMs, built specifically for LLaDA-MoE
@@ -659,17 +665,15 @@ def main():
     ap.add_argument("--config-name", default="", help="Label stored in the summary JSON.")
     ap.add_argument("--max-tokens", type=int, default=None,
                     help=f"Generation budget. Default: {GSM8K_GEN_DEFAULTS['max_tokens']} "
-                         f"for gsm8k (matches dInfer's gsm8k-llada-moe.yaml / the paper's "
-                         f"gen_length=1024), {DEFAULT_COT_MAX_TOKENS} otherwise.")
+                         f"for gsm8k/bbh/cruxeval (matches the paper's gen_length=1024 "
+                         f"protocol), {DEFAULT_COT_MAX_TOKENS} otherwise.")
     ap.add_argument("--steps", type=int, default=None,
                     help=f"Diffusion steps. Default: {GSM8K_GEN_DEFAULTS['steps']} for "
-                         f"gsm8k (preserves this file's steps_per_block density at "
-                         f"block_length=64 -- not from dInfer, which doesn't specify "
-                         f"this), {DEFAULT_COT_STEPS} otherwise.")
+                         f"gsm8k/bbh/cruxeval, {DEFAULT_COT_STEPS} otherwise.")
     ap.add_argument("--block-length", type=int, default=None,
                     help=f"Server-side block_length. Default: "
-                         f"{GSM8K_GEN_DEFAULTS['block_length']} for gsm8k (matches "
-                         f"dInfer / the paper), {DEFAULT_COT_BLOCK_LENGTH} otherwise.")
+                         f"{GSM8K_GEN_DEFAULTS['block_length']} for gsm8k/bbh/cruxeval "
+                         f"(matches the paper's protocol), {DEFAULT_COT_BLOCK_LENGTH} otherwise.")
     ap.add_argument(
         "--save-transcripts", default=None,
         help="Path to save full per-question transcripts as JSON. Not saved by default.",
@@ -696,9 +700,18 @@ def main():
     limit = args.limit if args.limit > 0 else 0
 
     if args.task == "gsm8k":
-        max_tokens = args.max_tokens if args.max_tokens is not None else GSM8K_GEN_DEFAULTS["max_tokens"]
-        steps = args.steps if args.steps is not None else GSM8K_GEN_DEFAULTS["steps"]
-        block_length = args.block_length if args.block_length is not None else GSM8K_GEN_DEFAULTS["block_length"]
+        defaults = GSM8K_GEN_DEFAULTS
+    elif args.task == "bbh" or args.task.startswith("bbh_"):
+        defaults = BBH_GEN_DEFAULTS
+    elif args.task == "cruxeval":
+        defaults = CRUXEVAL_GEN_DEFAULTS
+    else:
+        defaults = None
+
+    if defaults is not None:
+        max_tokens = args.max_tokens if args.max_tokens is not None else defaults["max_tokens"]
+        steps = args.steps if args.steps is not None else defaults["steps"]
+        block_length = args.block_length if args.block_length is not None else defaults["block_length"]
     else:
         max_tokens = args.max_tokens if args.max_tokens is not None else DEFAULT_COT_MAX_TOKENS
         steps = args.steps if args.steps is not None else DEFAULT_COT_STEPS

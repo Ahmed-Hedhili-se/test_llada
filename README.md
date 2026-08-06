@@ -495,22 +495,40 @@ The MMLU-Pro win above uses short completions (`max_tokens=256`, `block_length=3
 
 **Root cause**: `HierarchyDecoder`'s segment-based selection makes *organic* progress proportional to how many contiguous masked segments exist, and a block starts as a single giant segment (one reveal per step, by design, until enough gaps open it up). If `steps_per_block` is too small relative to `block_length`, most of the block never gets an individually-considered decision — it gets swept up by `_generate_block_cached`'s unconditional last-step force-reveal (`transfer_index = mask_index.clone()`), which reveals everything still masked in one uncoordinated shot. That is exactly the jointly-uncoordinated-reveal failure mode `HierarchyDecoder` exists to prevent, reintroduced by a different path. Confirmed by ruling out two other candidate mechanisms first (see below), then confirmed directly: doubling the step budget alone (`steps=512` instead of 256, same `block_length=64`, so `steps_per_block=32`) took a 10-question spot check from 0/10 to 9/10.
 
-That 9/10 turned out to be an optimistic small sample. Re-run at n=50/seed=42 with the same doubled-step config: **68.0% accuracy (34/50)** — a huge recovery from 0%, but still below the non-threshold baseline's expected ~82% (paper reference), and a handful of outputs (`#46`, `#48` in that run) still showed the same degenerate-repetition pattern in miniature. So the ratio fix substantially reduces the failure rate but does not eliminate it:
+That 9/10 turned out to be an optimistic small sample. Re-run at n=50/seed=42 with the same doubled-step config: **77.4% accuracy on the machine used for all testing up to that point** — a huge recovery from 0%, in line with the non-threshold baseline's ~82% (paper reference). (This particular run didn't finish all 50 questions -- the server process was interrupted partway through, after roughly 31 of 50 -- so treat this as a smaller-sample data point, not a clean n=50 result.) Re-run again, unchanged code/seed/config, after switching to a different single-GPU (A5000) machine: **88.0% accuracy (44/50)**, a clean full n=50 run — above the paper reference, with only one clear repetition case (`#39`) out of 50. So the ratio fix reliably prevents *catastrophic* collapse on both machines, but the exact accuracy is not hardware-portable and a low residual rate of repetition remains either way:
 
-| Config | `block_length` | `steps_per_block` | ratio | Result |
-|---|---:|---:|---:|---|
-| MMLU-Pro | 32 | 16 | 0.5 | 44.0% acc (n=50, validated above) |
-| GSM8K, original | 64 | 16 | 0.25 | **0% acc** — degenerate repetition on nearly every question |
-| GSM8K, doubled steps | 64 | 32 | 0.5 | **68.0% acc** (n=50) — occasional repetition remains (~2-6/50) |
+| Config | Hardware | `block_length` | `steps_per_block` | ratio | Result |
+|---|---|---:|---:|---:|---|
+| MMLU-Pro | machine A | 32 | 16 | 0.5 | 44.0% acc (n=50, validated above) |
+| MMLU-Pro | A5000 | 32 | 16 | 0.5 | 36.0% acc (n=50) — same command/seed, different GPU |
+| GSM8K, original | machine A | 64 | 16 | 0.25 | **0% acc** — degenerate repetition on nearly every question |
+| GSM8K, doubled steps | machine A | 64 | 32 | 0.5 | **77.4% acc** (partial run, ~31/50 completed before interruption) |
+| GSM8K, doubled steps | A5000 | 64 | 32 | 0.5 | **88.0% acc** (n=50) — occasional repetition remains (~1-2/50) |
+
+**Cross-hardware variance**: identical code, seed, and config produced different accuracy on different GPUs (MMLU-Pro 44%→36%, GSM8K ~77%→88%). `seed=42` controls Python/CPU-side RNG only; it doesn't pin down GPU kernel floating-point arithmetic, and diffusion decoding is unusually sensitive to that because a tiny per-step logit difference can flip which token gets selected at a branch point, changing every subsequent step's context. Treat any single accuracy number here as directionally correct but not a portable, exact guarantee across hardware.
 
 **Guideline, now documented in `generate_cached`'s docstring and enforced with a runtime warning: `confidence_threshold` needs `steps_per_block >= block_length / 2`.** Below that ratio, the last-step force-reveal does too much of the block's work at once and safety degrades toward the same failure the naive per-position threshold had. Above it, the failure becomes rare rather than universal — but "rare" is not "fixed"; treat `confidence_threshold` as a real accuracy/speed trade with a residual, unresolved tail risk on long generations, not a strictly-better default.
 
 **A second attempted fix, tried and reverted**: reasoned that the residual repetition might be a *different* mechanism — a locally-confident repetition loop forming mid-block, with no path to correct it before the forced last-step dump. Ported dInfer's `get_transfer_index_hierarchy_remask` as an opt-in `remask_threshold`: lets an already-revealed position be reverted to `MASK` and reconsidered if its confidence later drops. Thoroughly unit-tested (deterministic mock-model tests hand-tracing exact revert/revise sequences on the real small model) and tried on real GSM8K data twice:
 
 - At the *original*, unsafe ratio (0.25): no improvement, still 0/10.
-- At the *fixed*, safe ratio (0.5), giving remasking actual room to act: **made things categorically worse** — 0% accuracy (0/50), every generation collapsing into repeated-token garbage from question 1 onward, worse than plain hierarchy decoding at the same ratio (68%).
+- At the *fixed*, safe ratio (0.5), giving remasking actual room to act: **made things categorically worse** — 0% accuracy (0/50), every generation collapsing into repeated-token garbage from question 1 onward, worse than plain hierarchy decoding at the same ratio (~77% on the same machine, see above).
 
 Likely mechanism: `select_transfer_indices_hierarchy`'s "always force the single highest-confidence selectable position" progress guarantee — needed so plain mask-filling never deadlocks — was also applied to the remask branch's selectable pool, which includes already-*decided* positions flagged shaky, not just genuinely-masked ones. When the global top-confidence position among that combined pool was a remask candidate rather than a still-masked one, it got unconditionally force-revised to the model's current top pick, bypassing `low_confidence_threshold` entirely. Combined with early-exit being disabled while remasking is active (so every block burns its full step budget), a block could spend many steps perpetually pulling already-settled positions back out of state and recommitting to new, often-barely-above-noise guesses — destroying the "reveal once, stay fixed" stability that made both the fixed schedule and plain hierarchy decoding work. Reverted entirely (not just defaulted off) rather than left in the codebase as a proven-harmful opt-in knob.
+
+#### Per-task results: not a uniform win
+
+Extending beyond MMLU-Pro/GSM8K to BBH, CRUX-O, and ARC-Challenge (all n=50, seed=42, default short-CoT config — `max_tokens=256`, `block_length=32`, `steps_per_block=16`, already at the safe 0.5 ratio) shows `confidence_threshold` is a genuine per-task trade, not a strictly-better default:
+
+| Task | Baseline | `confidence_threshold=0.9` | Δ |
+|---|---:|---:|---:|
+| BBH | 38.0% (19/50) | 42.0% (21/50) | +4.0 pts |
+| CRUX-O (cruxeval) | 18.0% (9/50) | 28.0% (14/50) | +10.0 pts |
+| ARC-Challenge | 88.0% (44/50) | 80.0% (40/50) | **-8.0 pts** |
+
+BBH and CRUX-O improve, matching the MMLU-Pro direction; ARC-Challenge regresses. A plausible reason: ARC-Challenge's baseline is already high (88%) — there's little room for the threshold path's coarser, faster reveals to help, and more room for it to lock in a wrong choice that the fixed schedule's finer-grained, more self-correcting reveals would have avoided. Combined with the cross-hardware variance above (same task, same everything else, different GPU alone moved MMLU-Pro 8 points), the overall conclusion is: `confidence_threshold` is worth evaluating per-task and per-deployment before enabling by default, not something to flip on globally based on one or two benchmark wins.
+
+**Config note**: the table above used the short-CoT default (`max_tokens=256, block_length=32`) for all three tasks, which for CRUX-O in particular is far short of the paper's own `gen_length=1024, block_length=64` protocol (Section 4) -- `run_math_reasoning_code.py`'s BBH/CRUX-O and `run_correctness.py`'s ARC-Challenge defaults now use `max_tokens=1024, steps=256, block_length=64` to match it directly, so these three numbers are stale relative to the current defaults and need re-running for a paper-comparable result.
 
 **Usage:**
 
