@@ -9,6 +9,8 @@ low-confidence remasking, block restriction), but:
     purely to compute correct K/V to push into the cache
 """
 
+from typing import Optional
+
 import torch
 import torch.nn.functional as F
 
@@ -72,6 +74,97 @@ def select_transfer_indices(confidence: torch.Tensor, num_transfer_step: torch.T
     return transfer_index
 
 
+def select_transfer_indices_hierarchy(
+    confidence: torch.Tensor,
+    threshold: Optional[float] = None,
+    low_threshold: Optional[float] = 0.4,
+) -> torch.Tensor:
+    """
+    Ported from dInfer's HierarchyDecoder (inclusionAI/dInfer,
+    python/dinfer/decoding/parallel_strategy.py -- the same project's
+    gsm8k-llada-moe.yaml eval config this project's GSM8K/BBH/CRUX-O harness
+    already aligned to elsewhere). "Force separate decisions" instead of a
+    plain per-position threshold: an earlier, simpler threshold-only
+    implementation here (select_transfer_indices_threshold, reverted -- see
+    git history) revealed every position independently clearing a threshold
+    in one step, which caused a real ~33% relative MMLU-Pro accuracy drop
+    (36.0%->24.0%, n=50) -- locally-confident-but-jointly-uncoordinated
+    reveals, with no chance for the model to reconsider before the next
+    step, corrupted CoT reasoning chains. This is dInfer's own fix for
+    exactly that failure mode.
+
+    Three-part selection, unioned together:
+      1. At most ONE position per contiguous run of currently-selectable
+         positions (a "segment") -- specifically, that segment's highest-
+         confidence position. Instead of every qualifying position across
+         the whole block, at most one reveal per locally-correlated span
+         per step, forcing separate, sequential decisions about spans that
+         are far enough apart to be genuinely independent, rather than a
+         free-for-all across the whole block.
+      2. Segment picks are floored by low_threshold -- a segment's pick
+         doesn't count if even its best position isn't reasonably
+         confident (default 0.4, matching dInfer's HierarchyDecoder default).
+      3. Positions independently clearing `threshold` are unioned in
+         regardless of the segment/low_threshold gating (still lets a
+         genuinely highly-confident position skip ahead of its segment
+         peers), and the single globally highest-confidence position is
+         always included unconditionally -- guarantees at least one token
+         transfers per row per step whenever that row has any selectable
+         position left, the same progress guarantee
+         select_transfer_indices_threshold's fallback provided, just
+         applied unconditionally here (matching dInfer's own reference)
+         rather than only when nothing else qualified.
+
+    Fully vectorized: segment IDs via a cumsum over segment-start markers,
+    per-segment max via scatter_reduce(reduce="amax") -- no Python loop, no
+    host sync. dInfer's own reference implementation of this exact
+    algorithm asserts batch size 1; the segment-id/scatter_reduce operations
+    here are already independent along dim=1 (verified by inspection: every
+    op either broadcasts per-row or scatters within dim=1 using a per-row
+    index tensor), so this generalizes to any batch size without changing
+    the per-row result.
+
+    confidence: [B, T] float, -inf at positions that must not be selected
+    (already-revealed, outside the active block, or -- for a row with no
+    selectable position left at all, e.g. already fully done in a batched
+    call where other rows aren't -- every position in that row).
+    Returns: [B, T] bool mask.
+    """
+    B, L = confidence.shape
+    device = confidence.device
+    neg_inf_val = torch.finfo(confidence.dtype).min
+
+    selectable = torch.isfinite(confidence)
+
+    prev = torch.cat([selectable.new_zeros((B, 1)), selectable[:, :-1]], dim=1)
+    starts = selectable & ~prev
+    seg_id = torch.cumsum(starts.to(torch.int64), dim=-1) - 1
+    seg_id = torch.where(selectable, seg_id, torch.zeros_like(seg_id))
+
+    seg_max = torch.full((B, L), neg_inf_val, device=device, dtype=confidence.dtype)
+    seg_max = torch.scatter_reduce(seg_max, dim=1, index=seg_id, src=confidence, reduce="amax", include_self=True)
+    seg_max_at_pos = seg_max.gather(dim=1, index=seg_id)
+    transfer_index = selectable & (confidence == seg_max_at_pos)
+
+    if low_threshold is not None:
+        transfer_index = transfer_index & (confidence > low_threshold)
+
+    if threshold is not None:
+        transfer_index = transfer_index | (confidence > threshold)
+
+    # Always include the single globally highest-confidence position per
+    # row (unconditionally, matching dInfer's HierarchyDecoder) -- but only
+    # for rows that actually have a selectable position left, since a row
+    # already fully done (every position -inf) must select nothing.
+    has_candidate = selectable.any(dim=-1)
+    if has_candidate.any():
+        top1_idx = confidence.argmax(dim=-1)
+        row_idx = torch.nonzero(has_candidate, as_tuple=True)[0]
+        transfer_index[row_idx, top1_idx[row_idx]] = True
+
+    return transfer_index
+
+
 def _generate_block_cached(
     model,
     x: torch.Tensor,
@@ -81,18 +174,47 @@ def _generate_block_cached(
     cache_buffer: KVCacheBuffer,
     temperature: float,
     remasking: str,
+    confidence_threshold: Optional[float] = None,
+    low_confidence_threshold: Optional[float] = 0.4,
 ):
+    """
+    confidence_threshold: opt-in hierarchical threshold-based token
+    selection (select_transfer_indices_hierarchy, ported from dInfer's
+    HierarchyDecoder) instead of the default fixed per-step reveal count
+    (select_transfer_indices). None (default) preserves the exact original
+    behavior byte-for-byte -- the early-exit check below never triggers for
+    the fixed schedule (it spreads reveals evenly across every allotted
+    step by construction, so mask_index can only become all-False on the
+    very last iteration, which is where the loop would end anyway), so
+    existing callers are unaffected either way.
+
+    low_confidence_threshold: floor applied to hierarchy decoding's
+    per-segment picks (see select_transfer_indices_hierarchy). Ignored
+    when confidence_threshold is None.
+
+    When a threshold is given, a block CAN finish in fewer than
+    steps_per_block forward passes (the loop exits the instant every row's
+    block is already fully unmasked), but never in more: the last allowed
+    iteration always force-reveals any remaining masked positions
+    regardless of confidence, guaranteeing the block is never left with
+    leftover MASK tokens and the step-count ceiling from `steps` is never
+    exceeded, no matter how the threshold behaved on earlier steps.
+    """
     block_length = block_end - block_start
     device = x.device
 
     block_mask_index = (x[:, block_start:block_end] == MASK_ID)
-    num_transfer = get_num_transfer_tokens(block_mask_index, steps_per_block)
+    num_transfer = None
+    if confidence_threshold is None:
+        num_transfer = get_num_transfer_tokens(block_mask_index, steps_per_block)
 
     for step in range(steps_per_block):
-        suffix_ids = x[:, block_start:]
         active_ids = x[:, block_start:block_end]
         mask_index = (active_ids == MASK_ID)
+        if not mask_index.any():
+            break  # every row's block already fully unmasked -- no forward call needed
 
+        suffix_ids = x[:, block_start:]
         suffix_logits, _ = model(
             suffix_ids,
             position_offset=block_start,
@@ -115,7 +237,15 @@ def _generate_block_cached(
         x0 = torch.where(mask_index, x0, active_ids)
         confidence = torch.where(mask_index, x0_p, torch.full_like(x0_p, -torch.inf))
 
-        transfer_index = select_transfer_indices(confidence, num_transfer[:, step])
+        if confidence_threshold is not None:
+            if step == steps_per_block - 1:
+                transfer_index = mask_index.clone()  # last chance -- force full completion
+            else:
+                transfer_index = select_transfer_indices_hierarchy(
+                    confidence, threshold=confidence_threshold, low_threshold=low_confidence_threshold,
+                )
+        else:
+            transfer_index = select_transfer_indices(confidence, num_transfer[:, step])
 
         active_ids = active_ids.clone()
         active_ids[transfer_index] = x0[transfer_index]
@@ -150,11 +280,23 @@ def generate_cached(
     block_length: int = 128,
     temperature: float = 0.0,
     remasking: str = "low_confidence",
+    confidence_threshold: Optional[float] = None,
+    low_confidence_threshold: Optional[float] = 0.4,
 ) -> torch.Tensor:
     """
     Same signature/semantics as generate.generate(), minus cfg_scale
     (CFG doubles the batch and complicates cache bookkeeping; add back
     once single-sequence caching is verified correct).
+
+    confidence_threshold: opt-in hierarchical threshold-based decoding
+    (select_transfer_indices_hierarchy, ported from dInfer's
+    HierarchyDecoder -- see its docstring for why this replaced an earlier,
+    simpler, reverted threshold implementation) instead of the default
+    fixed-per-step reveal schedule. None (default) preserves the exact
+    original behavior. `steps` is still an exact ceiling either way: this
+    can only make a block finish in FEWER forward passes, never more.
+    low_confidence_threshold: floor applied to hierarchy decoding's
+    per-segment picks (ignored when confidence_threshold is None).
     """
     assert gen_length % block_length == 0, "gen_length must be divisible by block_length"
     num_blocks = gen_length // block_length
@@ -202,6 +344,8 @@ def generate_cached(
             cache_buffer=cache_buffer,
             temperature=temperature,
             remasking=remasking,
+            confidence_threshold=confidence_threshold,
+            low_confidence_threshold=low_confidence_threshold,
         )
 
     return x[:, P:]
