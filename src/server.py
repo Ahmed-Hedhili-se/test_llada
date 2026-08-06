@@ -73,12 +73,10 @@ request_lock = threading.Lock()
 # mismatched requests simply go in separate batches rather than being forced
 # together.
 #
-# Known limitation carried over from generate.py, not introduced here: the
-# per-batch-row confidence top-k loop in _generate_block_cached calls
-# `.item()` once per row per step -- B=8 batching means 8x the host syncs of
-# B=1, the same class of cost eval/test_moe_align_block_size.py's vectorization
-# eliminated for MoE routing. Not fixed here; worth revisiting if profiling
-# shows it eating into batching's win.
+# The per-batch-row confidence top-k selection in generate.py's
+# select_transfer_indices() was vectorized to a single `.item()` per step
+# (not per row) as a separate fix earlier -- batching does not multiply that
+# cost with B, so it is not a concern for this batching path.
 
 BATCH_MAX_SIZE = int(os.environ.get("BATCH_MAX_SIZE", 8))
 BATCH_WAIT_S = float(os.environ.get("BATCH_WAIT_S", 0.05))
