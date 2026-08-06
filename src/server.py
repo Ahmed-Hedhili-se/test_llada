@@ -154,14 +154,27 @@ PROFILE_BATCHES = os.environ.get("PROFILE_BATCHES", "0") == "1"
 PROFILE_DIR = os.environ.get("PROFILE_DIR", "traces")
 
 
+_last_batch_end_time: Optional[float] = None  # only _run_batch touches this -- single executor thread, no lock needed
+
+
 def _run_batch(batch: list["_PendingRequest"]):
+    global _last_batch_end_time
     if not batch:
         return
     # Visibility into what's actually forming -- this was the open question
     # from the concurrency investigation: does the collection window really
     # produce batches near BATCH_MAX_SIZE, or fall back to 1-2 under GIL
     # contention? No way to know without this line.
-    print(f"[batch] size={len(batch)} key={batch[0].key}", flush=True)
+    #
+    # gap_since_prev: the direct measurement of what the collector/executor
+    # split (see _batch_collector's docstring) is meant to eliminate -- dead
+    # time between one batch finishing and the next starting. Near-zero means
+    # the next batch was already fully formed and ready the instant the GPU
+    # freed up; a large gap means either genuinely no traffic was waiting, or
+    # the pipelining isn't working as intended.
+    now = time.monotonic()
+    gap_str = f"{now - _last_batch_end_time:.3f}s" if _last_batch_end_time is not None else "n/a (first batch)"
+    print(f"[batch] size={len(batch)} key={batch[0].key} gap_since_prev_batch_end={gap_str}", flush=True)
     try:
         from model_update.generate import generate_cached
         input_ids = torch.cat([r.input_ids for r in batch], dim=0)
@@ -211,6 +224,7 @@ def _run_batch(batch: list["_PendingRequest"]):
     finally:
         for req in batch:
             req.event.set()
+        _last_batch_end_time = time.monotonic()
 
 
 def _batch_collector():
