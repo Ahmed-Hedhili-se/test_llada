@@ -15,6 +15,7 @@ Usage:
 
 import argparse
 import os
+import queue
 import sys
 import time
 import uuid
@@ -88,6 +89,31 @@ request_lock = threading.Lock()
 # sequential batch rounds for 128 concurrent requests, so most requests sit
 # queued behind earlier rounds; 64 needs only 2 rounds, so most requests
 # start almost immediately.
+#
+# Collector/executor split, not a single worker: the original single-thread
+# design called generate_cached() (via _run_batch) directly inside the same
+# loop that collects requests -- so while one batch was generating (tens of
+# seconds at production gen_length), a request arriving mid-batch got zero
+# collection progress: it sat untouched in _pending_queue until the *entire*
+# current batch finished, THEN had to wait out its own fresh BATCH_WAIT_S
+# window on top of that. _batch_collector now only forms batches and hands
+# each one to _ready_batches (a queue.Queue); _batch_executor is the sole
+# consumer, the only thread that ever calls generate_cached(), so GPU work
+# still runs strictly one batch at a time -- no change to generation
+# semantics or single-GPU serialization. What changes is that the collector
+# keeps accumulating and forming the *next* batch the entire time the
+# executor is busy with the current one, so as soon as the executor finishes,
+# the next batch is usually already fully formed and starts immediately,
+# instead of paying a fresh collection window on top of the wait.
+# True mid-generation admission (splicing a new request into an
+# already-running batch, freeing a row the moment ITS block finishes rather
+# than waiting for the whole batch) is a materially bigger change -- it needs
+# per-row early-exit decoding first (this project uses a fixed, uniform
+# step schedule per block today, so rows never finish at different times to
+# begin with) plus restructuring _generate_block_cached to support a
+# dynamically resized batch tensor mid-loop. Deliberately out of scope here;
+# this fix only removes the dead time between batches, which is real and
+# unconditional regardless of the decoding algorithm.
 
 BATCH_MAX_SIZE = int(os.environ.get("BATCH_MAX_SIZE", 64))
 BATCH_WAIT_S = float(os.environ.get("BATCH_WAIT_S", 0.05))
@@ -115,6 +141,13 @@ class _PendingRequest:
 _pending_lock = threading.Lock()
 _pending_queue: list["_PendingRequest"] = []
 _new_request_event = threading.Event()
+
+# Formed batches waiting for _batch_executor (the sole GPU-generation
+# consumer) to get to them. Unbounded, same as _pending_queue always was --
+# in practice bounded anyway by MAX_THREADPOOL_WORKERS (a request can't even
+# be collected until its HTTP handler is running), so at most a couple of
+# BATCH_MAX_SIZE-sized batches can ever be queued here at once.
+_ready_batches: "queue.Queue[list[_PendingRequest]]" = queue.Queue()
 
 
 PROFILE_BATCHES = os.environ.get("PROFILE_BATCHES", "0") == "1"
@@ -180,9 +213,10 @@ def _run_batch(batch: list["_PendingRequest"]):
             req.event.set()
 
 
-def _batch_worker():
+def _batch_collector():
     """Runs on a dedicated background thread, started once at server startup
-    (see main()).
+    (see main()). Forms batches only -- never calls generate_cached() itself,
+    that's _batch_executor's job (see its docstring for why they're split).
 
     Early-exit polling, not a fixed sleep-then-check: once the first request
     of a new group arrives, poll every BATCH_POLL_INTERVAL_S for either (a)
@@ -220,6 +254,24 @@ def _batch_worker():
                     # the remainder rather than waiting for a new arrival.
                     break
             time.sleep(BATCH_POLL_INTERVAL_S)
+        if batch:
+            _ready_batches.put(batch)
+        # Loop straight back to collecting the next group -- does NOT wait
+        # for _batch_executor to consume this one. That's the whole point:
+        # collection and GPU execution now overlap instead of alternating.
+
+
+def _batch_executor():
+    """Runs on a dedicated background thread, started once at server startup
+    (see main()). The ONLY thread that ever calls _run_batch()/generate_cached()
+    -- pulling one fully-formed batch at a time off _ready_batches and running
+    it to completion before pulling the next. This preserves exactly the same
+    single-GPU serialization as before (one generation in flight at a time);
+    what's different is that _batch_collector is free to keep forming the
+    NEXT batch the whole time this thread is busy with the current one, so
+    there's usually no gap between one batch finishing and the next starting."""
+    while True:
+        batch = _ready_batches.get()
         _run_batch(batch)
 
 
@@ -231,7 +283,7 @@ async def _raise_threadpool_limit():
     after uvicorn's loop is live, so it works here. chat_completions() is a
     sync `def`, so FastAPI/Starlette runs each request in a worker thread via
     this threadpool; its default capacity (~40) can otherwise queue requests
-    before they even reach _batch_worker -- indistinguishable from batching
+    before they even reach _batch_collector -- indistinguishable from batching
     "not helping" unless raised explicitly for higher target concurrency
     (e.g. 64)."""
     from model_update.distributed import get_tp_size
@@ -506,9 +558,10 @@ def main():
         worker_loop()
     else:
         if args.backend == "fast_dense" and get_tp_size() == 1:
-            print(f"Starting batch worker (max_size={BATCH_MAX_SIZE}, wait={BATCH_WAIT_S}s, "
-                  f"poll={BATCH_POLL_INTERVAL_S}s)...")
-            threading.Thread(target=_batch_worker, daemon=True).start()
+            print(f"Starting batch collector + executor (max_size={BATCH_MAX_SIZE}, "
+                  f"wait={BATCH_WAIT_S}s, poll={BATCH_POLL_INTERVAL_S}s)...")
+            threading.Thread(target=_batch_collector, daemon=True).start()
+            threading.Thread(target=_batch_executor, daemon=True).start()
         uvicorn.run(app, host=args.host, port=args.port)
 
 
