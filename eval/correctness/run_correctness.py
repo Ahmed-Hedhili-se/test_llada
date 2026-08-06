@@ -535,12 +535,6 @@ def main():
     ap.add_argument("--low-confidence-threshold", type=float, default=0.4,
                     help="Floor applied to hierarchy decoding's per-segment picks. Ignored "
                          "unless --confidence-threshold is set.")
-    ap.add_argument("--remask-threshold", type=float, default=None,
-                    help="Opt-in, ported from dInfer's get_transfer_index_hierarchy_remask -- "
-                         "lets an already-revealed position be reverted to MASK and "
-                         "reconsidered if its confidence drops on a later step. Requires "
-                         "--confidence-threshold to also be set. Fixes a real degenerate-"
-                         "repetition failure mode found on long generations (see README).")
     ap.add_argument(
         "--save-transcripts", default=None,
         help=(
@@ -573,8 +567,7 @@ def main():
     print(f"Concurrent : {args.num_concurrent}")
     print(f"Prompting  : {'chain-of-thought' if cot else 'direct (bare letter)'}")
     print(f"Max tokens : {max_tokens}  |  Steps: {steps}  |  Block length: {args.block_length}")
-    print(f"Confidence threshold: {args.confidence_threshold} (low={args.low_confidence_threshold}, "
-          f"remask={args.remask_threshold})")
+    print(f"Confidence threshold: {args.confidence_threshold} (low={args.low_confidence_threshold})")
     print(f"Seed       : {seed}\n")
 
     print("Loading dataset...", flush=True)
@@ -585,8 +578,6 @@ def main():
     if args.confidence_threshold is not None:
         gen_config["confidence_threshold"] = args.confidence_threshold
         gen_config["low_confidence_threshold"] = args.low_confidence_threshold
-        if args.remask_threshold is not None:
-            gen_config["remask_threshold"] = args.remask_threshold
 
     t0    = time.time()
     stats = evaluate(
