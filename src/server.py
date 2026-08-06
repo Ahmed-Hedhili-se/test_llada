@@ -124,7 +124,7 @@ MAX_THREADPOOL_WORKERS = int(os.environ.get("MAX_THREADPOOL_WORKERS", 128))
 
 class _PendingRequest:
     def __init__(self, input_ids, gen_length, steps, block_length, temperature,
-                 confidence_threshold=None, low_confidence_threshold=0.4):
+                 confidence_threshold=None, low_confidence_threshold=0.4, remask_threshold=None):
         self.input_ids = input_ids
         self.gen_length = gen_length
         self.steps = steps
@@ -132,19 +132,20 @@ class _PendingRequest:
         self.temperature = temperature
         self.confidence_threshold = confidence_threshold
         self.low_confidence_threshold = low_confidence_threshold
+        self.remask_threshold = remask_threshold
         self.event = threading.Event()
         self.result = None
         self.error = None
 
     @property
     def key(self):
-        # confidence_threshold/low_confidence_threshold included: requests
-        # must share the exact same generation config to be batched into
-        # one generate_cached() call, same reasoning as
+        # confidence_threshold/low_confidence_threshold/remask_threshold
+        # included: requests must share the exact same generation config to
+        # be batched into one generate_cached() call, same reasoning as
         # gen_length/steps/block_length already being here.
         return (
             self.gen_length, self.steps, self.block_length, self.input_ids.shape[1],
-            self.confidence_threshold, self.low_confidence_threshold,
+            self.confidence_threshold, self.low_confidence_threshold, self.remask_threshold,
         )
 
 
@@ -196,6 +197,7 @@ def _run_batch(batch: list["_PendingRequest"]):
             temperature=first.temperature,
             confidence_threshold=first.confidence_threshold,
             low_confidence_threshold=first.low_confidence_threshold,
+            remask_threshold=first.remask_threshold,
         )
         if PROFILE_BATCHES:
             # Chrome/Perfetto trace JSON -- shows actual GPU busy vs idle
@@ -345,6 +347,13 @@ class ChatRequest(BaseModel):
     # _PendingRequest).
     confidence_threshold: Optional[float] = None
     low_confidence_threshold: float = 0.4
+    # Opt-in, ported from dInfer's get_transfer_index_hierarchy_remask --
+    # lets an already-revealed position be reverted to MASK and
+    # reconsidered if its confidence drops on a later step. Requires
+    # confidence_threshold to also be set. Fixes a real degenerate-
+    # repetition failure mode found in plain hierarchy decoding on long
+    # generations (GSM8K, 1024 tokens) -- see README.
+    remask_threshold: Optional[float] = None
 
 
 @app.get("/health")
@@ -413,6 +422,7 @@ def chat_completions(req: ChatRequest):
             input_ids, gen_length, steps, block_length, req.temperature,
             confidence_threshold=req.confidence_threshold,
             low_confidence_threshold=req.low_confidence_threshold,
+            remask_threshold=req.remask_threshold,
         )
         with _pending_lock:
             _pending_queue.append(pending)

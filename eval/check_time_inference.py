@@ -142,13 +142,15 @@ def baseline_generate(model, prompt_ids, gen_length, steps, block_length):
 
 
 def optimized_generate(model, prompt_ids, gen_length, steps, block_length,
-                        confidence_threshold=None, low_confidence_threshold=0.4):
+                        confidence_threshold=None, low_confidence_threshold=0.4,
+                        remask_threshold=None):
     """Generation with block-wise KV cache, fused MoE, static top-8 experts."""
     from model_update.generate import generate_cached
     return generate_cached(
         model, prompt_ids, gen_length, steps, block_length,
         confidence_threshold=confidence_threshold,
         low_confidence_threshold=low_confidence_threshold,
+        remask_threshold=remask_threshold,
     )
 
 
@@ -207,6 +209,14 @@ def main():
                          "select_transfer_indices_hierarchy). Ignored unless "
                          "--confidence-threshold is set. Default matches dInfer's "
                          "HierarchyDecoder default.")
+    ap.add_argument("--remask-threshold", type=float, default=None,
+                    help="Opt-in, ported from dInfer's get_transfer_index_hierarchy_remask -- "
+                         "lets an already-revealed position be reverted to MASK and "
+                         "reconsidered if its confidence drops on a later step, instead of "
+                         "every reveal being permanent. Requires --confidence-threshold to "
+                         "also be set. Fixes a real degenerate-repetition failure mode found "
+                         "in plain hierarchy decoding on long generations (GSM8K, 1024 "
+                         "tokens) -- see README. Default None (disabled).")
     args = ap.parse_args()
 
     if args.batch_size > 1 and args.mode in ["both", "baseline"]:
@@ -241,7 +251,8 @@ def main():
         print(f"  Warmup Runs      : {args.num_warmup}")
         print(f"  Benchmark Runs   : {args.num_runs}")
         print(f"  Batch Size       : {args.batch_size}")
-        print(f"  Confidence Thresh: {args.confidence_threshold} (low={args.low_confidence_threshold})")
+        print(f"  Confidence Thresh: {args.confidence_threshold} (low={args.low_confidence_threshold}, "
+              f"remask={args.remask_threshold})")
         print("=" * 80 + "\n")
 
     if not os.path.isdir(args.weight_dir):
@@ -310,6 +321,7 @@ def main():
             opt_model, prompt_ids, args.gen_length, args.steps, args.block_length,
             confidence_threshold=args.confidence_threshold,
             low_confidence_threshold=args.low_confidence_threshold,
+            remask_threshold=args.remask_threshold,
         )[0].cpu()
 
         opt_lats = benchmark(
@@ -317,6 +329,7 @@ def main():
                 opt_model, prompt_ids, args.gen_length, args.steps, args.block_length,
                 confidence_threshold=args.confidence_threshold,
                 low_confidence_threshold=args.low_confidence_threshold,
+                remask_threshold=args.remask_threshold,
             ),
             args.device, args.num_warmup, args.num_runs,
         )

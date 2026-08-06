@@ -176,6 +176,7 @@ def _generate_block_cached(
     remasking: str,
     confidence_threshold: Optional[float] = None,
     low_confidence_threshold: Optional[float] = 0.4,
+    remask_threshold: Optional[float] = None,
 ):
     """
     confidence_threshold: opt-in hierarchical threshold-based token
@@ -192,16 +193,67 @@ def _generate_block_cached(
     per-segment picks (see select_transfer_indices_hierarchy). Ignored
     when confidence_threshold is None.
 
-    When a threshold is given, a block CAN finish in fewer than
-    steps_per_block forward passes (the loop exits the instant every row's
-    block is already fully unmasked), but never in more: the last allowed
-    iteration always force-reveals any remaining masked positions
-    regardless of confidence, guaranteeing the block is never left with
-    leftover MASK tokens and the step-count ceiling from `steps` is never
-    exceeded, no matter how the threshold behaved on earlier steps.
+    remask_threshold: opt-in, ported from dInfer's
+    get_transfer_index_hierarchy_remask -- lets an already-revealed
+    position get reverted back to MASK and reconsidered if its confidence
+    (re-evaluated against the now-more-complete context) drops below this
+    value, instead of every reveal being permanent. Requires
+    confidence_threshold to also be set; ignored otherwise.
+
+    Plain hierarchical decoding (confidence_threshold set, remask_threshold
+    None) has no way to correct an early mistake once revealed -- validated
+    on MMLU-Pro (real accuracy improvement over the fixed schedule) but
+    found on GSM8K's much longer generations (1024 tokens vs MMLU-Pro's
+    256) to sometimes lock into degenerate repetition loops: once a
+    confidently-wrong token starts a repeat, repeating it is itself often a
+    high-confidence prediction, and nothing before this could ever revisit
+    that choice. remask_threshold adds that correction path back: at every
+    step (except the last, where it's disabled -- see below), the model's
+    fresh confidence is re-checked against EVERY position in the block, not
+    just currently-masked ones; already-revealed positions whose confidence
+    has now dropped below remask_threshold are added to the selectable set
+    for this step (unioned with -- not replacing -- select_transfer_indices_
+    hierarchy's normal segment/threshold logic operating on that same
+    expanded set). A shaky position that gets re-selected this step is
+    REVISED to the model's current top pick at that position -- which may
+    differ from what was already there, not merely re-confirmed as-is --
+    since confidence/selection is computed from the raw, unmodified argmax
+    at every position (matching dInfer's reference exactly, not a
+    mask_index-preserved version). A shaky position that does NOT get
+    re-selected is reverted to MASK_ID instead and marked as this step's
+    write. A position can therefore be revealed, revised, reverted to MASK,
+    and revealed again with a different value multiple times across a
+    block's steps.
+
+    Differs from dInfer's reference implementation in one respect: dInfer's
+    version guarantees "at least (count being remasked this step + 1)"
+    selections via its own gap-filling top-up; this reuses
+    select_transfer_indices_hierarchy unmodified, whose own guarantee is
+    simpler (the single globally highest-confidence position is always
+    included). Chosen deliberately for lower implementation risk (no new
+    selection logic to separately validate) -- correctness/termination
+    doesn't depend on either progress-rate guarantee anyway, since the
+    last-step force-reveal below is an unconditional, independent backstop.
+
+    Early exit (breaking out of the step loop once nothing is masked) is
+    unconditionally DISABLED whenever remasking is active (confidence_
+    threshold and remask_threshold both set): a row with no currently-
+    masked positions can still have shaky already-revealed content worth
+    reconsidering, so "nothing is masked" no longer means "nothing left to
+    do." Remasking-enabled generation therefore always uses the full
+    steps_per_block budget for a block. Plain hierarchy decoding (no
+    remasking) keeps its existing early-exit behavior unchanged.
+
+    When a threshold is given, a block never exceeds steps_per_block
+    forward passes regardless of confidence/remasking behavior on earlier
+    steps: the last allowed iteration always force-reveals any remaining
+    masked positions outright and never remasks anything, guaranteeing the
+    block is never left with leftover MASK tokens and the step-count
+    ceiling from `steps` is never exceeded.
     """
     block_length = block_end - block_start
     device = x.device
+    remask_active = confidence_threshold is not None and remask_threshold is not None
 
     block_mask_index = (x[:, block_start:block_end] == MASK_ID)
     num_transfer = None
@@ -211,7 +263,7 @@ def _generate_block_cached(
     for step in range(steps_per_block):
         active_ids = x[:, block_start:block_end]
         mask_index = (active_ids == MASK_ID)
-        if not mask_index.any():
+        if not mask_index.any() and not remask_active:
             break  # every row's block already fully unmasked -- no forward call needed
 
         suffix_ids = x[:, block_start:]
@@ -224,28 +276,57 @@ def _generate_block_cached(
         logits = suffix_logits[:, :block_length]
 
         logits_with_noise = add_gumbel_noise(logits, temperature)
-        x0 = logits_with_noise.argmax(dim=-1)
+        x0_raw = logits_with_noise.argmax(dim=-1)  # the model's own top pick at EVERY position, unmodified
 
         if remasking == "low_confidence":
             p = F.softmax(logits.float(), dim=-1)
-            x0_p = p.gather(-1, x0.unsqueeze(-1)).squeeze(-1)
+            x0_p = p.gather(-1, x0_raw.unsqueeze(-1)).squeeze(-1)  # confidence of x0_raw at EVERY position
         elif remasking == "random":
-            x0_p = torch.rand(x0.shape, device=device)
+            x0_p = torch.rand(x0_raw.shape, device=device)
         else:
             raise ValueError(f"Unknown remasking: {remasking}")
 
-        x0 = torch.where(mask_index, x0, active_ids)
-        confidence = torch.where(mask_index, x0_p, torch.full_like(x0_p, -torch.inf))
+        is_last_step = (step == steps_per_block - 1)
 
-        if confidence_threshold is not None:
-            if step == steps_per_block - 1:
-                transfer_index = mask_index.clone()  # last chance -- force full completion
-            else:
-                transfer_index = select_transfer_indices_hierarchy(
-                    confidence, threshold=confidence_threshold, low_threshold=low_confidence_threshold,
-                )
+        if confidence_threshold is not None and remask_active and not is_last_step:
+            # Remasking path: deliberately uses x0_raw directly, NOT a
+            # mask_index-preserved version -- an already-revealed position
+            # that gets reconfirmed (selected but not reverted) may
+            # legitimately be REVISED to the model's fresh top pick here,
+            # not just kept at its exact old value or fully erased. This
+            # matches dInfer's reference exactly: its x0 is also the raw,
+            # per-position argmax throughout, with revert positions
+            # overwritten to mask_id as the only modification before the
+            # caller applies transfer_index.
+            low_conf_now = x0_p < remask_threshold
+            remask_candidates = low_conf_now & ~mask_index  # already-revealed, now shaky
+            selectable_now = mask_index | remask_candidates
+            remask_confidence = torch.where(selectable_now, x0_p, torch.full_like(x0_p, -torch.inf))
+            transfer_index = select_transfer_indices_hierarchy(
+                remask_confidence, threshold=confidence_threshold, low_threshold=low_confidence_threshold,
+            )
+            revert = remask_candidates & ~transfer_index  # shaky positions not re-confirmed this step
+            x0 = torch.where(revert, torch.full_like(x0_raw, MASK_ID), x0_raw)
+            transfer_index = transfer_index | revert
         else:
-            transfer_index = select_transfer_indices(confidence, num_transfer[:, step])
+            # Every other path (fixed schedule, plain hierarchy decoding,
+            # and the always-force-reveal last step even when remasking is
+            # otherwise active) preserves existing values at non-candidate
+            # positions exactly as before -- x0 only matters at positions
+            # transfer_index actually selects, and those are always a
+            # subset of mask_index here, so this is unchanged from the
+            # validated pre-remasking behavior.
+            x0 = torch.where(mask_index, x0_raw, active_ids)
+            confidence = torch.where(mask_index, x0_p, torch.full_like(x0_p, -torch.inf))
+            if confidence_threshold is not None:
+                if is_last_step:
+                    transfer_index = mask_index.clone()  # last chance -- force full completion, no remasking
+                else:
+                    transfer_index = select_transfer_indices_hierarchy(
+                        confidence, threshold=confidence_threshold, low_threshold=low_confidence_threshold,
+                    )
+            else:
+                transfer_index = select_transfer_indices(confidence, num_transfer[:, step])
 
         active_ids = active_ids.clone()
         active_ids[transfer_index] = x0[transfer_index]
@@ -282,6 +363,7 @@ def generate_cached(
     remasking: str = "low_confidence",
     confidence_threshold: Optional[float] = None,
     low_confidence_threshold: Optional[float] = 0.4,
+    remask_threshold: Optional[float] = None,
 ) -> torch.Tensor:
     """
     Same signature/semantics as generate.generate(), minus cfg_scale
@@ -294,9 +376,20 @@ def generate_cached(
     simpler, reverted threshold implementation) instead of the default
     fixed-per-step reveal schedule. None (default) preserves the exact
     original behavior. `steps` is still an exact ceiling either way: this
-    can only make a block finish in FEWER forward passes, never more.
+    can only make a block finish in FEWER forward passes, never more,
+    UNLESS remask_threshold is also set (see below), in which case the
+    full step budget is always used.
     low_confidence_threshold: floor applied to hierarchy decoding's
     per-segment picks (ignored when confidence_threshold is None).
+    remask_threshold: opt-in, ported from dInfer's
+    get_transfer_index_hierarchy_remask -- lets an already-revealed
+    position be reverted to MASK and reconsidered if its confidence drops
+    on a later step, instead of every reveal being permanent (see
+    _generate_block_cached's docstring for the full mechanism and why
+    plain hierarchy decoding needed this: it was found to sometimes lock
+    into degenerate repetition loops on long generations, e.g. GSM8K's
+    1024-token budget, with no way to correct once revealed). Requires
+    confidence_threshold to also be set; ignored otherwise.
     """
     assert gen_length % block_length == 0, "gen_length must be divisible by block_length"
     num_blocks = gen_length // block_length
@@ -346,6 +439,7 @@ def generate_cached(
             remasking=remasking,
             confidence_threshold=confidence_threshold,
             low_confidence_threshold=low_confidence_threshold,
+            remask_threshold=remask_threshold,
         )
 
     return x[:, P:]
