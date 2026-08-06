@@ -679,6 +679,16 @@ def main():
         help="Number of worked examples to prepend for gsm8k (default 4, matching "
              "dInfer's gsm8k-llada-moe.yaml). Ignored by bbh/cruxeval.",
     )
+    ap.add_argument("--confidence-threshold", type=float, default=None,
+                    help="Opt-in hierarchical threshold-based decoding (see "
+                         "model_update/generate.py's generate_cached, ported from dInfer's "
+                         "HierarchyDecoder). Default None is the server's normal "
+                         "fixed-step-schedule behavior. Validated on MMLU-Pro (see README); "
+                         "this is the corroborating check on a free-form-answer task with a "
+                         "different block_length profile (64 vs MMLU-Pro's 32).")
+    ap.add_argument("--low-confidence-threshold", type=float, default=0.4,
+                    help="Floor applied to hierarchy decoding's per-segment picks. Ignored "
+                         "unless --confidence-threshold is set.")
     args = ap.parse_args()
 
     seed = args.seed if args.seed is not None else random.randint(0, 999_999)
@@ -701,6 +711,7 @@ def main():
     print(f"Max tokens : {max_tokens}  |  Steps: {steps}  |  Block length: {block_length}")
     if args.task == "gsm8k":
         print(f"Few-shot   : {args.num_fewshot}")
+    print(f"Confidence threshold: {args.confidence_threshold} (low={args.low_confidence_threshold})")
     print(f"Seed       : {seed}\n")
 
     print("Loading dataset...", flush=True)
@@ -709,6 +720,9 @@ def main():
 
     grade_fn = grader_for(args.task)
     gen_config = {"block_length": block_length}
+    if args.confidence_threshold is not None:
+        gen_config["confidence_threshold"] = args.confidence_threshold
+        gen_config["low_confidence_threshold"] = args.low_confidence_threshold
 
     t0 = time.time()
     stats = evaluate(
