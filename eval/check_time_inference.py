@@ -181,7 +181,17 @@ def main():
     ap.add_argument("--block-length", type=int, default=16)
     ap.add_argument("--mode", choices=["both", "baseline", "optimized"], default="both",
                     help="Which model(s) to benchmark")
+    ap.add_argument("--batch-size", type=int, default=1,
+                    help="Replicate the test prompt to this many rows before generating, to "
+                         "benchmark/profile the optimized path at a batched shape (simulating "
+                         "server.py's continuous batching having grouped this many concurrent "
+                         "requests). Optimized path only -- baseline_generate hardcodes B=1 "
+                         "throughout and does not support this.")
     args = ap.parse_args()
+
+    if args.batch_size > 1 and args.mode in ["both", "baseline"]:
+        print("--batch-size > 1 only applies to the optimized path; switching mode to 'optimized'.")
+        args.mode = "optimized"
 
     # In distributed mode, override device with local rank
     if get_tp_size() > 1:
@@ -210,6 +220,7 @@ def main():
         print(f"  Block Length     : {args.block_length}")
         print(f"  Warmup Runs      : {args.num_warmup}")
         print(f"  Benchmark Runs   : {args.num_runs}")
+        print(f"  Batch Size       : {args.batch_size}")
         print("=" * 80 + "\n")
 
     if not os.path.isdir(args.weight_dir):
@@ -224,6 +235,10 @@ def main():
 
     test_prompt = "The chemical symbol for gold is Au and for silver is"
     prompt_ids = tok(test_prompt, return_tensors="pt")["input_ids"].to(args.device)
+    if args.batch_size > 1:
+        # Identical rows are fine here -- kernel shape/occupancy/bandwidth depend on B and
+        # sequence length, not on token content, and that's what this flag exists to probe.
+        prompt_ids = prompt_ids.repeat(args.batch_size, 1)
 
     # ── 1. Dense Baseline ────────────────────────────────────────────────────
     baseline_tokens = None
@@ -280,8 +295,10 @@ def main():
         )
         opt_mean, opt_med, opt_p95 = get_stats(opt_lats)
         opt_tps = args.gen_length / opt_mean
+        opt_agg_tps = args.gen_length * args.batch_size / opt_mean
         if is_master:
-            print(f"  Mean: {opt_mean:.2f}s | Median: {opt_med:.2f}s | P95: {opt_p95:.2f}s | {opt_tps:.2f} tok/s\n")
+            print(f"  Mean: {opt_mean:.2f}s | Median: {opt_med:.2f}s | P95: {opt_p95:.2f}s | "
+                  f"{opt_tps:.2f} tok/s/seq | {opt_agg_tps:.2f} aggregate tok/s (B={args.batch_size})\n")
 
         free_model(opt_model, args.device)
 
