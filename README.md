@@ -369,6 +369,48 @@ python -m eval.throughput.run_throughput --base-url http://localhost:8000 \
     --concurrency 64 --n-requests 128 --max-tokens 128 --steps 128 --block-length 32 --fixed-prompt
 ```
 
+Raw output, Run A (`BATCH_MAX_SIZE=8`):
+
+```
+============================================================
+  LLaDA-MoE Throughput Benchmark
+============================================================
+  Backends:          1 (http://localhost:8000)
+  Requests:          128/128 succeeded
+  Concurrency:       64 (total, shared across backends)
+  max_tokens:        128  steps=128  block=32
+  Total wall time:   112.9s
+  Prompt tokens:     4352
+  Output tokens:     16256
+  Output tok/s:      144.0
+  Req/s:             1.13
+  Latency p50:       56.18s
+  Latency p95:       56.72s
+  Latency p99:       56.72s
+============================================================
+```
+
+Raw output, Run B (`BATCH_MAX_SIZE=64`):
+
+```
+============================================================
+  LLaDA-MoE Throughput Benchmark
+============================================================
+  Backends:          1 (http://localhost:8000)
+  Requests:          128/128 succeeded
+  Concurrency:       64 (total, shared across backends)
+  max_tokens:        128  steps=128  block=32
+  Total wall time:   81.5s
+  Prompt tokens:     4352
+  Output tokens:     16256
+  Output tok/s:      199.6
+  Req/s:             1.57
+  Latency p50:       36.89s
+  Latency p95:       44.56s
+  Latency p99:       52.01s
+============================================================
+```
+
 | Metric | `BATCH_MAX_SIZE=8` (old default) | `BATCH_MAX_SIZE=64` (new default) | Change |
 |---|---:|---:|---:|
 | Output tok/s | 144.0 | 199.6 | **+39%** |
