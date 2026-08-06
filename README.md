@@ -15,6 +15,7 @@ Self-contained PyTorch reimplementation of [inclusionAI/LLaDA-MoE-7B-A1B-Instruc
 - [Getting Started](#getting-started)
 - [Usage](#usage)
 - [Project Structure](#project-structure)
+- [Dependencies](#dependencies)
 
 ---
 
@@ -199,7 +200,7 @@ After tuning, the generated `moe_tune_config.json` is automatically detected and
 
 ## Correctness Verification
 
-Verified against the HuggingFace reference implementation:
+Verified against the HuggingFace reference implementation at the logit level:
 
 | Metric | Result |
 |---|---|
@@ -207,6 +208,10 @@ Verified against the HuggingFace reference implementation:
 | Logit cosine similarity | avg **0.9781** across 256 masked positions |
 | Top-1 token match | **91.0%** (233/256) |
 | Generation quality | Matches HF generation behavior with exact cosine precision |
+
+**At the full-generation level, a real accuracy bug was found and fixed.** Comparing CoT MMLU-Pro accuracy between `model_update` and HF surfaced a large gap (28.0% vs HF's 46.0%) caused by `generate_cached`'s responses collapsing to a bare `"Final Answer: X"` with no reasoning content. Root cause: the KV-cache priming and finalize calls were missing the mask-placeholder context the model was trained to always see. Fixed in commit `a5f6ebe`; post-fix, MMLU-Pro rose to **40.0%** (HF: 46.0%).
+
+**A ~6-point residual gap remains and has not been root-caused.** Leading hypothesis, not yet confirmed: a smaller approximation inherent to the KV-cache design itself (the committed prefix only refreshes at block boundaries, not every step, unlike HF's full recompute every step) — see `eval/correctness/analyze_length_vs_gap.py`, built to test exactly this. MMLU (not just MMLU-Pro) has not yet been re-run against the fix. `INVESTIGATION_LOG.md` has the complete investigation, including an earlier (reverted) attempt at reduced expert-count routing that turned out to be unrelated to this bug.
 
 ---
 
@@ -533,11 +538,21 @@ python -m eval.throughput.run_throughput            # concurrent request through
 │   └── distributed.py                      Distributed process group helpers
 │
 ├── eval/                                   ← Evaluation & benchmarks
-│   ├── check_time_inference.py             Baseline vs optimized speedup benchmark
+│   ├── check_time_inference.py             Baseline vs optimized speedup benchmark (--batch-size, --mode, ...)
+│   ├── benchmark_compare.sh                Wraps check_time_inference.py for the baseline-vs-TP/EP comparison
 │   ├── time_fraction.py                    Attention vs MoE FFN timing breakdown
-│   ├── check_server.py                     Server smoke test
+│   ├── check_server.py                     Server health check + smoke test
+│   ├── diagnose_cache_vs_dense.py          Correctness: cached vs dense generation, side by side, on known-collapse questions
+│   ├── diagnose_step_divergence.py         Step-by-step cached-vs-dense divergence tracer (follow-up to the above)
+│   ├── profile_kv_concat.py                Isolates KV-cache torch.cat cost vs attention math cost
+│   ├── profile_kernel_occupancy.sh         Nsight Compute (ncu) wrapper: occupancy/memory-bandwidth/warp-stall profiling
+│   ├── test_moe_align_block_size.py        Regression test: vectorized MoE token-alignment vs a frozen reference
+│   ├── test_select_transfer_indices.py     Regression test: vectorized per-row top-k selection vs a frozen reference
 │   ├── correctness/
-│   │   └── run_correctness.py              MMLU / ARC correctness evaluation
+│   │   ├── run_correctness.py              MMLU / MMLU-Pro accuracy evaluation
+│   │   ├── run_math_reasoning_code.py      GSM8K / BBH / CRUX-O evaluation (aligned to inclusionAI/dInfer's config)
+│   │   ├── diagnose_humaneval.py           One-off diagnostic for a HumanEval pass@1=0 root cause
+│   │   └── analyze_length_vs_gap.py        Tests the block-commit-staleness hypothesis for the residual HF accuracy gap
 │   └── throughput/
 │       └── run_throughput.py               Concurrent request throughput benchmark
 │
@@ -545,12 +560,17 @@ python -m eval.throughput.run_throughput            # concurrent request through
 ├── moe_tune_config.json                    GPU-specific tuned kernel configs (generated)
 ├── diagnose_speedup.py                     GPU environment + config + kernel diagnostic
 ├── compare_models.py                       Logit + generation comparison vs HF reference
+├── benchmark_fused_moe.py                  Fused vs unfused MoE speedup benchmark
 ├── download_weights.py                     Download weights from HuggingFace Hub
 ├── requirements.txt                        Python dependencies (torch, triton, transformers, ...)
 ├── setup.sh                                One-shot environment setup script
 ├── start.sh                                Start inference server
+├── run_all_benchmarks.sh                   Runs the full benchmark suite in one pass
+├── INVESTIGATION_LOG.md                    Full record of correctness/accuracy investigations (see Correctness Verification)
 └── README.md
 ```
+
+Not shown above: a handful of one-off dev-utility scripts (`fused_moe_triton_raw.py`, `download_vllm.py`, `patch_nvtx.py`) that exist for reference/diffing rather than as part of the maintained workflow.
 
 ---
 
