@@ -141,10 +141,13 @@ def baseline_generate(model, prompt_ids, gen_length, steps, block_length):
     return x[0, P:]
 
 
-def optimized_generate(model, prompt_ids, gen_length, steps, block_length):
+def optimized_generate(model, prompt_ids, gen_length, steps, block_length, confidence_threshold=None):
     """Generation with block-wise KV cache, fused MoE, static top-8 experts."""
     from model_update.generate import generate_cached
-    return generate_cached(model, prompt_ids, gen_length, steps, block_length)
+    return generate_cached(
+        model, prompt_ids, gen_length, steps, block_length,
+        confidence_threshold=confidence_threshold,
+    )
 
 
 # ── benchmarking ─────────────────────────────────────────────────────────────
@@ -187,6 +190,17 @@ def main():
                          "server.py's continuous batching having grouped this many concurrent "
                          "requests). Optimized path only -- baseline_generate hardcodes B=1 "
                          "throughout and does not support this.")
+    ap.add_argument("--confidence-threshold", type=float, default=None,
+                    help="Opt-in threshold/confidence-based decoding (see "
+                         "generate_cached's confidence_threshold parameter in "
+                         "model_update/generate.py) instead of the default fixed-per-step "
+                         "reveal schedule -- lets a block finish in fewer forward passes when "
+                         "the model is confident early. NOT validated end-to-end on real "
+                         "hardware or for accuracy impact -- run eval/test_threshold_decoding.py "
+                         "and a real accuracy check (eval/correctness/run_correctness.py) before "
+                         "trusting output from this path. Omit (default None) for the exact "
+                         "original fixed-schedule behavior. Only affects --mode optimized/both's "
+                         "optimized run.")
     args = ap.parse_args()
 
     if args.batch_size > 1 and args.mode in ["both", "baseline"]:
@@ -221,6 +235,7 @@ def main():
         print(f"  Warmup Runs      : {args.num_warmup}")
         print(f"  Benchmark Runs   : {args.num_runs}")
         print(f"  Batch Size       : {args.batch_size}")
+        print(f"  Confidence Thresh: {args.confidence_threshold}")
         print("=" * 80 + "\n")
 
     if not os.path.isdir(args.weight_dir):
@@ -286,11 +301,15 @@ def main():
 
         set_seed(42)
         opt_tokens = optimized_generate(
-            opt_model, prompt_ids, args.gen_length, args.steps, args.block_length
+            opt_model, prompt_ids, args.gen_length, args.steps, args.block_length,
+            confidence_threshold=args.confidence_threshold,
         )[0].cpu()
 
         opt_lats = benchmark(
-            lambda: optimized_generate(opt_model, prompt_ids, args.gen_length, args.steps, args.block_length),
+            lambda: optimized_generate(
+                opt_model, prompt_ids, args.gen_length, args.steps, args.block_length,
+                confidence_threshold=args.confidence_threshold,
+            ),
             args.device, args.num_warmup, args.num_runs,
         )
         opt_mean, opt_med, opt_p95 = get_stats(opt_lats)
