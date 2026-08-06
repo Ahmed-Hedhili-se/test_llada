@@ -352,7 +352,22 @@ Attention was **occupancy-starved**: only 16 blocks (one per KV head, B=1) again
 
 More concurrent sequences directly multiplies attention's grid size (more blocks to fill the 84 SMs), and more tokens per expert raises MoE's arithmetic intensity (same weight-load cost now amortized over far more useful compute) — both are the batching lever, not a kernel-dispatch lever. MoE's efficiency gain is front-loaded: the big win (thin-GEMM fixed) happens by B=32; B=32→64 still helps (real additional throughput) but per-token cost stops improving. MoE's occupancy % drop from 65%→33% between B=1 and B=32 reflects Triton's `get_best_config` selecting a different tuned kernel configuration for larger token counts (128-thread vs 256-thread blocks), not an efficiency regression — compute throughput rose 2.6× over the same transition.
 
-**End-to-end validation with real concurrent HTTP traffic** (`eval/throughput/run_throughput.py --concurrency 64 --n-requests 128 --fixed-prompt`, same A6000, `BACKEND=fast_dense`):
+**End-to-end validation with real concurrent HTTP traffic** (same A6000, `BACKEND=fast_dense`). Reproduce by restarting the server at each `BATCH_MAX_SIZE` and running the identical load against it:
+
+```bash
+# Run A: old default
+BATCH_MAX_SIZE=8 python -m src.server --weight-dir ./weights --port 8000 --backend fast_dense --device cuda:0 &
+python -m eval.check_server --base-url http://localhost:8000   # wait until this passes (model load takes ~45-70s)
+python -m eval.throughput.run_throughput --base-url http://localhost:8000 \
+    --concurrency 64 --n-requests 128 --max-tokens 128 --steps 128 --block-length 32 --fixed-prompt
+
+# Run B: new default -- restart the server, then repeat the identical load command
+pkill -f "src.server"
+BATCH_MAX_SIZE=64 python -m src.server --weight-dir ./weights --port 8000 --backend fast_dense --device cuda:0 &
+python -m eval.check_server --base-url http://localhost:8000
+python -m eval.throughput.run_throughput --base-url http://localhost:8000 \
+    --concurrency 64 --n-requests 128 --max-tokens 128 --steps 128 --block-length 32 --fixed-prompt
+```
 
 | Metric | `BATCH_MAX_SIZE=8` (old default) | `BATCH_MAX_SIZE=64` (new default) | Change |
 |---|---:|---:|---:|
