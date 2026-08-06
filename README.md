@@ -426,6 +426,86 @@ Raw output, Run B (`BATCH_MAX_SIZE=64`):
 
 Not a throughput/latency tradeoff — a win on both simultaneously. With `BATCH_MAX_SIZE=8`, 128 concurrent requests need 16 sequential batch rounds, so most requests queue behind many earlier rounds before starting at all (hence p50/p95/p99 all clustered near the tail, ~56s). With `BATCH_MAX_SIZE=64`, only 2 rounds are needed, so most requests start almost immediately. `BATCH_MAX_SIZE`'s default was changed from 8 to 64 in `src/server.py` based on this data.
 
+#### Removing Dead Time Between Batches: Collector/Executor Pipelining
+
+The batching mechanism above still had a structural gap: the original single background thread (`_batch_worker`) called `generate_cached()` directly inside the same loop that collected requests. While one batch was generating — tens of seconds at production `gen_length` — a request arriving mid-batch got **zero** collection progress: it sat completely untouched in the pending queue until the *entire* current batch finished, then had to pay its own fresh `BATCH_WAIT_S` collection window on top of that. No overlap between batches at all.
+
+**Fix**: split the single worker into two threads connected by a queue. `_batch_collector` only forms batches (identical logic to before) and hands each one to `_ready_batches`; `_batch_executor` is the sole consumer — the only thread that ever calls `generate_cached()`, so GPU work still runs strictly one batch at a time, zero change to generation semantics or single-GPU serialization. What changes: the collector keeps accumulating and forming the *next* batch the entire time the executor is busy with the current one, so the next batch is usually already fully formed and ready the instant the executor finishes.
+
+**Validation**: added a `gap_since_prev_batch_end` field to the server's `[batch]` log line — the direct measurement of what this fix is meant to eliminate. Real concurrent load (`--concurrency 96 --n-requests 192`) produced 5 batches (41/55/41/3/52 — HTTP/thread-scheduling timing doesn't form clean, evenly-sized batches in practice) with these gaps between them:
+
+```
+[batch] size=41 ... gap_since_prev_batch_end=0.071s
+[batch] size=55 ... gap_since_prev_batch_end=0.002s
+[batch] size=41 ... gap_since_prev_batch_end=0.000s
+[batch] size=3  ... gap_since_prev_batch_end=0.000s
+[batch] size=52 ... gap_since_prev_batch_end=0.000s
+```
+
+Near-zero across every transition — the next batch was already formed and ready every time. (Aggregate client-side throughput turned out to be a poor way to validate this specific fix — the benchmark client's own concurrency semaphore only dispatches new requests once old ones return, which happens in synchronized bursts tied to batch completions, so it can't produce the kind of independent, staggered arrival pattern the fix actually targets. Measuring the gap directly from the server's own log sidesteps that confound entirely.)
+
+### Adaptive Decoding: Threshold-Based Token Selection
+
+A comparison against [SGLang's `--dllm-fdfo`](https://github.com/sgl-project/sglang) (First-Done-First-Out scheduling for diffusion LLMs) surfaced three gaps in this project's batching relative to that design:
+
+1. **Dead time between batches** — fixed above (collector/executor pipelining).
+2. **No confidence/threshold-based early stopping** — this project used a *uniform* fixed-step schedule (`get_num_transfer_tokens` divides each row's masked-token count evenly across every allotted step), so a block always takes the maximum configured number of steps regardless of how confident the model actually is.
+3. **True per-row FDFO** — splicing a brand-new, different-prompt request into a batch slot the instant an existing row's block finishes, mid-generation. This needs per-row independent KV-cache lifetime and per-row block boundaries instead of the current shared, batch-wide commit — a genuinely different architecture, closer to a multi-day rebuild of the batching layer than a fix, and it touches exactly the KV-cache logic that already caused a real accuracy bug once in this project (see Correctness Verification). Deliberately not attempted; scoped out as future work, not implemented here.
+
+Item 2 (and the batch-wide portion of item 3 — exiting early once an *entire* batch's block is already fully unmasked, with no per-row splicing) were implemented and validated, in two attempts.
+
+#### First attempt: naive per-position threshold — reverted
+
+The obvious implementation: at each step, reveal every currently-masked position whose confidence clears a threshold, instead of a fixed count, falling back to a row's single highest-confidence position when nothing qualifies (guaranteeing progress every step). Mechanism-tested thoroughly (CPU-only unit tests, an integration test proving the default path is provably unaffected and the threshold path never exceeds its step budget or leaves stray `MASK` tokens) and it worked correctly — but real evaluation told a different story:
+
+| Config | MMLU-Pro (n=50, seed=42) | Total time |
+|---|---:|---:|
+| Baseline (fixed schedule) | 36.0% (18/50) | 240.6s |
+| `confidence_threshold=0.9` (naive) | **24.0%** (12/50) | 169.5s |
+
+A third of correct answers lost, for only a 1.4x speedup — far below the 9.5x seen on an earlier trivial single-fact-completion prompt that turned out not to be representative of real generation. **Reverted.**
+
+**Why it failed, mechanistically**: at each step, the model predicts every masked position independently, with no knowledge of what the *other* positions will simultaneously become in that same step. Revealing every position that clears a threshold in one step — which can easily mean many tokens at once, since local per-position confidence reflects strong surface-level priors (common phrasing, grammar) even before the deeper logical content is worked out — locks in a burst of individually-plausible-but-jointly-uncoordinated tokens with no chance for the model to reconsider before the next step. The original fixed schedule's fine-grained, small-reveal-per-step approach (2 tokens/step on average at the CoT config used here) is effectively iterative self-consistency: each tiny commitment is followed by a fresh look at the updated context before the next one. Threshold decoding traded that away, and for long chain-of-thought reasoning chains, the compounding cost wasn't worth the speed.
+
+#### Second attempt: dInfer's `HierarchyDecoder` algorithm — validated, kept
+
+Rather than inventing a mitigation from scratch, checked whether [inclusionAI/dInfer](https://github.com/inclusionAI/dInfer) — the reference framework this project's GSM8K/BBH/CRUX-O eval config was already aligned to — had already solved this. It has: `dInfer/python/dinfer/decoding/parallel_strategy.py`'s simplest threshold decoder is mechanically equivalent to the naive attempt above (same default `threshold=0.9`, same model — its `SamplingParams` defaults use `mask_id=156895`, this exact model's `MASK_ID`) — but it also ships a `HierarchyDecoder`, whose own docstring says **"force separate decisions"**, directly addressing the failure mode just diagnosed.
+
+The algorithm, ported faithfully as `select_transfer_indices_hierarchy` (fully vectorized — segment IDs via cumsum, per-segment max via `scatter_reduce`; dInfer's own reference asserts batch size 1, generalized here to any batch size since the operations are already independent per row):
+
+1. At most **one** reveal per contiguous run of currently-masked positions (a "segment") — that segment's highest-confidence position. Instead of a free-for-all across the whole block, at most one decision per locally-correlated span per step.
+2. Segment picks are floored by `low_confidence_threshold` (default 0.4, matching dInfer) — a segment's pick doesn't count if even its best position isn't reasonably confident.
+3. Positions independently clearing `confidence_threshold` are unioned in regardless of the segment/floor gating (a genuinely confident position can still skip ahead), and the single globally highest-confidence position is always included unconditionally — guarantees progress every step.
+
+Re-validated on the identical benchmark:
+
+| Config | MMLU-Pro (n=50, seed=42) | Total time | Output tok/s* |
+|---|---:|---:|---:|
+| Baseline (fixed schedule) | 36.0% (18/50) | 240.6s | 53.2 |
+| Naive threshold=0.9 (reverted) | 24.0% (12/50) | 169.5s | 75.5 |
+| **`HierarchyDecoder`, threshold=0.9 (kept)** | **44.0%** (22/50) | 175.7s | **72.9** |
+
+<sub>*`max_tokens=256` is fixed and identical across all three runs (no EOS early-stopping in `generate_cached`), so tok/s = 256 × 50 ÷ total time is directly comparable.</sub>
+
+A win on **both** axes versus baseline at once — **+37% throughput and +8 accuracy points**, not a tradeoff — while keeping nearly all of the naive version's speed advantage (72.9 vs 75.5 tok/s) after fixing what made it unsafe. n=50 is a modest sample size, so treat this as a strong opt-in result rather than fully settled; it defaults to off (`confidence_threshold=None`) regardless.
+
+**Usage:**
+
+```bash
+# Benchmark: compare with/without threshold decoding directly
+python eval/check_time_inference.py --mode optimized --gen-length 128 --steps 128 --block-length 32
+python eval/check_time_inference.py --mode optimized --gen-length 128 --steps 128 --block-length 32 --confidence-threshold 0.9
+
+# Accuracy check (the one that matters -- always re-run this after touching decoding logic)
+python -m eval.correctness.run_correctness --task mmlu_pro --seed 42 --limit 50
+python -m eval.correctness.run_correctness --task mmlu_pro --seed 42 --limit 50 --confidence-threshold 0.9
+
+# Via the API server (fast_dense/single-GPU path only; opt-in per request)
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "inclusionAI/LLaDA-MoE-7B-A1B-Instruct", "messages": [{"role": "user", "content": "..."}], "confidence_threshold": 0.9}'
+```
+
 ---
 
 ## Getting Started
