@@ -9,8 +9,6 @@ low-confidence remasking, block restriction), but:
     purely to compute correct K/V to push into the cache
 """
 
-from typing import Optional
-
 import torch
 import torch.nn.functional as F
 
@@ -74,45 +72,6 @@ def select_transfer_indices(confidence: torch.Tensor, num_transfer_step: torch.T
     return transfer_index
 
 
-def select_transfer_indices_threshold(confidence: torch.Tensor, threshold: float) -> torch.Tensor:
-    """
-    Threshold/confidence-based token selection: opt-in alternative to
-    select_transfer_indices' fixed per-step count (see
-    _generate_block_cached's confidence_threshold parameter). For each row,
-    reveals EVERY currently-selectable position whose confidence >=
-    threshold, instead of a fixed count -- lets a row finish in fewer steps
-    when the model is confident early, instead of always spreading reveals
-    evenly across every allotted step regardless of confidence.
-
-    Rows with no qualifying position still reveal their single
-    highest-confidence position as a fallback. This guarantees at least one
-    token transfers per row per step whenever that row has ANY selectable
-    position left, so a row can never stall indefinitely no matter how low
-    its confidence is -- without this, an unlucky row could in principle
-    never cross the threshold and never make progress. This bounds the
-    worst case to "one token per step" (same as the old per-row loop this
-    project moved away from for cost reasons, not correctness -- see
-    select_transfer_indices' docstring), not "zero progress forever."
-    _generate_block_cached's caller separately guarantees the step-count
-    ceiling itself is never exceeded (its last iteration force-reveals any
-    remaining positions outright, regardless of confidence).
-
-    confidence: [B, T] float, -inf at positions that must not be selected
-    (already-revealed or outside the active block -- same convention as
-    select_transfer_indices).
-    Returns: [B, T] bool mask.
-    """
-    transfer_index = confidence >= threshold
-    has_candidate = torch.isfinite(confidence).any(dim=-1)
-    has_selection = transfer_index.any(dim=-1)
-    needs_fallback = has_candidate & ~has_selection
-    if needs_fallback.any():
-        fallback_idx = confidence.argmax(dim=-1)
-        row_idx = torch.nonzero(needs_fallback, as_tuple=True)[0]
-        transfer_index[row_idx, fallback_idx[row_idx]] = True
-    return transfer_index
-
-
 def _generate_block_cached(
     model,
     x: torch.Tensor,
@@ -122,41 +81,18 @@ def _generate_block_cached(
     cache_buffer: KVCacheBuffer,
     temperature: float,
     remasking: str,
-    confidence_threshold: Optional[float] = None,
 ):
-    """
-    confidence_threshold: opt-in threshold-based token selection
-    (select_transfer_indices_threshold) instead of the default fixed
-    per-step reveal count (select_transfer_indices). None (default)
-    preserves the exact original behavior byte-for-byte -- the early-exit
-    check below never triggers for the fixed schedule (it spreads reveals
-    evenly across every allotted step by construction, so mask_index can
-    only become all-False on the very last iteration, which is where the
-    loop would end anyway), so existing callers are unaffected either way.
-
-    When a threshold is given, a block CAN finish in fewer than
-    steps_per_block forward passes (the loop exits the instant every row's
-    block is already fully unmasked), but never in more: the last allowed
-    iteration always force-reveals any remaining masked positions
-    regardless of confidence, guaranteeing the block is never left with
-    leftover MASK tokens and the step-count ceiling from `steps` is never
-    exceeded, no matter how the threshold behaved on earlier steps.
-    """
     block_length = block_end - block_start
     device = x.device
 
     block_mask_index = (x[:, block_start:block_end] == MASK_ID)
-    num_transfer = None
-    if confidence_threshold is None:
-        num_transfer = get_num_transfer_tokens(block_mask_index, steps_per_block)
+    num_transfer = get_num_transfer_tokens(block_mask_index, steps_per_block)
 
     for step in range(steps_per_block):
+        suffix_ids = x[:, block_start:]
         active_ids = x[:, block_start:block_end]
         mask_index = (active_ids == MASK_ID)
-        if not mask_index.any():
-            break  # every row's block already fully unmasked -- no forward call needed
 
-        suffix_ids = x[:, block_start:]
         suffix_logits, _ = model(
             suffix_ids,
             position_offset=block_start,
@@ -179,13 +115,7 @@ def _generate_block_cached(
         x0 = torch.where(mask_index, x0, active_ids)
         confidence = torch.where(mask_index, x0_p, torch.full_like(x0_p, -torch.inf))
 
-        if confidence_threshold is not None:
-            if step == steps_per_block - 1:
-                transfer_index = mask_index.clone()  # last chance -- force full completion
-            else:
-                transfer_index = select_transfer_indices_threshold(confidence, confidence_threshold)
-        else:
-            transfer_index = select_transfer_indices(confidence, num_transfer[:, step])
+        transfer_index = select_transfer_indices(confidence, num_transfer[:, step])
 
         active_ids = active_ids.clone()
         active_ids[transfer_index] = x0[transfer_index]
@@ -220,22 +150,11 @@ def generate_cached(
     block_length: int = 128,
     temperature: float = 0.0,
     remasking: str = "low_confidence",
-    confidence_threshold: Optional[float] = None,
 ) -> torch.Tensor:
     """
     Same signature/semantics as generate.generate(), minus cfg_scale
     (CFG doubles the batch and complicates cache bookkeeping; add back
     once single-sequence caching is verified correct).
-
-    confidence_threshold: opt-in threshold-based decoding (see
-    _generate_block_cached) instead of the default fixed-per-step reveal
-    schedule. None (default) preserves the exact original behavior.
-    NOT validated end-to-end on real hardware as written -- run
-    eval/test_select_transfer_indices.py (covers select_transfer_indices_
-    threshold's selection logic) and a real accuracy check (e.g.
-    eval/correctness/run_correctness.py) with this enabled before trusting
-    output from this path. `steps` is still an exact ceiling either way:
-    this can only make a block finish in FEWER forward passes, never more.
     """
     assert gen_length % block_length == 0, "gen_length must be divisible by block_length"
     num_blocks = gen_length // block_length
@@ -283,7 +202,6 @@ def generate_cached(
             cache_buffer=cache_buffer,
             temperature=temperature,
             remasking=remasking,
-            confidence_threshold=confidence_threshold,
         )
 
     return x[:, P:]

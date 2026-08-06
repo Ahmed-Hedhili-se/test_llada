@@ -123,23 +123,19 @@ MAX_THREADPOOL_WORKERS = int(os.environ.get("MAX_THREADPOOL_WORKERS", 128))
 
 
 class _PendingRequest:
-    def __init__(self, input_ids, gen_length, steps, block_length, temperature, confidence_threshold=None):
+    def __init__(self, input_ids, gen_length, steps, block_length, temperature):
         self.input_ids = input_ids
         self.gen_length = gen_length
         self.steps = steps
         self.block_length = block_length
         self.temperature = temperature
-        self.confidence_threshold = confidence_threshold
         self.event = threading.Event()
         self.result = None
         self.error = None
 
     @property
     def key(self):
-        # confidence_threshold included: requests must share the exact same
-        # generation config to be batched into one generate_cached() call,
-        # same reasoning as gen_length/steps/block_length already being here.
-        return (self.gen_length, self.steps, self.block_length, self.input_ids.shape[1], self.confidence_threshold)
+        return (self.gen_length, self.steps, self.block_length, self.input_ids.shape[1])
 
 
 _pending_lock = threading.Lock()
@@ -188,7 +184,6 @@ def _run_batch(batch: list["_PendingRequest"]):
             steps=first.steps,
             block_length=first.block_length,
             temperature=first.temperature,
-            confidence_threshold=first.confidence_threshold,
         )
         if PROFILE_BATCHES:
             # Chrome/Perfetto trace JSON -- shows actual GPU busy vs idle
@@ -329,13 +324,6 @@ class ChatRequest(BaseModel):
     block_length: int = DEFAULT_BLOCK_LENGTH
     cfg_scale: float = DEFAULT_CFG_SCALE
     remasking: str = DEFAULT_REMASKING
-    # Opt-in threshold/confidence-based decoding (model_update/generate.py's
-    # confidence_threshold) instead of the default fixed-per-step reveal
-    # schedule. None (default) is the exact original behavior. NOT validated
-    # for accuracy impact yet -- see model_update/generate.py's
-    # generate_cached docstring before trusting output with this set. Only
-    # applies to the fast_dense/single-GPU batched path (see _PendingRequest).
-    confidence_threshold: Optional[float] = None
 
 
 @app.get("/health")
@@ -400,10 +388,7 @@ def chat_completions(req: ChatRequest):
     if BACKEND == "fast_dense" and get_tp_size() == 1:
         # Batched path -- see the "Server-side request batching" block above
         # for why this is scoped to single-GPU only.
-        pending = _PendingRequest(
-            input_ids, gen_length, steps, block_length, req.temperature,
-            confidence_threshold=req.confidence_threshold,
-        )
+        pending = _PendingRequest(input_ids, gen_length, steps, block_length, req.temperature)
         with _pending_lock:
             _pending_queue.append(pending)
             _new_request_event.set()

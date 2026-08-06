@@ -525,13 +525,6 @@ def main():
                          f"(CoT) or 32 (--direct-answer).")
     ap.add_argument("--block-length", type=int, default=DEFAULT_COT_BLOCK_LENGTH,
                     help="Server-side block_length for generation.")
-    ap.add_argument("--confidence-threshold", type=float, default=None,
-                    help="Opt-in threshold/confidence-based decoding (see "
-                         "model_update/generate.py's generate_cached). Default None "
-                         "is the server's normal fixed-step-schedule behavior. This "
-                         "is the accuracy-impact check for that feature -- run once "
-                         "without this flag and once with it, same --task/--seed/"
-                         "--limit, and compare the two summary scores.")
     ap.add_argument(
         "--save-transcripts", default=None,
         help=(
@@ -564,7 +557,6 @@ def main():
     print(f"Concurrent : {args.num_concurrent}")
     print(f"Prompting  : {'chain-of-thought' if cot else 'direct (bare letter)'}")
     print(f"Max tokens : {max_tokens}  |  Steps: {steps}  |  Block length: {args.block_length}")
-    print(f"Confidence threshold: {args.confidence_threshold}")
     print(f"Seed       : {seed}\n")
 
     print("Loading dataset...", flush=True)
@@ -572,8 +564,6 @@ def main():
     print(f"Loaded {len(items)} questions.\n")
 
     gen_config = {"block_length": args.block_length}
-    if args.confidence_threshold is not None:
-        gen_config["confidence_threshold"] = args.confidence_threshold
 
     t0    = time.time()
     stats = evaluate(
