@@ -9,7 +9,14 @@
 #  Usage:
 #    bash eval/benchmark_compare.sh [--weight-dir ./weights] \
 #         [--gen-length 64] [--steps 64] [--block-length 32] \
-#         [--num-warmup 1] [--num-runs 3]
+#         [--num-warmup 1] [--num-runs 3] [--master-port 29500]
+#
+#  --master-port: both the baseline call (via init_distributed()'s
+#  single-process fallback, model_update/distributed.py) and the TP
+#  torchrun call default to port 29500 for their rendezvous. If something
+#  else on the box already holds 29500 (e.g. a running src/server.py
+#  instance), override this to any free port instead of stopping that
+#  process.
 # ============================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,16 +33,18 @@ BLOCK_LENGTH=32
 NUM_WARMUP=1
 NUM_RUNS=3
 NPROC=2
+MASTER_PORT_ARG=29500
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --weight-dir)   WEIGHT_DIR="$2";  shift 2 ;;
-        --gen-length)   GEN_LENGTH="$2";  shift 2 ;;
-        --steps)        STEPS="$2";       shift 2 ;;
-        --block-length) BLOCK_LENGTH="$2";shift 2 ;;
-        --num-warmup)   NUM_WARMUP="$2";  shift 2 ;;
-        --num-runs)     NUM_RUNS="$2";    shift 2 ;;
-        --nproc)        NPROC="$2";       shift 2 ;;
+        --weight-dir)   WEIGHT_DIR="$2";      shift 2 ;;
+        --gen-length)   GEN_LENGTH="$2";      shift 2 ;;
+        --steps)        STEPS="$2";           shift 2 ;;
+        --block-length) BLOCK_LENGTH="$2";    shift 2 ;;
+        --num-warmup)   NUM_WARMUP="$2";      shift 2 ;;
+        --num-runs)     NUM_RUNS="$2";        shift 2 ;;
+        --nproc)        NPROC="$2";           shift 2 ;;
+        --master-port)  MASTER_PORT_ARG="$2"; shift 2 ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
@@ -60,6 +69,7 @@ echo "║  Steps       : $STEPS"
 echo "║  Block Length: $BLOCK_LENGTH"
 echo "║  Warmup / Runs: $NUM_WARMUP / $NUM_RUNS"
 echo "║  TP Size     : $NPROC GPUs"
+echo "║  Master Port : $MASTER_PORT_ARG"
 echo "╚══════════════════════════════════════════════════════════════╝"
 echo ""
 
@@ -68,7 +78,8 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "  [1/2] BASELINE  (src/, single GPU cuda:0, no TP)"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-BASELINE_OUT=$("$PY" "$BENCH" "${COMMON_ARGS[@]}" --mode baseline --device cuda:0 2>&1)
+BASELINE_OUT=$(MASTER_ADDR=localhost MASTER_PORT="$MASTER_PORT_ARG" RANK=0 WORLD_SIZE=1 \
+    "$PY" "$BENCH" "${COMMON_ARGS[@]}" --mode baseline --device cuda:0 2>&1)
 echo "$BASELINE_OUT"
 
 # Extract: "Mean: X.XXs | ..."  →  X.XX
@@ -82,7 +93,7 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "  [2/2] OPTIMIZED  (model_update/, ${NPROC}x GPU, Tensor Parallelism)"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-OPT_OUT=$("$TORCHRUN" --nproc_per_node="$NPROC" "$BENCH" "${COMMON_ARGS[@]}" --mode optimized 2>&1)
+OPT_OUT=$("$TORCHRUN" --nproc_per_node="$NPROC" --master_port="$MASTER_PORT_ARG" "$BENCH" "${COMMON_ARGS[@]}" --mode optimized 2>&1)
 echo "$OPT_OUT"
 
 OPT_MEAN=$(echo "$OPT_OUT" | grep -oP 'Mean:\s+\K[0-9]+\.[0-9]+' | head -1)
