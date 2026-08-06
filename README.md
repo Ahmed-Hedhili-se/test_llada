@@ -287,7 +287,7 @@ The mechanism is plain queueing, not a GPU-compute-efficiency difference. TP+EP'
 
 #### How it works
 
-`src/server.py` runs a dedicated background thread (`_batch_worker`) that collects concurrent requests instead of processing them one at a time, for `BACKEND == "fast_dense"` with `tp_size == 1` only. Once the first request of a new group arrives, it polls every `BATCH_POLL_INTERVAL_S` (default 5ms) for either `BATCH_MAX_SIZE` (default 8) matching-key requests to accumulate, or `BATCH_WAIT_S` (default 50ms) total to elapse — whichever comes first — then runs that group as one `generate_cached()` call instead of N sequential ones. Requests only batch together if they share an identical `(gen_length, steps, block_length, prompt_token_length)` key: different-length prompts would need padding plus an attention mask, which nothing in `model_update/model.py` supports today (`F.scaled_dot_product_attention` is always called with `attn_mask=None`), so mismatched requests land in separate batches rather than being forced together unsafely.
+`src/server.py` runs a dedicated background thread (`_batch_worker`) that collects concurrent requests instead of processing them one at a time, for `BACKEND == "fast_dense"` with `tp_size == 1` only. Once the first request of a new group arrives, it polls every `BATCH_POLL_INTERVAL_S` (default 5ms) for either `BATCH_MAX_SIZE` (default 64, see below) matching-key requests to accumulate, or `BATCH_WAIT_S` (default 50ms) total to elapse — whichever comes first — then runs that group as one `generate_cached()` call instead of N sequential ones. Requests only batch together if they share an identical `(gen_length, steps, block_length, prompt_token_length)` key: different-length prompts would need padding plus an attention mask, which nothing in `model_update/model.py` supports today (`F.scaled_dot_product_attention` is always called with `attn_mask=None`), so mismatched requests land in separate batches rather than being forced together unsafely.
 
 #### Validation: does it actually form large batches?
 
@@ -324,6 +324,45 @@ The trace pointed at a fixable source of the fragmented idle time: `_generate_bl
 | CPU-side launch calls (`cuda_runtime`) | 27,156 | 24,250 | **−10.7%** |
 
 Busy time is essentially untouched, exactly as expected — the fix changes zero math, only removes overhead sitting around it — while every overhead-side metric improved: less idle time, fewer and smaller gaps, fewer kernel launches, fewer CPU-side dispatch calls. Not the dominant lever (MoE's kernel time still dwarfs everything else in this workload), but a real, correctly-attributed, measured 6.5% reduction in wall-clock time for the same batch of work.
+
+#### Kernel-Level Validation: Occupancy, Memory Bandwidth, and Instruction Stalls (Nsight Compute)
+
+The Chrome trace above answers "is the GPU busy," but not *why* individual kernels are cheap or expensive once running — that needs per-kernel hardware-counter profiling (`ncu`, NVIDIA Nsight Compute), not a wall-clock timeline. Profiled the two hot kernels (`fused_moe_kernel`, the Triton grouped-GEMM; `pytorch_flash::flash_fwd_kernel`, PyTorch's bundled flash-attention) directly on a single A6000 at `--batch-size 1`, `32`, and `64` (`eval/check_time_inference.py`), full metric set (`ncu --set full`), 16 kernel launches sampled at each size.
+
+**At B=1, both kernels were underutilizing the GPU, for two different root causes:**
+
+| Metric | Attention (`flash_fwd_kernel`) | MoE (`fused_moe_kernel`, GEMM1) |
+|---|---:|---:|
+| Grid size | 16 blocks (vs 84 SMs) | 1,632 blocks |
+| Memory bandwidth used | ~7% of peak | **~96% of peak** |
+| Compute throughput used | ~4.3% of peak | ~16% of peak |
+| Achieved occupancy | ~8.3% | ~65% |
+| "No eligible warp" cycles | ~79.7% | ~93% (81.6% of it: L1TEX/memory scoreboard stalls) |
+
+Attention was **occupancy-starved**: only 16 blocks (one per KV head, B=1) against 84 SMs, so ~80% of cycles had literally no warp with work ready to issue — a launch-configuration problem, not a bandwidth or compute one. MoE was **already memory-bandwidth-bound**, pinned near the A6000's DRAM bandwidth ceiling: with 16 active tokens split across top-8-of-64 routing, each expert averages ~2 tokens, so the kernel spends most of its time streaming that expert's full weight matrix from memory to process almost nothing — the classic thin-GEMM regime. This is the mechanistic explanation for why kernel-launch-overhead techniques tried and reverted earlier (`torch.compile` on `Attention.forward` and on the SiLU×mul MoE activation, CUDA graph capture/replay — see git history) showed no benefit or a regression: neither technique changes how much work a kernel does once launched, and in both cases the bottleneck was underutilization *within* the kernel, not dispatch overhead *around* it.
+
+**Batching directly fixes both, by two different mechanisms — confirmed at the kernel level, not inferred from throughput alone:**
+
+| Metric | Attention, B=1 → 32 → 64 | MoE GEMM1, B=1 → 32 → 64 |
+|---|---:|---:|
+| Achieved occupancy | 8.3% → 15.5% → 15.5% (plateaus) | 65% → 33% → 33% (config change, not regression — see below) |
+| Compute throughput | 4.3% → 32.3% → 37.4% | 16% → 41.3% → 41.7% |
+| Memory throughput | 7.0% → 59.7% → 75.7% | 96% → 96% → 98% (stays saturated) |
+| Duration vs. tokens processed | grid scales 32×/64× with B | 32× tokens in only ~1.9× time at B=32 (~17× more work per μs); duration scales ~linearly with B from 32→64 (efficiency plateaus) |
+
+More concurrent sequences directly multiplies attention's grid size (more blocks to fill the 84 SMs), and more tokens per expert raises MoE's arithmetic intensity (same weight-load cost now amortized over far more useful compute) — both are the batching lever, not a kernel-dispatch lever. MoE's efficiency gain is front-loaded: the big win (thin-GEMM fixed) happens by B=32; B=32→64 still helps (real additional throughput) but per-token cost stops improving. MoE's occupancy % drop from 65%→33% between B=1 and B=32 reflects Triton's `get_best_config` selecting a different tuned kernel configuration for larger token counts (128-thread vs 256-thread blocks), not an efficiency regression — compute throughput rose 2.6× over the same transition.
+
+**End-to-end validation with real concurrent HTTP traffic** (`eval/throughput/run_throughput.py --concurrency 64 --n-requests 128 --fixed-prompt`, same A6000, `BACKEND=fast_dense`):
+
+| Metric | `BATCH_MAX_SIZE=8` (old default) | `BATCH_MAX_SIZE=64` (new default) | Change |
+|---|---:|---:|---:|
+| Output tok/s | 144.0 | 199.6 | **+39%** |
+| Wall time (128 req) | 112.9s | 81.5s | −28% |
+| Latency p50 | 56.18s | 36.89s | **−34%** |
+| Latency p95 | 56.72s | 44.56s | −21% |
+| Latency p99 | 56.72s | 52.01s | −8% |
+
+Not a throughput/latency tradeoff — a win on both simultaneously. With `BATCH_MAX_SIZE=8`, 128 concurrent requests need 16 sequential batch rounds, so most requests queue behind many earlier rounds before starting at all (hence p50/p95/p99 all clustered near the tail, ~56s). With `BATCH_MAX_SIZE=64`, only 2 rounds are needed, so most requests start almost immediately. `BATCH_MAX_SIZE`'s default was changed from 8 to 64 in `src/server.py` based on this data.
 
 ---
 

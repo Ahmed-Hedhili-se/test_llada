@@ -77,8 +77,19 @@ request_lock = threading.Lock()
 # select_transfer_indices() was vectorized to a single `.item()` per step
 # (not per row) as a separate fix earlier -- batching does not multiply that
 # cost with B, so it is not a concern for this batching path.
+#
+# Default of 64 (was 8): validated on a single A6000 via
+# eval/check_time_inference.py --batch-size {1,32,64} under Nsight Compute
+# (occupancy/memory-bandwidth/compute-throughput all kept improving up to at
+# least 64) and then confirmed end-to-end with real concurrent HTTP traffic
+# (eval/throughput/run_throughput.py --concurrency 64 --n-requests 128):
+# BATCH_MAX_SIZE=8 -> 144.0 tok/s, p50=56.18s; BATCH_MAX_SIZE=64 -> 199.6
+# tok/s, p50=36.89s. Not a throughput/latency tradeoff -- 8 forces 16
+# sequential batch rounds for 128 concurrent requests, so most requests sit
+# queued behind earlier rounds; 64 needs only 2 rounds, so most requests
+# start almost immediately.
 
-BATCH_MAX_SIZE = int(os.environ.get("BATCH_MAX_SIZE", 8))
+BATCH_MAX_SIZE = int(os.environ.get("BATCH_MAX_SIZE", 64))
 BATCH_WAIT_S = float(os.environ.get("BATCH_WAIT_S", 0.05))
 BATCH_POLL_INTERVAL_S = float(os.environ.get("BATCH_POLL_INTERVAL_S", 0.005))
 BATCH_REQUEST_TIMEOUT_S = float(os.environ.get("BATCH_REQUEST_TIMEOUT_S", 300))
