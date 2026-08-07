@@ -300,6 +300,42 @@ def call_server(
     return resp.json()["choices"][0]["message"]["content"]
 
 
+def call_server_raw(
+    base_url: str, prompt: str, timeout: int,
+    gen_config: Optional[dict] = None,
+    max_tokens: int = DEFAULT_COT_MAX_TOKENS,
+    steps: int = DEFAULT_COT_STEPS,
+    stop: Optional[list[str]] = None,
+) -> str:
+    """Raw text completion via /v1/completions -- no chat template, no
+    system message, unlike call_server(). Added to test whether dInfer's
+    actual eval methodology (raw few-shot text completion, e.g.
+    dInfer/evaluations/tasks/gsm8k/gsm8k-llada-moe.yaml's doc_to_text
+    fed with no chat markup and until: [...] stop sequences) scores
+    differently than call_server()'s chat-template-wrapped path -- a real
+    methodology gap identified by comparing this project's harness
+    against dInfer's actual eval config (see README's "Adaptive Decoding"
+    section)."""
+    payload = {
+        "model":       "inclusionAI/LLaDA-MoE-7B-A1B-Instruct",
+        "prompt":      prompt,
+        "temperature": 0.0,
+        "max_tokens":  max_tokens,
+        "steps":       steps,
+    }
+    if stop:
+        payload["stop"] = stop
+    if gen_config:
+        payload.update(gen_config)
+    resp = requests.post(
+        f"{base_url}/v1/completions",
+        json=payload,
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["text"]
+
+
 def parse_answer(text: str) -> Optional[str]:
     """Extract the model's answer letter, preferring an explicit
     'Final Answer: <letter>' / 'Answer: <letter>' marker (chain-of-thought

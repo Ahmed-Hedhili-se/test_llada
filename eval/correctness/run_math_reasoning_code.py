@@ -123,7 +123,7 @@ from typing import Callable, Optional
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from eval.correctness.run_correctness import (
-    call_server, print_results, print_comparison, save_summary,
+    call_server, call_server_raw, print_results, print_comparison, save_summary,
     DEFAULT_URL, DEFAULT_TIMEOUT, DEFAULT_COT_MAX_TOKENS, DEFAULT_COT_STEPS,
     DEFAULT_COT_BLOCK_LENGTH,
 )
@@ -152,6 +152,12 @@ PAPER_REFERENCE_TABLE3 = {
 # = steps / (max_tokens / block_length)) at the larger block_length, not
 # copied from any source -- see the module docstring's coupling note.
 GSM8K_GEN_DEFAULTS = {"max_tokens": 1024, "steps": 256, "block_length": 64}
+
+# dInfer's gsm8k-llada-moe.yaml generation_kwargs.until -- used with
+# --raw-completion, where the prompt is raw few-shot text (no chat template)
+# and the model can otherwise drift into hallucinating a new "Question: ..."
+# within its token budget.
+GSM8K_STOP_SEQUENCES = ["Question:", "</s>", "<|im_end|>"]
 
 # BBH and CRUX-O were tried at the paper's 1024/64 generative-benchmark
 # protocol (Section 4) and reverted: real evaluation showed it made both
@@ -565,6 +571,8 @@ def evaluate(
     max_tokens: int = DEFAULT_COT_MAX_TOKENS,
     steps: int = DEFAULT_COT_STEPS,
     transcript_path: Optional[str] = None,
+    raw_completion: bool = False,
+    stop: Optional[list[str]] = None,
 ) -> dict:
     correct = 0
     total = len(items)
@@ -573,10 +581,18 @@ def evaluate(
 
     def _eval_one(idx: int, item: TaskItem):
         try:
-            raw = call_server(
-                base_url, item.prompt, timeout, gen_config=gen_config,
-                system_prompt=system_prompt, max_tokens=max_tokens, steps=steps,
-            )
+            if raw_completion:
+                # No chat template, no system message -- see
+                # call_server_raw()'s docstring for why this exists.
+                raw = call_server_raw(
+                    base_url, item.prompt, timeout, gen_config=gen_config,
+                    max_tokens=max_tokens, steps=steps, stop=stop,
+                )
+            else:
+                raw = call_server(
+                    base_url, item.prompt, timeout, gen_config=gen_config,
+                    system_prompt=system_prompt, max_tokens=max_tokens, steps=steps,
+                )
             predicted = extract_final_answer(raw)
         except Exception as e:
             return idx, item, None, str(e)
@@ -701,6 +717,17 @@ def main():
     ap.add_argument("--low-confidence-threshold", type=float, default=0.4,
                     help="Floor applied to hierarchy decoding's per-segment picks. Ignored "
                          "unless --confidence-threshold is set.")
+    ap.add_argument(
+        "--raw-completion", action="store_true",
+        help="Send the prompt as raw text completion via /v1/completions "
+             "instead of wrapping it in the chat template + a system prompt "
+             "via /v1/chat/completions -- matches dInfer's actual eval "
+             "methodology (see gsm8k-llada-moe.yaml's doc_to_text, fed with "
+             "no chat markup at all) more closely than the default chat "
+             "path. For gsm8k, also applies GSM8K_STOP_SEQUENCES "
+             "(dInfer's generation_kwargs.until) to truncate drift. "
+             "Requires backend=fast_dense with tp_size=1 on the server.",
+    )
     args = ap.parse_args()
 
     seed = args.seed if args.seed is not None else random.randint(0, 999_999)
@@ -724,6 +751,7 @@ def main():
     if args.task == "gsm8k":
         print(f"Few-shot   : {args.num_fewshot}")
     print(f"Confidence threshold: {args.confidence_threshold} (low={args.low_confidence_threshold})")
+    print(f"Prompting  : {'raw completion (no chat template)' if args.raw_completion else 'chat-templated'}")
     print(f"Seed       : {seed}\n")
 
     print("Loading dataset...", flush=True)
@@ -736,11 +764,14 @@ def main():
         gen_config["confidence_threshold"] = args.confidence_threshold
         gen_config["low_confidence_threshold"] = args.low_confidence_threshold
 
+    stop = GSM8K_STOP_SEQUENCES if (args.raw_completion and args.task == "gsm8k") else None
+
     t0 = time.time()
     stats = evaluate(
         items, grade_fn, system_prompt, args.base_url, args.num_concurrent,
         args.timeout, gen_config=gen_config, max_tokens=max_tokens,
         steps=steps, transcript_path=args.save_transcripts,
+        raw_completion=args.raw_completion, stop=stop,
     )
     elapsed = time.time() - t0
 

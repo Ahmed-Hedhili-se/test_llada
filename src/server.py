@@ -340,10 +340,41 @@ class ChatRequest(BaseModel):
     # confidence_threshold, ported from dInfer's HierarchyDecoder) instead
     # of the default fixed-per-step reveal schedule. None (default) is the
     # exact original behavior. Validated on MMLU-Pro (44.0% acc) and GSM8K
-    # (68.0% acc) -- but see generate_cached's docstring for the required
-    # steps_per_block >= block_length / 2 ratio before trusting output with
-    # this set (violating it causes degenerate repetition). Only applies to
-    # the fast_dense/single-GPU batched path (see _PendingRequest).
+    # (see README's "Adaptive Decoding" section for current numbers) -- but
+    # see generate_cached's docstring for the required steps_per_block >=
+    # block_length / 2 ratio before trusting output with this set (violating
+    # it causes degenerate repetition). Only applies to the fast_dense/
+    # single-GPU batched path (see _PendingRequest).
+    confidence_threshold: Optional[float] = None
+    low_confidence_threshold: float = 0.4
+
+
+class CompletionRequest(BaseModel):
+    """Raw text completion -- no chat template, no system message, unlike
+    ChatRequest. Added specifically to test whether dInfer's own eval
+    methodology (dInfer/evaluations/tasks/gsm8k/gsm8k-llada-moe.yaml's
+    doc_to_text: "Question: ...\\nPlease reason step by step\\nAnswer:",
+    fed as raw few-shot text completion with no chat markup at all, no
+    system message, and until: ["Question:", "</s>", "<|im_end|>"] stop
+    sequences) scores differently than this project's existing
+    /v1/chat/completions path, which wraps the same prompt text through
+    the Instruct model's chat template plus an added system-prompt
+    instruction -- a real methodology gap identified by comparing this
+    project's harness against dInfer's actual eval config, suspected of
+    letting the model's chat-tuned formatting habits (markdown, "**bold**",
+    preambles) leak into what should be a clean raw-completion answer."""
+    model: str = "inclusionAI/LLaDA-MoE-7B-A1B-Instruct"
+    prompt: str
+    max_tokens: int = DEFAULT_GEN_LENGTH
+    temperature: float = DEFAULT_TEMPERATURE
+    steps: int = DEFAULT_STEPS
+    block_length: int = DEFAULT_BLOCK_LENGTH
+    # Truncate the generated text at the first occurrence of any of these
+    # substrings, applied client-side to the decoded text (this project's
+    # generation loop has no true early-stopping / causal KV cache the way
+    # an AR model's until-sequence stopping criterion would use -- diffusion
+    # generation always fills the full max_tokens budget regardless).
+    stop: Optional[list[str]] = None
     confidence_threshold: Optional[float] = None
     low_confidence_threshold: float = 0.4
 
@@ -515,6 +546,80 @@ def chat_completions(req: ChatRequest):
                 "message": {"role": "assistant", "content": text},
                 "finish_reason": "stop",
             }
+        ],
+        "usage": {
+            "prompt_tokens": input_ids.shape[1],
+            "completion_tokens": tokens_generated,
+            "total_tokens": input_ids.shape[1] + tokens_generated,
+        },
+        "timing": {"generation_seconds": round(elapsed, 3)},
+    }
+
+
+# ── Raw text completions (no chat template) ────────────────────────────────────
+@app.post("/v1/completions")
+def completions(req: CompletionRequest):
+    """See CompletionRequest's docstring. Scoped to the fast_dense/single-GPU
+    batched path only, same restriction confidence_threshold already has --
+    this is an experimental A/B path, not meant to cover every backend."""
+    from model_update.distributed import get_tp_size
+    if not (BACKEND == "fast_dense" and get_tp_size() == 1):
+        raise HTTPException(
+            status_code=400,
+            detail="/v1/completions only supports backend=fast_dense with tp_size=1",
+        )
+
+    input_ids = TOKENIZER(req.prompt, return_tensors="pt")["input_ids"].to(DEVICE)
+
+    gen_length   = req.max_tokens
+    block_length = req.block_length
+    if gen_length % block_length != 0:
+        gen_length = ((gen_length // block_length) + 1) * block_length
+
+    steps = req.steps
+    if steps % (gen_length // block_length) != 0:
+        steps = (gen_length // block_length) * max(1, steps // (gen_length // block_length))
+
+    t0 = time.time()
+    pending = _PendingRequest(
+        input_ids, gen_length, steps, block_length, req.temperature,
+        confidence_threshold=req.confidence_threshold,
+        low_confidence_threshold=req.low_confidence_threshold,
+    )
+    with _pending_lock:
+        _pending_queue.append(pending)
+        _new_request_event.set()
+    if not pending.event.wait(timeout=BATCH_REQUEST_TIMEOUT_S):
+        raise HTTPException(status_code=504, detail="Timed out waiting for a batch slot")
+    if pending.error is not None:
+        raise HTTPException(status_code=500, detail=str(pending.error))
+    out_ids = pending.result
+    elapsed = time.time() - t0
+
+    generated = out_ids[0].tolist()
+    eos_id = TOKENIZER.eos_token_id
+    if eos_id in generated:
+        generated = generated[: generated.index(eos_id)]
+    while generated and generated[-1] == 156895:  # MASK_ID
+        generated.pop()
+
+    text = TOKENIZER.decode(generated, skip_special_tokens=True)
+    tokens_generated = len(generated)
+
+    finish_reason = "length"
+    if req.stop:
+        cut = min((i for i in (text.find(s) for s in req.stop) if i != -1), default=None)
+        if cut is not None:
+            text = text[:cut]
+            finish_reason = "stop"
+
+    return {
+        "id": f"cmpl-{uuid.uuid4().hex[:8]}",
+        "object": "text_completion",
+        "created": int(time.time()),
+        "model": req.model,
+        "choices": [
+            {"index": 0, "text": text, "finish_reason": finish_reason}
         ],
         "usage": {
             "prompt_tokens": input_ids.shape[1],
