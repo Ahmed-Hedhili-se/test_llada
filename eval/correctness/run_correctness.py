@@ -105,10 +105,11 @@ DEFAULT_COT_MAX_TOKENS   = 256
 DEFAULT_COT_STEPS        = 128
 DEFAULT_COT_BLOCK_LENGTH = 32
 
-# arc_challenge uses the paper's own generative-benchmark protocol (Section 4:
-# "gen_length of 1024 and a block length of 64") instead of the short CoT
-# default above, for a directly comparable config.
-ARC_CHALLENGE_GEN_DEFAULTS = {"max_tokens": 1024, "steps": 256, "block_length": 64}
+# arc_challenge was tried at the paper's 1024/64 generative-benchmark protocol
+# (Section 4) and reverted: real evaluation showed it made accuracy WORSE
+# (88.0%->60.0% baseline, 80.0%->44.0% with confidence_threshold), not more
+# comparable to the paper -- see README's "Adaptive Decoding" section. Uses
+# the short DEFAULT_COT_* config below instead, same as every other task.
 
 
 # ── Dataset loading ──────────────────────────────────────────────────────────────
@@ -523,17 +524,13 @@ def main():
         ),
     )
     ap.add_argument("--max-tokens", type=int, default=None,
-                    help=f"Generation budget. Default: {DEFAULT_COT_MAX_TOKENS} (CoT) or 16 "
-                         f"(--direct-answer), {ARC_CHALLENGE_GEN_DEFAULTS['max_tokens']} for "
-                         "arc_challenge (matches the paper's protocol).")
+                    help=f"Generation budget. Default: {DEFAULT_COT_MAX_TOKENS} "
+                         f"(CoT) or 16 (--direct-answer).")
     ap.add_argument("--steps", type=int, default=None,
-                    help=f"Diffusion steps. Default: {DEFAULT_COT_STEPS} (CoT) or 32 "
-                         f"(--direct-answer), {ARC_CHALLENGE_GEN_DEFAULTS['steps']} for "
-                         "arc_challenge (matches the paper's protocol).")
-    ap.add_argument("--block-length", type=int, default=None,
-                    help=f"Server-side block_length for generation. Default: "
-                         f"{DEFAULT_COT_BLOCK_LENGTH}, {ARC_CHALLENGE_GEN_DEFAULTS['block_length']} "
-                         "for arc_challenge (matches the paper's protocol).")
+                    help=f"Diffusion steps. Default: {DEFAULT_COT_STEPS} "
+                         f"(CoT) or 32 (--direct-answer).")
+    ap.add_argument("--block-length", type=int, default=DEFAULT_COT_BLOCK_LENGTH,
+                    help="Server-side block_length for generation.")
     ap.add_argument("--confidence-threshold", type=float, default=None,
                     help="Opt-in hierarchical threshold-based decoding (see "
                          "model_update/generate.py's generate_cached, ported from dInfer's "
@@ -556,14 +553,8 @@ def main():
     args = ap.parse_args()
 
     cot = not args.direct_answer
-    if args.task == "arc_challenge":
-        max_tokens = args.max_tokens if args.max_tokens is not None else ARC_CHALLENGE_GEN_DEFAULTS["max_tokens"]
-        steps      = args.steps if args.steps is not None else ARC_CHALLENGE_GEN_DEFAULTS["steps"]
-        args.block_length = args.block_length if args.block_length is not None else ARC_CHALLENGE_GEN_DEFAULTS["block_length"]
-    else:
-        max_tokens = args.max_tokens if args.max_tokens is not None else (DEFAULT_COT_MAX_TOKENS if cot else 16)
-        steps      = args.steps if args.steps is not None else (DEFAULT_COT_STEPS if cot else 32)
-        args.block_length = args.block_length if args.block_length is not None else DEFAULT_COT_BLOCK_LENGTH
+    max_tokens = args.max_tokens if args.max_tokens is not None else (DEFAULT_COT_MAX_TOKENS if cot else 16)
+    steps      = args.steps if args.steps is not None else (DEFAULT_COT_STEPS if cot else 32)
 
     if args.task in _CODE_TASKS:
         print(

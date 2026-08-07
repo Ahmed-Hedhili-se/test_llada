@@ -528,7 +528,20 @@ Extending beyond MMLU-Pro/GSM8K to BBH, CRUX-O, and ARC-Challenge (all n=50, see
 
 BBH and CRUX-O improve, matching the MMLU-Pro direction; ARC-Challenge regresses. A plausible reason: ARC-Challenge's baseline is already high (88%) — there's little room for the threshold path's coarser, faster reveals to help, and more room for it to lock in a wrong choice that the fixed schedule's finer-grained, more self-correcting reveals would have avoided. Combined with the cross-hardware variance above (same task, same everything else, different GPU alone moved MMLU-Pro 8 points), the overall conclusion is: `confidence_threshold` is worth evaluating per-task and per-deployment before enabling by default, not something to flip on globally based on one or two benchmark wins.
 
-**Config note**: the table above used the short-CoT default (`max_tokens=256, block_length=32`) for all three tasks, which for CRUX-O in particular is far short of the paper's own `gen_length=1024, block_length=64` protocol (Section 4) -- `run_math_reasoning_code.py`'s BBH/CRUX-O and `run_correctness.py`'s ARC-Challenge defaults now use `max_tokens=1024, steps=256, block_length=64` to match it directly, so these three numbers are stale relative to the current defaults and need re-running for a paper-comparable result.
+**Config experiment, tried and reverted**: since the table above uses a short-CoT config (`max_tokens=256, block_length=32`) far below the paper's own `gen_length=1024, block_length=64` protocol (Section 4), BBH/CRUX-O/ARC-Challenge were switched to `max_tokens=1024, steps=256, block_length=64` to match it directly, on the theory this would make results more paper-comparable. Real evaluation showed the opposite — it made every one of these tasks worse except BBH (whose short answers never used the extra budget anyway):
+
+| Task | 256/32 config | 1024/64 config | Δ |
+|---|---:|---:|---:|
+| BBH baseline | 38.0% (19/50) | 38.0% (19/50) | 0 |
+| BBH + threshold | 42.0% (21/50) | 42.0% (21/50) | 0 |
+| CRUX-O baseline | 18.0% (9/50) | 14.0% (7/50) | -4.0 pts |
+| CRUX-O + threshold | 28.0% (14/50) | **4.0% (2/50)** | **-24.0 pts** |
+| ARC-Challenge baseline | 88.0% (44/50) | **60.0% (30/50)** | **-28.0 pts** |
+| ARC-Challenge + threshold | 80.0% (40/50) | **44.0% (22/50)** | **-36.0 pts** |
+
+Two separate mechanisms explain this: (1) for the `confidence_threshold` runs, `block_length=64` with `steps=256` gives `steps_per_block=16` — ratio 0.25, the same unsafe zone documented above that caused GSM8K's original collapse, striking CRUX-O the same way; (2) for the *baseline* runs, which shouldn't be vulnerable to that mechanism at all, `steps_per_block` stayed at 16 in both configs while `block_length` doubled — meaning roughly twice as many tokens get revealed per step (coarser granularity), undercutting the fixed schedule's fine-grained "iterative self-consistency" that the naive-threshold section above already identified as important, on top of simply giving a short-multiple-choice task 4x more room for its CoT to drift before the "Final Answer: X" line.
+
+The deeper lesson: the paper's `gen_length=1024, block_length=64` protocol is stated for its "generative benchmarks" specifically, and its MMLU-Pro-style numbers were almost certainly scored via log-likelihood over answer choices, not free-form generation at all — matching its generation-length knob doesn't make a fundamentally different scoring methodology (ours: generate CoT text, then extract via string search) more comparable to its results. **Reverted**: BBH, CRUX-O, and ARC-Challenge are back on the short `256/32` config (the numbers in the table above), which is what actually performs best under this harness.
 
 **Usage:**
 
