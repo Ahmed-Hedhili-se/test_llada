@@ -543,6 +543,21 @@ Two separate mechanisms explain this: (1) for the `confidence_threshold` runs, `
 
 The deeper lesson: the paper's `gen_length=1024, block_length=64` protocol is stated for its "generative benchmarks" specifically, and its MMLU-Pro-style numbers were almost certainly scored via log-likelihood over answer choices, not free-form generation at all — matching its generation-length knob doesn't make a fundamentally different scoring methodology (ours: generate CoT text, then extract via string search) more comparable to its results. **Reverted**: BBH, CRUX-O, and ARC-Challenge are back on the short `256/32` config (the numbers in the table above), which is what actually performs best under this harness.
 
+#### Prompting methodology vs dInfer's reference: chat-template, tried raw completion, kept chat-template
+
+A comparative code review against dInfer's actual eval config (`dInfer/evaluations/tasks/gsm8k/gsm8k-llada-moe.yaml`, Ant Group's own inference framework for this exact model) surfaced a structural difference: dInfer's reference feeds GSM8K as **raw few-shot text completion** — `doc_to_text: "Question: {{question}}\nPlease reason step by step\nAnswer:"`, no chat template, no system message, `generation_kwargs.until: ["Question:", "</s>", "<|im_end|>"]` for stopping — the classic lm-eval-harness pattern. This project's correctness harness instead sends the same few-shot text through the Instruct model's chat template (`apply_chat_template`) plus an added system-prompt instruction. The working hypothesis was that this mismatch explained the recurring markdown/chat-style noise in transcripts throughout this investigation (`**52**.`, `$$`, `The answer is **138**.`) and that switching to raw completion would reduce it and close some of the gap to the paper's 82.41%.
+
+Real evaluation disproved the hypothesis. A `/v1/completions` endpoint (`src/server.py`'s `CompletionRequest` — tokenizes the prompt directly, no chat template, with client-side stop-sequence truncation) and a `--raw-completion` flag on `run_math_reasoning_code.py` were added specifically to A/B this, holding task/seed/limit/config identical:
+
+| Prompting mode | GSM8K (n=50, seed=42) |
+|---|---:|
+| Chat-template (existing default) | **68.0%** (34/50) |
+| Raw completion (dInfer's actual format) | **58.0%** (29/50) |
+
+Raw completion scored 10 points *worse*, with visibly more frequent degenerate-repetition collapses in the transcripts, not fewer. Likely explanation: this is the **Instruct** (SFT'd) checkpoint, fine-tuned specifically on chat-formatted conversations — feeding it dInfer's raw-completion format (closer to what its *base* pretraining distribution looked like) is arguably more out-of-distribution for this specific checkpoint than the chat template it was actually tuned to expect, and that distribution shift outweighs whatever benefit avoiding chat-markdown-noise might have provided. dInfer's yaml tells us the convention its own harness follows (and how the paper's Table 3 number was plausibly produced) — it doesn't mean that convention is more reliable for this checkpoint when driven through a different, independently-built harness.
+
+**Kept as an opt-in diagnostic, not adopted as the default**: `--raw-completion` and `/v1/completions` remain in the codebase (real, working, useful for future A/B checks — e.g. on other tasks, or if the underlying repetition issue gets further reduced) but `run_math_reasoning_code.py`/`run_correctness.py` continue to default to the chat-template path, since it empirically performs better for this checkpoint under this harness.
+
 **Usage:**
 
 ```bash
