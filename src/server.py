@@ -124,7 +124,7 @@ MAX_THREADPOOL_WORKERS = int(os.environ.get("MAX_THREADPOOL_WORKERS", 128))
 
 class _PendingRequest:
     def __init__(self, input_ids, gen_length, steps, block_length, temperature,
-                 confidence_threshold=None, low_confidence_threshold=0.4):
+                 confidence_threshold=None, low_confidence_threshold=0.4, no_cache=False):
         self.input_ids = input_ids
         self.gen_length = gen_length
         self.steps = steps
@@ -132,19 +132,20 @@ class _PendingRequest:
         self.temperature = temperature
         self.confidence_threshold = confidence_threshold
         self.low_confidence_threshold = low_confidence_threshold
+        self.no_cache = no_cache
         self.event = threading.Event()
         self.result = None
         self.error = None
 
     @property
     def key(self):
-        # confidence_threshold/low_confidence_threshold included: requests
-        # must share the exact same generation config to be batched into one
-        # generate_cached() call, same reasoning as gen_length/steps/
-        # block_length already being here.
+        # confidence_threshold/low_confidence_threshold/no_cache included:
+        # requests must share the exact same generation config to be batched
+        # into one generate_cached()/generate_dense() call, same reasoning as
+        # gen_length/steps/block_length already being here.
         return (
             self.gen_length, self.steps, self.block_length, self.input_ids.shape[1],
-            self.confidence_threshold, self.low_confidence_threshold,
+            self.confidence_threshold, self.low_confidence_threshold, self.no_cache,
         )
 
 
@@ -186,17 +187,31 @@ def _run_batch(batch: list["_PendingRequest"]):
     gap_str = f"{now - _last_batch_end_time:.3f}s" if _last_batch_end_time is not None else "n/a (first batch)"
     print(f"[batch] size={len(batch)} key={batch[0].key} gap_since_prev_batch_end={gap_str}", flush=True)
     try:
-        from model_update.generate import generate_cached
+        from model_update.generate import generate_cached, generate_dense
         input_ids = torch.cat([r.input_ids for r in batch], dim=0)
         first = batch[0]
-        gen_kwargs = dict(
-            gen_length=first.gen_length,
-            steps=first.steps,
-            block_length=first.block_length,
-            temperature=first.temperature,
-            confidence_threshold=first.confidence_threshold,
-            low_confidence_threshold=first.low_confidence_threshold,
-        )
+        if first.no_cache:
+            # generate_dense has no confidence_threshold support (see its
+            # docstring) -- ChatRequest already rejects that combination
+            # before a request ever reaches here, so gen_kwargs is
+            # deliberately narrower for this path.
+            gen_fn = generate_dense
+            gen_kwargs = dict(
+                gen_length=first.gen_length,
+                steps=first.steps,
+                block_length=first.block_length,
+                temperature=first.temperature,
+            )
+        else:
+            gen_fn = generate_cached
+            gen_kwargs = dict(
+                gen_length=first.gen_length,
+                steps=first.steps,
+                block_length=first.block_length,
+                temperature=first.temperature,
+                confidence_threshold=first.confidence_threshold,
+                low_confidence_threshold=first.low_confidence_threshold,
+            )
         if PROFILE_BATCHES:
             # Chrome/Perfetto trace JSON -- shows actual GPU busy vs idle
             # time during this batch's generate_cached() call, not just
@@ -219,7 +234,7 @@ def _run_batch(batch: list["_PendingRequest"]):
             if os.environ.get("PROFILE_CPU", "0") == "1":
                 activities.insert(0, torch.profiler.ProfilerActivity.CPU)
             with torch.no_grad(), torch.profiler.profile(activities=activities) as prof:
-                out_ids = generate_cached(MODEL, input_ids, **gen_kwargs)
+                out_ids = gen_fn(MODEL, input_ids, **gen_kwargs)
             trace_path = os.path.join(
                 PROFILE_DIR, f"batch_size{len(batch)}_{int(time.time() * 1000)}.json"
             )
@@ -227,7 +242,7 @@ def _run_batch(batch: list["_PendingRequest"]):
             print(f"[profile] wrote {trace_path}", flush=True)
         else:
             with torch.no_grad():
-                out_ids = generate_cached(MODEL, input_ids, **gen_kwargs)
+                out_ids = gen_fn(MODEL, input_ids, **gen_kwargs)
         for i, req in enumerate(batch):
             req.result = out_ids[i : i + 1]
     except Exception as e:
@@ -347,6 +362,19 @@ class ChatRequest(BaseModel):
     # single-GPU batched path (see _PendingRequest).
     confidence_threshold: Optional[float] = None
     low_confidence_threshold: float = 0.4
+    # Opt-in: use model_update/generate.py's generate_dense (same model
+    # class/weights/Triton fused MoE as the normal path, but NO KV cache --
+    # every step recomputes the full sequence from scratch) instead of
+    # generate_cached. Added to test whether block-wise KV caching itself is
+    # the source of the ~6pt residual accuracy gap vs the HF reference found
+    # in the Correctness Verification investigation (README.md /
+    # INVESTIGATION_LOG.md Part 2 §2.9) -- generate_dense's only difference
+    # from HF's reference path at that point is caching, so if accuracy with
+    # no_cache=True closes most of that gap, caching is confirmed as the
+    # cause; if it doesn't, something else is. Incompatible with
+    # confidence_threshold (generate_dense doesn't implement it). Only
+    # applies to the fast_dense/single-GPU batched path.
+    no_cache: bool = False
 
 
 class CompletionRequest(BaseModel):
@@ -441,10 +469,17 @@ def chat_completions(req: ChatRequest):
     if BACKEND == "fast_dense" and get_tp_size() == 1:
         # Batched path -- see the "Server-side request batching" block above
         # for why this is scoped to single-GPU only.
+        if req.no_cache and req.confidence_threshold is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="no_cache and confidence_threshold are incompatible -- "
+                       "generate_dense (no_cache=True) doesn't implement threshold decoding.",
+            )
         pending = _PendingRequest(
             input_ids, gen_length, steps, block_length, req.temperature,
             confidence_threshold=req.confidence_threshold,
             low_confidence_threshold=req.low_confidence_threshold,
+            no_cache=req.no_cache,
         )
         with _pending_lock:
             _pending_queue.append(pending)

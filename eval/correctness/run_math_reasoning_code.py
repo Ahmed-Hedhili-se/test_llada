@@ -728,7 +728,25 @@ def main():
              "(dInfer's generation_kwargs.until) to truncate drift. "
              "Requires backend=fast_dense with tp_size=1 on the server.",
     )
+    ap.add_argument(
+        "--no-cache", action="store_true",
+        help="Use model_update's generate_dense instead of generate_cached -- "
+             "same model class/weights/Triton fused MoE, but NO block-wise KV "
+             "cache (every step recomputes the full sequence from scratch). "
+             "Added to test whether caching itself is the source of the ~6pt "
+             "residual accuracy gap vs the HF reference (see "
+             "INVESTIGATION_LOG.md Part 2 SS2.9 / README's Correctness "
+             "Verification section). Incompatible with --confidence-threshold "
+             "(generate_dense doesn't implement it). Requires backend="
+             "fast_dense with tp_size=1 on the server. Expect noticeably "
+             "slower generation than the normal cached path.",
+    )
     args = ap.parse_args()
+
+    if args.no_cache and args.confidence_threshold is not None:
+        print("[ERROR] --no-cache and --confidence-threshold are incompatible "
+              "(generate_dense doesn't implement threshold decoding).")
+        sys.exit(1)
 
     seed = args.seed if args.seed is not None else random.randint(0, 999_999)
     random.seed(seed)
@@ -752,6 +770,7 @@ def main():
         print(f"Few-shot   : {args.num_fewshot}")
     print(f"Confidence threshold: {args.confidence_threshold} (low={args.low_confidence_threshold})")
     print(f"Prompting  : {'raw completion (no chat template)' if args.raw_completion else 'chat-templated'}")
+    print(f"KV cache   : {'DISABLED (--no-cache, generate_dense)' if args.no_cache else 'enabled (generate_cached)'}")
     print(f"Seed       : {seed}\n")
 
     print("Loading dataset...", flush=True)
@@ -763,6 +782,8 @@ def main():
     if args.confidence_threshold is not None:
         gen_config["confidence_threshold"] = args.confidence_threshold
         gen_config["low_confidence_threshold"] = args.low_confidence_threshold
+    if args.no_cache:
+        gen_config["no_cache"] = True
 
     stop = GSM8K_STOP_SEQUENCES if (args.raw_completion and args.task == "gsm8k") else None
 
