@@ -152,6 +152,17 @@ def optimized_generate(model, prompt_ids, gen_length, steps, block_length,
     )
 
 
+def optimized_generate_no_cache(model, prompt_ids, gen_length, steps, block_length):
+    """Same model class/weights (Triton fused MoE, static top-8) as
+    optimized_generate, but with NO KV cache -- every step recomputes the
+    full sequence from scratch. Isolates block-wise KV caching's own
+    contribution to speed, separate from Triton MoE fusion (both this and
+    optimized_generate run identical model code/weights otherwise). See
+    model_update/generate.py's generate_dense docstring."""
+    from model_update.generate import generate_dense
+    return generate_dense(model, prompt_ids, gen_length, steps, block_length)
+
+
 # ── benchmarking ─────────────────────────────────────────────────────────────
 
 def benchmark(gen_fn, device, num_warmup, num_runs):
@@ -206,7 +217,23 @@ def main():
                          "select_transfer_indices_hierarchy). Ignored unless "
                          "--confidence-threshold is set. Default matches dInfer's "
                          "HierarchyDecoder default.")
+    ap.add_argument("--no-cache", action="store_true",
+                    help="Benchmark the optimized model WITHOUT block-wise KV caching -- "
+                         "same model_update model class/weights (Triton fused MoE, static "
+                         "top-8) as the normal optimized path, but every step recomputes the "
+                         "full sequence from scratch (model_update/generate.py's "
+                         "generate_dense). Isolates caching's own contribution to speed, "
+                         "separate from Triton MoE fusion. Only affects --mode "
+                         "optimized/both's optimized run; incompatible with "
+                         "--confidence-threshold (that's specific to the cached path's "
+                         "block-wise force-reveal logic -- generate_dense doesn't implement "
+                         "it).")
     args = ap.parse_args()
+
+    if args.no_cache and args.confidence_threshold is not None:
+        print("--no-cache and --confidence-threshold are incompatible (confidence_threshold "
+              "is specific to the cached path); ignoring --confidence-threshold.")
+        args.confidence_threshold = None
 
     if args.batch_size > 1 and args.mode in ["both", "baseline"]:
         print("--batch-size > 1 only applies to the optimized path; switching mode to 'optimized'.")
@@ -241,6 +268,7 @@ def main():
         print(f"  Benchmark Runs   : {args.num_runs}")
         print(f"  Batch Size       : {args.batch_size}")
         print(f"  Confidence Thresh: {args.confidence_threshold} (low={args.low_confidence_threshold})")
+        print(f"  Optimized cache  : {'DISABLED (--no-cache)' if args.no_cache else 'enabled (block-wise KV cache)'}")
         print("=" * 80 + "\n")
 
     if not os.path.isdir(args.weight_dir):
@@ -298,25 +326,31 @@ def main():
     if args.mode in ["both", "optimized"]:
         if is_master:
             print("=" * 60)
-            print("  2. OPTIMIZED  (model_update/, fused MoE, topk=8, KV cache)")
+            if args.no_cache:
+                print("  2. OPTIMIZED  (model_update/, fused MoE, topk=8, NO KV cache)")
+            else:
+                print("  2. OPTIMIZED  (model_update/, fused MoE, topk=8, KV cache)")
             print("=" * 60)
         opt_model, opt_load_time = load_optimized(args.weight_dir, args.device)
         if is_master:
             print(f"  Loaded in {opt_load_time:.2f}s")
 
-        set_seed(42)
-        opt_tokens = optimized_generate(
-            opt_model, prompt_ids, args.gen_length, args.steps, args.block_length,
-            confidence_threshold=args.confidence_threshold,
-            low_confidence_threshold=args.low_confidence_threshold,
-        )[0].cpu()
-
-        opt_lats = benchmark(
-            lambda: optimized_generate(
+        def _run_optimized():
+            if args.no_cache:
+                return optimized_generate_no_cache(
+                    opt_model, prompt_ids, args.gen_length, args.steps, args.block_length,
+                )
+            return optimized_generate(
                 opt_model, prompt_ids, args.gen_length, args.steps, args.block_length,
                 confidence_threshold=args.confidence_threshold,
                 low_confidence_threshold=args.low_confidence_threshold,
-            ),
+            )
+
+        set_seed(42)
+        opt_tokens = _run_optimized()[0].cpu()
+
+        opt_lats = benchmark(
+            _run_optimized,
             args.device, args.num_warmup, args.num_runs,
         )
         opt_mean, opt_med, opt_p95 = get_stats(opt_lats)

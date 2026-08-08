@@ -33,14 +33,13 @@ import sys
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 
 workspace_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(workspace_root))
 
 from model_update.distributed import init_distributed
 from model_update.model import LLaDAMoEKV, FULL_CFG
-from model_update.generate import generate_cached, add_gumbel_noise, get_num_transfer_tokens
+from model_update.generate import generate_cached, generate_dense
 from eval.correctness.run_correctness import (
     build_prompt, load_dataset_for_task, SYSTEM_PROMPT_COT, CHOICES,
     DEFAULT_COT_MAX_TOKENS, DEFAULT_COT_STEPS, DEFAULT_COT_BLOCK_LENGTH,
@@ -48,59 +47,12 @@ from eval.correctness.run_correctness import (
 
 MASK_ID = 156895
 
-
-@torch.no_grad()
-def generate_dense(model, prompt_ids, gen_length, steps, block_length, temperature=0.0, remasking="low_confidence"):
-    """Same denoising algorithm as generate_cached, but recomputes the FULL
-    sequence from scratch every step (no KV cache at all) -- mirrors
-    src.generate.generate's algorithm, through model_update's own model
-    class/weights, to isolate caching as the only variable."""
-    device = prompt_ids.device
-    P = prompt_ids.shape[1]
-    total_len = P + gen_length
-    x = torch.full((1, total_len), MASK_ID, dtype=torch.long, device=device)
-    x[:, :P] = prompt_ids
-
-    num_blocks = gen_length // block_length
-    steps_per_block = steps // num_blocks
-
-    for block_idx in range(num_blocks):
-        block_start = P + block_idx * block_length
-        block_end = P + (block_idx + 1) * block_length
-        block_mask_index = (x[:, block_start:block_end] == MASK_ID)
-        num_transfer = get_num_transfer_tokens(block_mask_index, steps_per_block)
-
-        for step in range(steps_per_block):
-            active_ids = x[:, block_start:block_end]
-            mask_index = (active_ids == MASK_ID)
-
-            full_logits, _ = model(x, position_offset=0)
-            logits = full_logits[:, block_start:block_end]
-
-            logits_with_noise = add_gumbel_noise(logits, temperature)
-            x0 = logits_with_noise.argmax(dim=-1)
-
-            if remasking == "low_confidence":
-                p = F.softmax(logits.float(), dim=-1)
-                x0_p = p.gather(-1, x0.unsqueeze(-1)).squeeze(-1)
-            else:
-                x0_p = torch.rand(x0.shape, device=device)
-
-            x0 = torch.where(mask_index, x0, active_ids)
-            confidence = torch.where(mask_index, x0_p, torch.full_like(x0_p, -torch.inf))
-
-            transfer_index = torch.zeros_like(x0, dtype=torch.bool)
-            for j in range(confidence.shape[0]):
-                k = num_transfer[j, step].item()
-                if k > 0:
-                    _, sel = torch.topk(confidence[j], k=int(k))
-                    transfer_index[j, sel] = True
-
-            active_ids = active_ids.clone()
-            active_ids[transfer_index] = x0[transfer_index]
-            x[:, block_start:block_end] = active_ids
-
-    return x[:, P:]
+# generate_dense (the no-KV-cache comparison path) now lives in
+# model_update/generate.py -- also used by eval/check_time_inference.py's
+# --no-cache flag for timing. Was a local duplicate here (with a slower,
+# Python-loop per-row topk selection unsuitable for timing use); switched
+# to the shared, vectorized implementation so both call sites always test
+# the exact same "dense" semantics.
 
 
 def main():

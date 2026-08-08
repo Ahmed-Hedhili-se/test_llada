@@ -397,3 +397,77 @@ def generate_cached(
         )
 
     return x[:, P:]
+
+
+@torch.no_grad()
+def generate_dense(
+    model,
+    prompt_ids: torch.Tensor,
+    gen_length: int = 128,
+    steps: int = 128,
+    block_length: int = 128,
+    temperature: float = 0.0,
+    remasking: str = "low_confidence",
+) -> torch.Tensor:
+    """Same fixed-schedule algorithm as generate_cached, but with NO KV
+    cache at all -- every step recomputes the FULL sequence from scratch
+    via a stateless forward pass (cache_buffer=None), exactly like
+    src.generate.generate()'s and HF's reference algorithm, just through
+    this project's own model class/weights. Exists to isolate block-wise
+    KV caching's own contribution to speed and accuracy, separate from
+    Triton fused MoE (both generate_cached and generate_dense run the
+    same model_update model class/weights, so caching is the only
+    variable) -- used by eval/check_time_inference.py's --no-cache flag
+    for timing, and eval/diagnose_cache_vs_dense.py for the correctness
+    investigation that originally found the KV-cache priming bug (see
+    INVESTIGATION_LOG.md Part 2).
+
+    No confidence_threshold support -- that's specific to the cached
+    path's block-wise force-reveal safety net (see generate_cached's
+    docstring); this function only implements the fixed schedule.
+    """
+    assert gen_length % block_length == 0, "gen_length must be divisible by block_length"
+    num_blocks = gen_length // block_length
+    steps_per_block = steps // num_blocks
+    device = prompt_ids.device
+    B, P = prompt_ids.shape
+    total_len = P + gen_length
+
+    x = torch.full((B, total_len), MASK_ID, dtype=torch.long, device=device)
+    x[:, :P] = prompt_ids
+
+    for block_idx in range(num_blocks):
+        block_start = P + block_idx * block_length
+        block_end = P + (block_idx + 1) * block_length
+        block_mask_index = (x[:, block_start:block_end] == MASK_ID)
+        num_transfer = get_num_transfer_tokens(block_mask_index, steps_per_block)
+
+        for step in range(steps_per_block):
+            active_ids = x[:, block_start:block_end]
+            mask_index = (active_ids == MASK_ID)
+            if not mask_index.any():
+                break
+
+            full_logits, _ = model(x, position_offset=0)
+            logits = full_logits[:, block_start:block_end]
+
+            logits_with_noise = add_gumbel_noise(logits, temperature)
+            x0_raw = logits_with_noise.argmax(dim=-1)
+
+            if remasking == "low_confidence":
+                p = F.softmax(logits.float(), dim=-1)
+                x0_p = p.gather(-1, x0_raw.unsqueeze(-1)).squeeze(-1)
+            elif remasking == "random":
+                x0_p = torch.rand(x0_raw.shape, device=device)
+            else:
+                raise ValueError(f"Unknown remasking: {remasking}")
+
+            x0 = torch.where(mask_index, x0_raw, active_ids)
+            confidence = torch.where(mask_index, x0_p, torch.full_like(x0_p, -torch.inf))
+            transfer_index = select_transfer_indices(confidence, num_transfer[:, step])
+
+            active_ids = active_ids.clone()
+            active_ids[transfer_index] = x0[transfer_index]
+            x[:, block_start:block_end] = active_ids
+
+    return x[:, P:]
