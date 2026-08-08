@@ -74,17 +74,18 @@ def make_diffusion_input(prompt_ids, gen_length):
     return x, P
 
 
-def run_ours_with_hooks(weight_dir, x):
+def run_ours_with_hooks(weight_dir, x, eager_moe=False):
     from model_update.model import LLaDAMoEKV, TritonFusedMoEBlock
     from src.model import load_weights
 
-    print("  Loading model_update...")
+    print(f"  Loading model_update ({'eager MoEBlock' if eager_moe else 'Triton fused MoE'})...")
     model = LLaDAMoEKV(use_fused_moe=False).to(torch.bfloat16).eval()
     load_weights(model, weight_dir, verbose=False)
-    for layer in model.layers:
-        fused_mlp = TritonFusedMoEBlock(layer.mlp.cfg).to(torch.bfloat16)
-        fused_mlp.load_state_dict_from_unfused(layer.mlp)
-        layer.mlp = fused_mlp
+    if not eager_moe:
+        for layer in model.layers:
+            fused_mlp = TritonFusedMoEBlock(layer.mlp.cfg).to(torch.bfloat16)
+            fused_mlp.load_state_dict_from_unfused(layer.mlp)
+            layer.mlp = fused_mlp
     model = model.to("cuda:0")
 
     captured = []
@@ -130,11 +131,11 @@ def _find_decoder_layers(model, expected_len):
     return [(f"{name}.{i}", layer) for i, layer in enumerate(module_list)]
 
 
-def run_hf_with_hooks(weight_dir, x, expected_layers):
-    print("  Loading HF reference...")
+def run_hf_with_hooks(weight_dir, x, expected_layers, attn_impl="eager"):
+    print(f"  Loading HF reference (attn_implementation={attn_impl})...")
     model = AutoModelForCausalLM.from_pretrained(
         weight_dir, trust_remote_code=True, torch_dtype=torch.bfloat16,
-        attn_implementation="eager",
+        attn_implementation=attn_impl,
     ).to("cuda:0").eval()
 
     layer_modules = _find_decoder_layers(model, expected_layers)
@@ -176,6 +177,22 @@ def report_region(name, our_hidden, hf_hidden, lo, hi, n_layers):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--weight-dir", default="weights")
+    ap.add_argument("--eager-moe", action="store_true",
+                    help="Use model_update's eager MoEBlock instead of converting to the "
+                         "Triton fused kernel. The eager block is a near-line-for-line match "
+                         "of HF's reference loop (sequential expert-ID order, index_add_ into "
+                         "a bf16 accumulator, nn.Linear/cuBLAS experts), so comparing this run "
+                         "against the default isolates the Triton MoE kernel's own "
+                         "contribution to the divergence.")
+    ap.add_argument("--hf-attn", choices=["eager", "sdpa"], default="eager",
+                    help="HF attn_implementation. model_update always uses "
+                         "F.scaled_dot_product_attention; loading HF with 'sdpa' aligns the "
+                         "attention kernel family on both sides, isolating attention's "
+                         "contribution to the divergence (the 90%% expert-set mismatch rate "
+                         "already present at layer 0 -- BEFORE any MoE computation runs -- "
+                         "can only come from attention/norm/RoPE, so this is the leading "
+                         "suspect). The checkpoint ships LLaDAMoESdpaAttention, so 'sdpa' is "
+                         "supported.")
     args = ap.parse_args()
 
     from model_update.model import FULL_CFG
@@ -187,11 +204,14 @@ def main():
     print(f"Expected answer: {item.expected}")
     print(f"Input shape: {tuple(x.shape)}  (prompt + {GEN_LEN} masked positions)\n")
 
+    print(f"Config: ours={'eager MoE' if args.eager_moe else 'Triton fused MoE'} + SDPA attention, "
+          f"HF=attn_implementation={args.hf_attn}\n")
+
     print("Running model_update (ours) with per-layer hooks...")
-    our_logits, our_hidden = run_ours_with_hooks(args.weight_dir, x)
+    our_logits, our_hidden = run_ours_with_hooks(args.weight_dir, x, eager_moe=args.eager_moe)
 
     print("Running HF reference with per-layer hooks...")
-    hf_logits, hf_hidden = run_hf_with_hooks(args.weight_dir, x, FULL_CFG.NL)
+    hf_logits, hf_hidden = run_hf_with_hooks(args.weight_dir, x, FULL_CFG.NL, attn_impl=args.hf_attn)
 
     n_layers = min(len(our_hidden), len(hf_hidden))
     if len(our_hidden) != len(hf_hidden):
