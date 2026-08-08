@@ -570,6 +570,22 @@ Raw completion scored 10 points *worse*, with visibly more frequent degenerate-r
 
 **Kept as an opt-in diagnostic, not adopted as the default**: `--raw-completion` and `/v1/completions` remain in the codebase (real, working, useful for future A/B checks — e.g. on other tasks, or if the underlying repetition issue gets further reduced) but `run_math_reasoning_code.py`/`run_correctness.py` continue to default to the chat-template path, since it empirically performs better for this checkpoint under this harness.
 
+#### Recommended configuration: correctness is won at the decoding layer, not the kernel layer
+
+After the kernel-level investigation closed (see Correctness Verification: the ~6pt fixed-schedule gap vs HF is inherent numerical sensitivity, not fixable), a systematic decoding-config comparison on GSM8K (all n=50, seed=42, same machine, chat-templated) showed where the real correctness headroom lives:
+
+| Config | Accuracy | s/question |
+|---|---:|---:|
+| HF reference, fixed schedule, steps=256 | 74.0% | ~101 |
+| `model_update`, fixed schedule, steps=256 | 68.0% | 17.6 |
+| `model_update`, fixed schedule, steps=512 | 76.0% | 33.8 |
+| `model_update`, threshold=0.76/low=0.62 (dInfer's own tuned values), steps=512 | 76.0% | 8.0 |
+| **`model_update`, threshold=0.9/low=0.4, steps=512** | **88.0%** | **8.6** |
+
+The recommended config — `confidence_threshold=0.9, low_confidence_threshold=0.4`, with `steps_per_block >= block_length / 2` (here steps=512 at block_length=64/max_tokens=1024) — wins on **both axes at once**: +14pts over the HF reference and +5.6 over the paper's 82.41%, at ~12x HF's speed and 2x the speed of this project's own fixed-schedule baseline. It is fast *because* of the accuracy mechanism, not despite it: the step budget is a ceiling, not a floor — hierarchy decoding early-exits each block once every position is confidently revealed, so it uses far fewer forward passes than the fixed schedule, which always spends its full budget by construction. The 88.0% (44/50) reproduced exactly (same questions right and wrong) across two separate runs of this config — deterministic on a given machine, not a lucky sample.
+
+Decomposition: more steps alone moved the fixed schedule 68%→76% (+8pts, at 2x the time); the hierarchy-threshold algorithm on top adds 76%→88% (+12pts) while *cutting* time 4x. Also tested and rejected: dInfer's own eval-script threshold values (`threshold=0.76, low_threshold=0.62`, from `eval_llada_moe.sh`) — 12 points worse than 0.9/0.4 here at near-identical speed; their tuning is for their own engine (dual cache, different iteration mechanics) and does not transfer to this stack.
+
 **Usage:**
 
 ```bash
