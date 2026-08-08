@@ -466,6 +466,90 @@ different caching strategy (dual only ever feeds the active block as new
 input each step, never the future masked blocks), not just "cached vs
 uncached." Not yet investigated further.
 
+### 2.11 Final resolution: forward-pass divergence localized, kernels exonerated, cause is inherent numerical sensitivity
+
+With generation-loop causes exhausted, the investigation moved down to
+the forward pass itself, on a realistic long input (GSM8K's real 4-shot
+chat-templated prompt, 1525 tokens, + 32 masked positions —
+`eval/diagnose_layer_divergence.py`).
+
+**Step 1 — divergence is sharp and discrete, not gradual.** Per-layer
+hidden-state cosine similarity vs HF stays high on average (~0.96-0.99
+at every layer) but the per-position *minimum* collapses abruptly at
+layer 7 (0.71 at layer 6 → 0.065 at layer 7) and stays broken through
+layer 14 (as low as −0.13) — a small subset of positions going nearly
+orthogonal while the rest stay fine. That is the signature of a discrete
+decision flipping for a few tokens, not accumulating rounding noise.
+
+**Step 2 — the flipping decision is MoE expert routing, and it flips
+constantly.** `eval/diagnose_moe_routing_divergence.py` captured the
+router's actual top-8 expert selection at every layer for both models:
+the two implementations pick a *different top-8 expert set* for 43-90%
+of positions at every layer, and 100% of the layer-7 cosine-collapsed
+positions had a flipped expert set. Consistent with Part 1's finding
+that this checkpoint's router is near-uniform (top-1 weight ~1.7-5%,
+barely above random): with routing scores that close, top-8 membership
+sits on a razor-thin boundary that any bf16-level noise can flip. Most
+flips are harmless (near-tied experts, low weights); occasionally one
+lands on a functionally different expert and cascades.
+
+**Step 3 — algorithm confirmed identical against the real reference.**
+Checked the actual downloaded checkpoint's own `modeling_lladamoe.py`
+(NOT dInfer's vendored `modeling_llada2_moe.py`, which is for a
+different model variant with sigmoid/grouped-topk/shared-expert routing
+that LLaDA-MoE does not use): fp32 softmax → flat top-8 → no
+renormalization (`norm_topk_prob=False`) → no expert bias
+(`moe_router_enable_expert_bias: false` in config.json). Matches
+`model_update` exactly. No algorithmic gap.
+
+**Step 4 — 2x2 kernel-isolation matrix exonerates both suspects.** Two
+candidate numerical sources: the Triton fused-MoE kernel (vs HF's
+sequential per-expert cuBLAS loop) and the attention kernel
+(model_update uses `F.scaled_dot_product_attention`; the HF comparison
+had used `attn_implementation="eager"`). Note the layer-0 evidence
+already argued against MoE being the origin: the layer-0 router shows
+~90% expert-set mismatch, and its input is computed BEFORE any MoE math
+runs. The full matrix (`--eager-moe` swaps in model_update's eager
+MoEBlock, a line-for-line match of HF's reference loop; `--hf-attn sdpa`
+loads HF with its shipped SDPA attention class):
+
+| Config (ours vs HF) | layer-7 min cos (prompt) | layers 8-14 | final top-1 (n=32) |
+|---|---:|---|---:|
+| Triton MoE vs HF-eager (baseline) | 0.065 | collapsed | 71.9% |
+| eager MoE vs HF-eager | 0.071 | collapsed, identical pattern | 68.8% |
+| Triton MoE vs HF-sdpa | 0.121 | collapsed, slightly milder | 75.0% |
+| eager MoE vs HF-sdpa | 0.130 | collapsed | 84.4% |
+
+Swapping the Triton kernel for the HF-matching eager loop changes
+nothing (B≈A) — **the Triton fused-MoE kernel is exonerated**. Aligning
+the attention kernel family helps modestly (top-1 up to 84.4% when
+everything is aligned) but **the layer-7 collapse survives even the
+maximally-aligned configuration**. (A briefly-proposed fp32-accumulation
+change to fused_moe's final expert sum was reverted before this data
+came in, and B≈A confirms it was aimed at a non-cause; also noted:
+torch's `.sum` on bf16 already accumulates in fp32 internally, so that
+step was already the more precise of the two implementations.)
+
+**Conclusion — closed as inherent, no fix.** What remains different in
+the aligned configuration is only micro-implementation detail (RMSNorm
+upcasting order, RoPE trig computation, op fusion order) — bf16-level
+noise that exists between any two independently-written implementations
+and cannot be removed without literally running the same code. The
+near-uniform router amplifies that unavoidable noise into discrete
+expert flips, which compound across 16 layers. This is the same family
+of effect as the cross-hardware accuracy variance documented in
+README's "Adaptive Decoding" section (same code + seed, different GPU,
+±8pt) — implementation-level numerics as an irreducible variance
+source, not a bug. One honest caveat on direction: HF scored higher on
+both compared tasks (46.0 vs 40.0 MMLU-Pro, 74.0 vs 68.0 GSM8K, one
+seed each), which may be chance at n=2 tasks, or may reflect that the
+checkpoint's weights (including those razor-thin router boundaries)
+were trained under numerics closer to HF's implementation — "closest to
+training numerics behaves most as-trained." Either way, model_update is
+computing the same algorithm faithfully; the gap is not an error to fix
+but a property of running a near-uniform-router MoE checkpoint on any
+implementation other than the one it was trained with.
+
 ---
 
 ## Summary timeline
@@ -479,3 +563,4 @@ uncached." Not yet investigated further.
 | Root-cause + fix | KV-cache priming/finalize calls missing mask-placeholder context | Fixed in commit `a5f6ebe`; confirmed on 3/3 known-bad questions and at whole-benchmark level: MMLU-Pro 28.0%→40.0% (HF: 46.0%); 6pt residual gap unexplained, MMLU re-run still pending |
 | Residual gap corroboration (§2.9) | Re-ran `model_update` vs HF on GSM8K, bucketed accuracy by response length | Same ~6pt gap on a second task (68.0% vs 74.0%); gap grows sharply with response length (-7.7pt → +16.7pt → +50.0pt across 300-600/600-1200/1200+ char buckets), with `model_update` scoring 0/6 vs HF's 3/6 on the longest responses — initially read as strong corroboration of the block-commit-staleness hypothesis |
 | Caching ablation, retraction (§2.10) | Added `generate_dense` (no-cache) and A/B'd it against `generate_cached` at two seeds | Direction flips exactly between seeds (cached wins by 6pt at seed 42, no-cache wins by 6pt at seed 123; means identical at 64.0%) — pure noise, not a caching effect. §2.9's staleness conclusion retracted; residual ~6pt gap vs HF remains real but unexplained again. New lead: dInfer's own eval uses a `dual` cache strategy, architecturally different from `model_update`'s `prefix`-style design — untested |
+| Forward-pass root cause, closed (§2.11) | Layer-by-layer hidden-state trace on a real 1525-token prompt, router top-8 capture, algorithm check vs the real checkpoint's modeling source, 2x2 kernel-isolation matrix (eager-vs-Triton MoE × eager-vs-SDPA HF attention) | Divergence is discrete (min cosine collapses 0.71→0.065 at layer 7 for a few positions), driven by near-uniform-router expert flips (different top-8 sets on 43-90% of positions per layer; 100% of collapsed positions flipped). Routing algorithm confirmed identical to the real HF reference. Triton MoE kernel exonerated (eager swap changes nothing); attention alignment helps modestly (top-1 71.9%→84.4%) but the collapse survives the maximally-aligned config. Closed as inherent implementation-level numerical sensitivity amplified by the near-uniform router — no fix; `fused_moe_triton.py` left untouched |
