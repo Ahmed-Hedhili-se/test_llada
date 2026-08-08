@@ -211,16 +211,17 @@ Verified against the HuggingFace reference implementation at the logit level:
 
 **At the full-generation level, a real accuracy bug was found and fixed.** Comparing CoT MMLU-Pro accuracy between `model_update` and HF surfaced a large gap (28.0% vs HF's 46.0%) caused by `generate_cached`'s responses collapsing to a bare `"Final Answer: X"` with no reasoning content. Root cause: the KV-cache priming and finalize calls were missing the mask-placeholder context the model was trained to always see. Fixed in commit `a5f6ebe`; post-fix, MMLU-Pro rose to **40.0%** (HF: 46.0%).
 
-**A ~6-point residual gap remains, and is now corroborated (not just hypothesized) to come from the KV-cache design itself.** Re-running the same `model_update`-vs-HF comparison on GSM8K (`gen_length=1024, block_length=64` — 16 blocks per response instead of MMLU-Pro's 8) reproduced the same ~6pt gap (68.0% vs HF's 74.0%, n=50) on a completely different task, then `eval/correctness/analyze_length_vs_gap.py` (built to test this, run for the first time here) bucketed accuracy by response length on matched transcripts from both backends:
+**A ~6-point residual gap remains, reproduced on a second task, but its cause is unresolved — an earlier "confirmed" explanation was retracted after a direct test.** Re-running the same `model_update`-vs-HF comparison on GSM8K (`gen_length=1024, block_length=64`) reproduced the same ~6pt gap (68.0% vs HF's 74.0%, n=50) on a completely different task from the original MMLU-Pro finding. Bucketing accuracy by response length (`eval/correctness/analyze_length_vs_gap.py`) initially looked like strong support for a block-commit-staleness explanation (the committed KV prefix only refreshes at block boundaries, not every step like HF) — the gap grew sharply with length, and `model_update` scored 0/6 on the longest (1200+ char) responses vs HF's 3/6.
 
-| Response length (chars) | n | `model_update` acc | HF acc | gap |
-|---|---:|---:|---:|---:|
-| 100-300 | 6 | 83.3% | 83.3% | +0.0pt |
-| 300-600 | 26 | 80.8% | 73.1% | -7.7pt |
-| 600-1200 | 12 | 66.7% | 83.3% | +16.7pt |
-| 1200+ | 6 | **0.0%** | 50.0% | **+50.0pt** |
+That explanation didn't survive a direct test. `generate_dense` (same model/weights, no KV cache at all) was added specifically to check it: if staleness were the cause, disabling caching should move accuracy toward HF's 74%. Instead, across two seeds:
 
-The gap grows sharply with response length — `model_update` isn't uniformly worse than HF, it specifically collapses on the longest responses (0/6 correct vs HF's 3/6 in the 1200+ bucket), the ones that cross the most block-boundary commits. This corroborates the leading hypothesis: the committed KV prefix only refreshes at block boundaries, not every step like HF's full recompute, and that staleness compounds with generation length. (Caveat: the extreme buckets are only n=6 — strong supporting evidence, not a controlled proof.) **Not pursued into a fix**: closing it would mean refreshing the cache more often than block boundaries, directly undercutting the reason block-wise caching exists — see `INVESTIGATION_LOG.md` §2.9 for the full writeup, including the earlier (reverted) attempt at reduced expert-count routing that turned out to be unrelated to this bug.
+| Seed | Cached | No-cache | Direction |
+|---|---:|---:|---|
+| 42 | 68.0% (34/50) | 62.0% (31/50) | cached wins by 6.0pt |
+| 123 | 60.0% (30/50) | 66.0% (33/50) | no-cache wins by 6.0pt |
+| **Mean** | **64.0%** | **64.0%** | **identical** |
+
+The direction flips exactly between seeds and the means are identical — pure sampling noise, not a real caching effect. **The block-commit-staleness explanation is retracted.** The ~6pt gap to HF is real (reproduced twice, on two tasks) but its actual cause is open again. One untested lead: dInfer's own KV-cache implementation supports three distinct strategies (`prompt`/`prefix`/`dual`), `model_update`'s design matches dInfer's `prefix` type, and dInfer's own eval script uses `dual` instead — a genuinely different caching strategy, not just "cached vs uncached." See `INVESTIGATION_LOG.md` §2.9-2.10 for the full writeup, including the earlier (reverted) attempt at reduced expert-count routing that turned out to be unrelated.
 
 ---
 

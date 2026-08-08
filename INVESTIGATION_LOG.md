@@ -411,16 +411,60 @@ staleness hypothesis from §2.8 — not a controlled per-step logit trace
 proof), but a second, independent, much more direct signal than the
 original single MMLU-Pro accuracy delta.
 
-**Decision: documented as the working explanation, not pursued further.**
-Closing this gap would mean refreshing the committed KV prefix more often
-than block boundaries — which cuts directly against the reason block-wise
-caching exists at all (see "Block-wise KV Caching" in `README.md`'s
-Optimizations section). The tradeoff was judged not worth chasing without
-a specific accuracy target requiring it: the gap is now well-understood
-and localized (long generations specifically), which is enough to inform
-future decisions (e.g. being cautious about `model_update` accuracy claims
-on very long generations) without giving back the caching speedup to close
-it.
+**Decision at the time: documented as the working explanation, not pursued
+further.** Closing this gap would mean refreshing the committed KV prefix
+more often than block boundaries — which cuts directly against the reason
+block-wise caching exists at all (see "Block-wise KV Caching" in
+`README.md`'s Optimizations section). The tradeoff was judged not worth
+chasing without a specific accuracy target requiring it.
+
+**§2.9 continued — this was retracted.** See §2.10 below: a direct
+caching on/off ablation (not available when §2.9 was written) showed
+caching has no reproducible effect on accuracy at all, contradicting the
+staleness explanation above.
+
+### 2.10 Direct caching ablation retracts the §2.9 staleness conclusion
+
+`model_update/generate.py` gained `generate_dense` (same model class/
+weights/Triton fused MoE as `generate_cached`, but no KV cache at all —
+every step recomputes the full sequence from scratch) specifically to test
+§2.9's conclusion directly, wired into the server via `ChatRequest.no_cache`
+and `run_math_reasoning_code.py --no-cache`. If block-commit staleness were
+really the cause, disabling caching should move `model_update`'s accuracy
+toward HF's 74.0%.
+
+It didn't — and a second seed flipped the direction entirely:
+
+| Seed | Cached | No-cache | Direction |
+|---|---:|---:|---|
+| 42 | 68.0% (34/50) | 62.0% (31/50) | cached wins by 6.0pt |
+| 123 | 60.0% (30/50) | 66.0% (33/50) | no-cache wins by 6.0pt |
+| **Mean** | **64.0%** | **64.0%** | **identical** |
+
+The direction reverses exactly between seeds and the means come out
+identical — the cleanest possible signature of pure sampling noise at
+n=50, not a real effect of caching in either direction. Also notable:
+in the seed=123 runs, *both* the cached and no-cache paths independently
+collapsed into repetition on the exact same question (#38, "newspapers
+newspapers..."), supporting "some specific questions are prone to this
+regardless of caching" over "caching causes it."
+
+**§2.9's "strongly corroborated" verdict is retracted.** The length-
+bucketed pattern found there (gap growing with response length,
+`model_update` scoring 0/6 on 1200+ char responses) was real data, but
+attributing it to caching specifically was premature — it's more likely
+the same kind of noise documented here, or reflects something about
+long-generation difficulty in general rather than caching mechanics. The
+~6pt residual gap vs HF remains real (reproduced on both MMLU-Pro and
+GSM8K) but its cause is back to unexplained. One newer, untested lead: a
+side investigation into dInfer's own KV-cache implementation
+(`dInfer/python/dinfer/decoding/generate_cache.py`) found it supports
+three distinct cache strategies (`prompt`, `prefix`, `dual`), that
+`model_update`'s design matches dInfer's `prefix` type, and that dInfer's
+own eval script (`eval_llada_moe.sh`) uses `dual` instead — a genuinely
+different caching strategy (dual only ever feeds the active block as new
+input each step, never the future masked blocks), not just "cached vs
+uncached." Not yet investigated further.
 
 ---
 
@@ -433,4 +477,5 @@ it.
 | Revert to static top-8 | Remove both schemes entirely | Static top-8 + Triton fused MoE + KV caching alone already gets 4.54x speedup at 2x A6000 TP+EP — neither alternative beat that with acceptable accuracy |
 | `model_update` vs HF correctness testing | Compare CoT MMLU/MMLU-Pro accuracy | Found real, large gap (28% vs 46% MMLU-Pro) caused by response collapse to bare `"Final Answer: X"` |
 | Root-cause + fix | KV-cache priming/finalize calls missing mask-placeholder context | Fixed in commit `a5f6ebe`; confirmed on 3/3 known-bad questions and at whole-benchmark level: MMLU-Pro 28.0%→40.0% (HF: 46.0%); 6pt residual gap unexplained, MMLU re-run still pending |
-| Residual gap corroboration (§2.9) | Re-ran `model_update` vs HF on GSM8K, bucketed accuracy by response length | Same ~6pt gap on a second task (68.0% vs 74.0%); gap grows sharply with response length (-7.7pt → +16.7pt → +50.0pt across 300-600/600-1200/1200+ char buckets), with `model_update` scoring 0/6 vs HF's 3/6 on the longest responses — strong corroboration of the block-commit-staleness hypothesis. Documented as the working explanation; not pursued into a fix, since closing it would mean sacrificing much of the block-wise caching speedup |
+| Residual gap corroboration (§2.9) | Re-ran `model_update` vs HF on GSM8K, bucketed accuracy by response length | Same ~6pt gap on a second task (68.0% vs 74.0%); gap grows sharply with response length (-7.7pt → +16.7pt → +50.0pt across 300-600/600-1200/1200+ char buckets), with `model_update` scoring 0/6 vs HF's 3/6 on the longest responses — initially read as strong corroboration of the block-commit-staleness hypothesis |
+| Caching ablation, retraction (§2.10) | Added `generate_dense` (no-cache) and A/B'd it against `generate_cached` at two seeds | Direction flips exactly between seeds (cached wins by 6pt at seed 42, no-cache wins by 6pt at seed 123; means identical at 64.0%) — pure noise, not a caching effect. §2.9's staleness conclusion retracted; residual ~6pt gap vs HF remains real but unexplained again. New lead: dInfer's own eval uses a `dual` cache strategy, architecturally different from `model_update`'s `prefix`-style design — untested |
