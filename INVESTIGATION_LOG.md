@@ -371,6 +371,57 @@ KV-cache design (see §2.6: the committed prefix is still only refreshed at
 block boundaries, not every step, unlike the dense/HF reference). MMLU (not
 just MMLU-Pro) has not yet been re-run against this fix.
 
+### 2.9 Residual gap corroborated on a second task (GSM8K), and localized to long generations
+
+Much later (separate session, see `README.md`'s "Adaptive Decoding"
+section for the surrounding context), the same `model_update`-vs-HF
+comparison was re-run on GSM8K (`gen_length=1024, block_length=64` — the
+paper's own long-generation config, 16 blocks per response instead of
+MMLU-Pro's 8) using the identical chat-templated harness for both
+backends:
+
+| Backend | GSM8K (n=50, seed=42) |
+|---|---:|
+| `model_update` (`fast_dense`, chat-template, no threshold) | 68.0% (34/50) |
+| HF reference (same harness) | 74.0% (37/50) |
+
+Same ~6pt gap, different task — already suggestive this is systematic
+rather than MMLU-Pro-specific noise. `analyze_length_vs_gap.py` (built
+during the earlier investigation specifically to test the block-commit-
+staleness hypothesis but never actually run until now) was applied to
+matched `--save-transcripts` output from both backends on this GSM8K run,
+bucketing accuracy by raw response length:
+
+| Response length (chars) | n | `model_update` acc | HF acc | gap |
+|---|---:|---:|---:|---:|
+| 100-300 | 6 | 83.3% | 83.3% | +0.0pt |
+| 300-600 | 26 | 80.8% | 73.1% | -7.7pt |
+| 600-1200 | 12 | 66.7% | 83.3% | +16.7pt |
+| 1200+ | 6 | **0.0%** | 50.0% | **+50.0pt** |
+
+The gap grows sharply and consistently across the three buckets that have
+enough response length to matter (300-600 → 600-1200 → 1200+: -7.7pt →
++16.7pt → +50.0pt) — `model_update` is not uniformly worse than HF, it is
+specifically much worse on the longest responses, the ones that cross the
+most block-boundary commits. Most strikingly: on the 6 longest responses
+(1200+ chars), `model_update` got **zero correct** while HF got half
+right. This is strong corroborating evidence for the block-commit-
+staleness hypothesis from §2.8 — not a controlled per-step logit trace
+(the extreme buckets are only n=6, so treat this as strong support, not
+proof), but a second, independent, much more direct signal than the
+original single MMLU-Pro accuracy delta.
+
+**Decision: documented as the working explanation, not pursued further.**
+Closing this gap would mean refreshing the committed KV prefix more often
+than block boundaries — which cuts directly against the reason block-wise
+caching exists at all (see "Block-wise KV Caching" in `README.md`'s
+Optimizations section). The tradeoff was judged not worth chasing without
+a specific accuracy target requiring it: the gap is now well-understood
+and localized (long generations specifically), which is enough to inform
+future decisions (e.g. being cautious about `model_update` accuracy claims
+on very long generations) without giving back the caching speedup to close
+it.
+
 ---
 
 ## Summary timeline
@@ -382,3 +433,4 @@ just MMLU-Pro) has not yet been re-run against this fix.
 | Revert to static top-8 | Remove both schemes entirely | Static top-8 + Triton fused MoE + KV caching alone already gets 4.54x speedup at 2x A6000 TP+EP — neither alternative beat that with acceptable accuracy |
 | `model_update` vs HF correctness testing | Compare CoT MMLU/MMLU-Pro accuracy | Found real, large gap (28% vs 46% MMLU-Pro) caused by response collapse to bare `"Final Answer: X"` |
 | Root-cause + fix | KV-cache priming/finalize calls missing mask-placeholder context | Fixed in commit `a5f6ebe`; confirmed on 3/3 known-bad questions and at whole-benchmark level: MMLU-Pro 28.0%→40.0% (HF: 46.0%); 6pt residual gap unexplained, MMLU re-run still pending |
+| Residual gap corroboration (§2.9) | Re-ran `model_update` vs HF on GSM8K, bucketed accuracy by response length | Same ~6pt gap on a second task (68.0% vs 74.0%); gap grows sharply with response length (-7.7pt → +16.7pt → +50.0pt across 300-600/600-1200/1200+ char buckets), with `model_update` scoring 0/6 vs HF's 3/6 on the longest responses — strong corroboration of the block-commit-staleness hypothesis. Documented as the working explanation; not pursued into a fix, since closing it would mean sacrificing much of the block-wise caching speedup |

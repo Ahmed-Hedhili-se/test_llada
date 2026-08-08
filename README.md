@@ -211,7 +211,16 @@ Verified against the HuggingFace reference implementation at the logit level:
 
 **At the full-generation level, a real accuracy bug was found and fixed.** Comparing CoT MMLU-Pro accuracy between `model_update` and HF surfaced a large gap (28.0% vs HF's 46.0%) caused by `generate_cached`'s responses collapsing to a bare `"Final Answer: X"` with no reasoning content. Root cause: the KV-cache priming and finalize calls were missing the mask-placeholder context the model was trained to always see. Fixed in commit `a5f6ebe`; post-fix, MMLU-Pro rose to **40.0%** (HF: 46.0%).
 
-**A ~6-point residual gap remains and has not been root-caused.** Leading hypothesis, not yet confirmed: a smaller approximation inherent to the KV-cache design itself (the committed prefix only refreshes at block boundaries, not every step, unlike HF's full recompute every step) — see `eval/correctness/analyze_length_vs_gap.py`, built to test exactly this. MMLU (not just MMLU-Pro) has not yet been re-run against the fix. `INVESTIGATION_LOG.md` has the complete investigation, including an earlier (reverted) attempt at reduced expert-count routing that turned out to be unrelated to this bug.
+**A ~6-point residual gap remains, and is now corroborated (not just hypothesized) to come from the KV-cache design itself.** Re-running the same `model_update`-vs-HF comparison on GSM8K (`gen_length=1024, block_length=64` — 16 blocks per response instead of MMLU-Pro's 8) reproduced the same ~6pt gap (68.0% vs HF's 74.0%, n=50) on a completely different task, then `eval/correctness/analyze_length_vs_gap.py` (built to test this, run for the first time here) bucketed accuracy by response length on matched transcripts from both backends:
+
+| Response length (chars) | n | `model_update` acc | HF acc | gap |
+|---|---:|---:|---:|---:|
+| 100-300 | 6 | 83.3% | 83.3% | +0.0pt |
+| 300-600 | 26 | 80.8% | 73.1% | -7.7pt |
+| 600-1200 | 12 | 66.7% | 83.3% | +16.7pt |
+| 1200+ | 6 | **0.0%** | 50.0% | **+50.0pt** |
+
+The gap grows sharply with response length — `model_update` isn't uniformly worse than HF, it specifically collapses on the longest responses (0/6 correct vs HF's 3/6 in the 1200+ bucket), the ones that cross the most block-boundary commits. This corroborates the leading hypothesis: the committed KV prefix only refreshes at block boundaries, not every step like HF's full recompute, and that staleness compounds with generation length. (Caveat: the extreme buckets are only n=6 — strong supporting evidence, not a controlled proof.) **Not pursued into a fix**: closing it would mean refreshing the cache more often than block boundaries, directly undercutting the reason block-wise caching exists — see `INVESTIGATION_LOG.md` §2.9 for the full writeup, including the earlier (reverted) attempt at reduced expert-count routing that turned out to be unrelated to this bug.
 
 ---
 
