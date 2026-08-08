@@ -104,7 +104,11 @@ def run_ours(weight_dir, x, topk):
     for rl in router_logits_by_layer:
         rw = F.softmax(rl, dim=-1)
         _, ids = torch.topk(rw, topk, dim=-1)
-        topk_ids_by_layer.append(ids)  # [1, T, topk]
+        # TritonFusedMoEBlock flattens x to [B*T, H] before calling self.gate,
+        # so captured router logits/ids here are [T, topk] (no batch dim) --
+        # normalize to [T, topk] regardless, so both backends' captures have
+        # an identical, predictable shape downstream.
+        topk_ids_by_layer.append(ids.reshape(-1, topk))
 
     return topk_ids_by_layer, hidden_by_layer
 
@@ -174,7 +178,9 @@ def run_hf(weight_dir, x, topk, num_experts, hidden_size, expected_layers):
     for rl in router_logits_by_layer:
         rw = F.softmax(rl, dim=-1)
         _, ids = torch.topk(rw, topk, dim=-1)
-        topk_ids_by_layer.append(ids)
+        # Normalize to [T, topk] the same way as run_ours, whatever HF's
+        # router's actual input shape ([B,T,H] or already-flattened) is.
+        topk_ids_by_layer.append(ids.reshape(-1, topk))
 
     return topk_ids_by_layer, hidden_by_layer
 
@@ -212,8 +218,8 @@ def main():
     print(f"{'layer':>6}  {'mismatch_rate':>15}  {'n_mismatched':>16}")
     mismatch_masks = []
     for i in range(n_layers):
-        o_ids = our_topk[i][0]  # [T, topk]
-        h_ids = hf_topk[i][0]
+        o_ids = our_topk[i]  # [T, topk]
+        h_ids = hf_topk[i]
         o_sets = [set(row.tolist()) for row in o_ids]
         h_sets = [set(row.tolist()) for row in h_ids]
         mism = torch.tensor([1 if o_sets[t] != h_sets[t] else 0 for t in range(T)])
@@ -250,8 +256,8 @@ def main():
     for t in range(T):
         if low_cos_mask[t] and shown < 10:
             print(f"  pos={t:5d}  cos={cos[t].item():.4f}  mismatch={bool(mism[t])}\n"
-                  f"    ours={sorted(our_topk[target_layer][0, t].tolist())}\n"
-                  f"    hf  ={sorted(hf_topk[target_layer][0, t].tolist())}")
+                  f"    ours={sorted(our_topk[target_layer][t].tolist())}\n"
+                  f"    hf  ={sorted(hf_topk[target_layer][t].tolist())}")
             shown += 1
     if shown == 0:
         print("  (none)")
