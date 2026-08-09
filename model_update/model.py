@@ -20,25 +20,13 @@ tested at small scale and then run at full 7B-MoE scale.
 """
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Literal, Union
-import sys
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import importlib.util
-import site
-from pathlib import Path
-import torch.distributed as dist
-from .distributed import get_tp_size, get_tp_rank, get_tp_group
-import re
+from .distributed import get_tp_size, get_tp_rank, tp_all_reduce_
 
-
-
-def _load_fused_moe():
-    return None
-
-fused_moe = None
 KVCache = List[Tuple[torch.Tensor, torch.Tensor]]
 
 
@@ -102,6 +90,14 @@ class Cfg:
         return self.H // self.NH
 
 
+def _local_expert_range(num_experts: int, tp_rank: int, tp_size: int) -> Tuple[int, int]:
+    """This rank's contiguous shard of the expert pool: (num_local_experts,
+    local_expert_start). Shared by TritonFusedMoEBlock/MoEBlock, which
+    otherwise duplicated this exact computation."""
+    num_local_experts = num_experts // tp_size
+    return num_local_experts, tp_rank * num_local_experts
+
+
 from .fused_moe_triton import fused_moe
 
 class TritonFusedMoEBlock(nn.Module):
@@ -110,9 +106,10 @@ class TritonFusedMoEBlock(nn.Module):
         self.cfg = cfg
         self.tp_size = get_tp_size()
         self.tp_rank = get_tp_rank()
-        self.num_local_experts = cfg.NE // self.tp_size
-        self.local_expert_start = self.tp_rank * self.num_local_experts
-        
+        self.num_local_experts, self.local_expert_start = _local_expert_range(
+            cfg.NE, self.tp_rank, self.tp_size
+        )
+
         self.gate = nn.Linear(cfg.H, cfg.NE, bias=False)
         self.w1 = nn.Parameter(torch.empty(self.num_local_experts, 2 * cfg.EI, cfg.H))
         self.w2 = nn.Parameter(torch.empty(self.num_local_experts, cfg.H, cfg.EI))
@@ -153,9 +150,7 @@ class TritonFusedMoEBlock(nn.Module):
         )
         
         out = out.view(B, T, H)
-        if self.tp_size > 1:
-            dist.all_reduce(out, op=dist.ReduceOp.SUM, group=get_tp_group())
-            
+        tp_all_reduce_(out)
         return out
 
 
@@ -265,9 +260,7 @@ class Attention(nn.Module):
         out = out.transpose(1, 2).reshape(B, Ta, self.NH_local * cfg.HD)
         
         attn_out = self.o_proj(out)
-        if get_tp_size() > 1:
-            dist.all_reduce(attn_out, op=dist.ReduceOp.SUM, group=get_tp_group())
-            
+        tp_all_reduce_(attn_out)
         return attn_out, (k, v)
 
 
@@ -289,9 +282,10 @@ class MoEBlock(nn.Module):
         self.tp_size = get_tp_size()
         self.tp_rank = get_tp_rank()
         assert cfg.NE % self.tp_size == 0
-        self.num_local_experts = cfg.NE // self.tp_size
-        self.local_expert_start = self.tp_rank * self.num_local_experts
-        
+        self.num_local_experts, self.local_expert_start = _local_expert_range(
+            cfg.NE, self.tp_rank, self.tp_size
+        )
+
         self.gate = nn.Linear(cfg.H, cfg.NE, bias=False)
         self.experts = nn.ModuleList([ExpertMLP(cfg) for _ in range(self.num_local_experts)])
 
@@ -319,9 +313,7 @@ class MoEBlock(nn.Module):
             out.index_add_(0, top_x, h.to(x.dtype))
 
         out = out.view(B, T, cfg.H)
-        if self.tp_size > 1:
-            dist.all_reduce(out, op=dist.ReduceOp.SUM, group=get_tp_group())
-            
+        tp_all_reduce_(out)
         return out
 
 

@@ -11,7 +11,6 @@ def init_distributed():
     """
     global _TP_GROUP
     if not dist.is_initialized():
-        rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", 0)))
         world_size = int(os.environ.get("WORLD_SIZE", 1))
         
         if world_size == 1 and "MASTER_ADDR" not in os.environ:
@@ -37,6 +36,15 @@ def get_tp_rank():
     if not dist.is_initialized():
         return 0
     return dist.get_rank(group=get_tp_group())
+
+
+def tp_all_reduce_(tensor: torch.Tensor) -> torch.Tensor:
+    """In-place SUM all-reduce of `tensor` across the TP group; no-op when
+    tp_size == 1. Shared by Attention/TritonFusedMoEBlock/MoEBlock.forward,
+    which all combine per-rank-partial outputs the same way."""
+    if get_tp_size() > 1:
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=get_tp_group())
+    return tensor
 
 
 def load_weights_tp(model, weight_dir: str, verbose: bool = True):
@@ -115,7 +123,6 @@ def load_weights_tp(model, weight_dir: str, verbose: bool = True):
         for m in mismatches[:20]:
             print(f"    {m}")
     if verbose:
-        total = sum(1 for k in wmap if _hf_to_our_key(k) is not None)
         print(f"  Mapped {mapped} tensors (expected for Rank {tp_rank}).")
 
     model.load_state_dict(sd, strict=False)

@@ -716,8 +716,7 @@ python -m eval.throughput.run_throughput            # concurrent request through
 │   ├── model.py                            KV-cached model, static top-8 routing
 │   ├── generate.py                         Block-wise KV-cached generation loop
 │   ├── fused_moe_triton.py                 Triton grouped-GEMM kernel + dynamic config loader
-│   ├── load_weights.py                     TP-aware safetensors weight loader
-│   └── distributed.py                      Distributed process group helpers
+│   └── distributed.py                      Distributed process group helpers + TP-aware weight loader
 │
 ├── eval/                                   ← Evaluation & benchmarks
 │   ├── check_time_inference.py             Baseline vs optimized speedup benchmark (--batch-size, --mode, ...)
