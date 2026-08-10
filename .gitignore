@@ -51,3 +51,18 @@ Thumbs.db
 # AI tooling
 .agents/
 .gemini/
+.claude/
+
+# Profiling & benchmark JSON traces
+batch_size*.json
+traces/
+
+# NCU profiling reports
+ncu_deep_report*.txt
+
+# Papers / large documents
+*.pdf
+the_paper.txt
+
+# dInfer reference (not part of this project's source)
+dInfer/
