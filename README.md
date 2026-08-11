@@ -184,8 +184,11 @@ Standard Triton autotune (`@triton.autotune`) has two critical weaknesses for Mo
 # Tune for the test model (fast, ~2 min)
 python tuning_fused_moe_triton.py --model SMALL_CFG
 
-# Tune for the full 7B production model
+# Tune for the full 7B production model (single GPU, no TP)
 python tuning_fused_moe_triton.py --model FULL_CFG
+
+# Tune for a multi-GPU deployment: pass the TP degree you will RUN with
+python tuning_fused_moe_triton.py --model FULL_CFG --tp-size 8
 
 # Custom penalty weight and block size cap
 python tuning_fused_moe_triton.py --model FULL_CFG --penalty 0.8 --max-block-m 32
@@ -195,6 +198,24 @@ python tuning_fused_moe_triton.py --model FULL_CFG --output my_a100_config.json
 ```
 
 After tuning, the generated `moe_tune_config.json` is automatically detected and loaded by `model_update/fused_moe_triton.py` at import time. No other changes are needed.
+
+#### Tuning for multi-GPU (`--tp-size`)
+
+The MoE weights are **expert-sharded**, so at TP=N each rank's `w1` holds only `NE // N` experts and `fused_moe()` sees that smaller `E`. Since `E` drives the block-padding cost that the autotuner's score is built around, tuning at the global `NE=64` produces a config optimized for a workload that never actually runs at TP>1. Pass `--tp-size` to match your deployment:
+
+| Deployment | Command | Experts per GPU |
+| :--- | :--- | :--- |
+| 1 GPU | `--model FULL_CFG` | 64 |
+| 2 GPUs | `--model FULL_CFG --tp-size 2` | 32 |
+| 8 GPUs | `--model FULL_CFG --tp-size 8` | 8 |
+
+**Tune once on a single GPU — not once per GPU.** The tuner is a single-process, single-device script (it never initializes a process group). All ranks read the same `moe_tune_config.json` from the repo root at import time, so one run produces the config used by every GPU. On a homogeneous node (e.g. 8×H100) the optimal tile sizes are identical across devices, so re-running per GPU only wastes time.
+
+#### Hardware portability
+
+The shared-memory budget used to prune candidate configs is **queried from the device** (`SHARED_MEM_LIMIT` in `fused_moe_triton.py`), not hardcoded. This matters across generations: A40/A6000 (Ampere) allow ~100 KB per block while H100 (Hopper) allows ~227 KB. The same limit is enforced in both the tuner's search space and `get_best_config()`'s runtime guard, so the tuner can never select a config the loader would reject. `num_stages=4` is included in the search space when the budget permits it, and the occupancy estimate in `profile_config()` reads per-SM shared memory, registers, and max warps from the device as well.
+
+Re-tune when you change GPU generation or TP degree — the config file is hardware- and shard-specific.
 
 ---
 

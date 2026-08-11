@@ -14,6 +14,22 @@ try:
 except Exception as e:
     print(f"Warning: Failed to load {config_path}: {e}")
 
+def _shared_mem_limit() -> int:
+    if not torch.cuda.is_available():
+        return 96_000
+    try:
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        limit = getattr(props, "shared_memory_per_block_optin", None)
+        if limit is None:
+            limit = getattr(props, "shared_memory_per_block", None)
+        if limit:
+            return int(limit) - 1024
+    except Exception:
+        pass
+    return 96_000
+
+SHARED_MEM_LIMIT = _shared_mem_limit()
+
 def get_best_config(M: int, E: int) -> Dict[str, Any]:
     config = None
     if TUNED_CONFIGS:
@@ -28,13 +44,13 @@ def get_best_config(M: int, E: int) -> Dict[str, Any]:
         ns = candidate.get('num_stages', 2)
         shmem = (bm * bk + bk * bn) * ns * 2
         
-        if shmem <= 96000:
+        if shmem <= SHARED_MEM_LIMIT:
             config = candidate
         else:
             # Try reducing num_stages to 2
             candidate['num_stages'] = 2
             shmem_reduced = (bm * bk + bk * bn) * 2 * 2
-            if shmem_reduced <= 96000:
+            if shmem_reduced <= SHARED_MEM_LIMIT:
                 config = candidate
 
     if config is None:

@@ -50,7 +50,7 @@ def tp_all_reduce_(tensor: torch.Tensor) -> torch.Tensor:
 def load_weights_tp(model, weight_dir: str, verbose: bool = True):
     import json
     from safetensors import safe_open
-    
+    num_experts = model.cfg.NE
     index_path = os.path.join(weight_dir, "model.safetensors.index.json")
     with open(index_path) as f:
         wmap = json.load(f)["weight_map"]
@@ -85,7 +85,7 @@ def load_weights_tp(model, weight_dir: str, verbose: bool = True):
                 expert_idx = int(parts[4])
                 
                 if tp_size > 1:
-                    num_local_experts = 64 // tp_size 
+                    num_local_experts = num_experts // tp_size
                     if not (tp_rank * num_local_experts <= expert_idx < (tp_rank + 1) * num_local_experts):
                         continue
                     

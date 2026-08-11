@@ -5,12 +5,12 @@ import torch
 import triton
 import triton.language as tl
 
-# ── Import the kernel and helpers directly from our model_update package ──────
 from model_update.fused_moe_triton import (
     fused_moe,
     invoke_fused_moe_kernel,
     moe_align_block_size,
     fused_moe_kernel,
+    SHARED_MEM_LIMIT,
 )
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -27,17 +27,24 @@ MODEL_SHAPES = {
 # Representative M values encountered during actual block-wise KV generation.
 # M = batch_size * active_block_length.  For your setup (BS=1, BL=32) M≈32.
 # RTX A6000 has 48 GB VRAM — we include larger M values to exploit this.
-REALISTIC_M_BUCKETS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+# Server-side batching (src/server.py, BATCH_MAX_SIZE=64) pushes M as high as
+# 64 * block_length = 2048, so the upper buckets matter in production, not just
+# on paper -- get_best_config() picks the *closest* tuned M, so a missing 2048
+# bucket would silently fall back to the 512 config for a 4x larger workload.
+REALISTIC_M_BUCKETS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
 
-# How heavily to penalise padding waste (tuned empirically; 0 = pure latency)
 PADDING_PENALTY_WEIGHT = 0.5
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 2.  CONFIGURATION SEARCH SPACE
-#     Restricted to configs that cannot exceed ~96 KB shared memory on an A40.
-#     We add the constraint BLOCK_SIZE_M <= 64 to prevent padding explosion.
+#     Pruned against the ACTUAL shared-memory budget of the GPU being tuned on
+#     (SHARED_MEM_LIMIT, queried from the device in fused_moe_triton.py) rather
+#     than a hardcoded Ampere figure -- H100 allows ~227KB/block vs A40's
+#     ~100KB, and pruning an H100 against 96KB throws away exactly the
+#     deep-pipelined configs that make Hopper fast.
+#     We keep the constraint BLOCK_SIZE_M <= 64 to prevent padding explosion.
 # ═══════════════════════════════════════════════════════════════════════════════
-def get_config_grid(max_block_m: int = 64):
+def get_config_grid(max_block_m: int = 64, shmem_limit: int = None):
     """
     Returns a list of candidate Triton configs.
 
@@ -46,13 +53,26 @@ def get_config_grid(max_block_m: int = 64):
                  compute because every expert slot is padded to 128.  We
                  cap at 64 by default which already allows BLOCK_SIZE_M > M
                  for the M=32 bucket (2x overhead at most).
+
+    shmem_limit: Per-block shared-memory budget in bytes. Defaults to the
+                 running GPU's real limit (SHARED_MEM_LIMIT). MUST match the
+                 guard in fused_moe_triton.py::get_best_config(), or the tuner
+                 can select a config that the loader then rejects at runtime.
+
+    num_stages 4 is included when the budget allows it: it was originally
+    excluded because "4 stages often hits shmem limit on A40", which is a
+    statement about Ampere's 100KB, not about the config being bad. On H100
+    the shmem guard below decides that empirically instead.
     """
+    if shmem_limit is None:
+        shmem_limit = SHARED_MEM_LIMIT
+
     block_m   = [bm for bm in [16, 32, 64, 128] if bm <= max_block_m]
     block_n   = [32, 64, 128]
     block_k   = [32, 64, 128]
     group_m   = [1, 4, 8]
     num_warps = [4, 8]
-    num_stages= [2, 3]          # 4 stages often hits shmem limit on A40
+    num_stages= [2, 3, 4]
 
     configs = []
     for bm, bn, bk, gm, nw, ns in itertools.product(
@@ -60,7 +80,7 @@ def get_config_grid(max_block_m: int = 64):
         # ── Hard shmem guard ───────────────────────────────────────────────
         # Formula: tiles_a + tiles_b per stage, each element is 2 bytes (bf16)
         shmem = (bm * bk + bk * bn) * ns * 2
-        if shmem > 96_000:
+        if shmem > shmem_limit:
             continue
         configs.append({
             "BLOCK_SIZE_M": bm,
@@ -193,13 +213,24 @@ def profile_config(config, K, N):
         )
         meta = compiled.metadata
         shared_bytes = getattr(meta, "shared", None)
-        # Max warps per SM on Ampere/A40 = 48; max blocks = shared_mem limited
+        # Occupancy estimate. The constants below were hardcoded to Ampere/A40
+        # (100KB shmem per SM, 48 max warps per SM); on H100 the per-SM shmem is
+        # ~228KB and max warps is 64, so the old figures under-reported occupancy
+        # by ~25% and over-penalised large tiles. Query the device instead.
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        shmem_per_sm = getattr(props, "shared_memory_per_multiprocessor", 102400)
+        max_threads_per_sm = getattr(props, "max_threads_per_multi_processor", 1536)
+        max_warps_per_sm = max(max_threads_per_sm // 32, 1)
+        regs_per_sm = getattr(props, "regs_per_multiprocessor", 65536)
+
         occupancy_pct = None
         if shared_bytes is not None and shared_bytes > 0:
-            max_blocks_by_shmem = 102400 // shared_bytes
-            max_blocks_by_regs  = 65536  // max(meta.num_warps * 32, 1)
+            max_blocks_by_shmem = shmem_per_sm // shared_bytes
+            max_blocks_by_regs  = regs_per_sm // max(meta.num_warps * 32, 1)
             blocks_per_sm       = min(max_blocks_by_shmem, max_blocks_by_regs, 16)
-            occupancy_pct       = round(blocks_per_sm * meta.num_warps / 48 * 100)
+            occupancy_pct       = round(
+                blocks_per_sm * meta.num_warps / max_warps_per_sm * 100
+            )
         return {
             "shared_bytes":   shared_bytes,
             "num_warps":      getattr(meta, "num_warps", config["num_warps"]),
@@ -262,6 +293,15 @@ def main():
     )
     ap.add_argument("--model",        default="FULL_CFG", choices=list(MODEL_SHAPES),
                     help="Model config to tune for (default: FULL_CFG = production model).")
+    ap.add_argument("--tp-size",      type=int, default=1,
+                    help="Tensor/expert-parallel degree you will RUN with. The MoE "
+                         "weights are expert-sharded, so each rank's w1 holds only "
+                         "NE//tp_size experts and fused_moe() sees that smaller E. "
+                         "Tuning at the global E would optimise padding for a "
+                         "workload that never occurs. Tune once on a single GPU "
+                         "with the tp_size you intend to deploy; the resulting "
+                         "moe_tune_config.json is read by all ranks from the repo "
+                         "root, so it does NOT need to be regenerated per GPU.")
     ap.add_argument("--max-block-m",  type=int, default=64,
                     help="Hard cap on BLOCK_SIZE_M to limit padding overhead.")
     ap.add_argument("--penalty",      type=float, default=PADDING_PENALTY_WEIGHT,
@@ -282,10 +322,27 @@ def main():
         print("CUDA is required."); return
 
     E, N, K, top_k, desc = MODEL_SHAPES[args.model]
+
+    global_E = E
+    if args.tp_size > 1:
+        if E % args.tp_size != 0:
+            print(f"ERROR: NE={E} is not divisible by --tp-size {args.tp_size}; "
+                  f"expert sharding in distributed.py requires an exact split.")
+            return
+        E = E // args.tp_size
+
+    props = torch.cuda.get_device_properties(0)
     print(f"\n{'='*70}")
     print(f"  End-to-End Aware MoE Autotuner")
     print(f"  Model : {args.model} — {desc}")
-    print(f"  GPU   : {torch.cuda.get_device_name(0)}")
+    print(f"  GPU   : {torch.cuda.get_device_name(0)} "
+          f"(sm_{props.major}{props.minor}, {props.multi_processor_count} SMs)")
+    print(f"  shmem : {SHARED_MEM_LIMIT/1024:.0f} KB/block usable (device-queried)")
+    if args.tp_size > 1:
+        print(f"  TP    : tp_size={args.tp_size} → tuning for E={E} local experts "
+              f"(global NE={global_E})")
+    else:
+        print(f"  TP    : tp_size=1 → tuning for all E={E} experts on one GPU")
     print(f"  max_block_m={args.max_block_m}  penalty={args.penalty}")
     print(f"{'='*70}\n")
 
@@ -353,6 +410,8 @@ def main():
     print(f"{'='*70}")
     print(f"  Tuning complete. Saved to: {args.output}")
     print(f"  To apply: ensure moe_tune_config.json is in your repo root.")
+    print(f"  All ranks read this one file at import time — tuning on a single")
+    print(f"  GPU is sufficient; do NOT re-run it per GPU.")
     print(f"{'='*70}\n")
 
 
