@@ -1,6 +1,6 @@
 # LLaDA-MoE-7B-A1B-Instruct — Optimized Inference Engine
 
-Self-contained PyTorch reimplementation of [inclusionAI/LLaDA-MoE-7B-A1B-Instruct](https://huggingface.co/inclusionAI/LLaDA-MoE-7B-A1B-Instruct) with two stacked inference optimizations: **Triton Fused MoE** and **Block-wise KV Caching**, running the model's native static top-8 expert routing. Includes an OpenAI-compatible API server, a full evaluation suite, and an end-to-end-aware Triton autotuner.
+Self-contained PyTorch reimplementation of [inclusionAI/LLaDA-MoE-7B-A1B-Instruct](https://huggingface.co/inclusionAI/LLaDA-MoE-7B-A1B-Instruct) with four stacked inference optimizations — **Triton Fused MoE** (with the SiLU activation fused into the first GEMM's epilogue), **Block-wise KV Caching**, and a **narrowed `lm_head`** — running the model's native static top-8 expert routing. **6.46× faster than the baseline on a single GPU.** Includes an OpenAI-compatible API server, a full evaluation suite, and an end-to-end-aware Triton autotuner.
 
 ---
 
@@ -92,24 +92,55 @@ Optimized:   model(active_block, cache)   each step only processes the current b
 
 > **On reduced expert activation**: an earlier version of this project explored running fewer than 8 experts per token (fixed top-5, a step-based ramp, and per-token adaptive/nucleus thresholding) to cut MoE compute further. All three were evaluated and dropped — the accuracy cost wasn't worth it, and for this checkpoint's router (routing weights are nearly uniform across all 64 experts) adaptive thresholding had no real advantage over a fixed count either. The model now always routes to its native top-8.
 
+### 3. Fused SiLU Epilogue (`fused_moe_triton.py`)
+
+**Problem**: `fused_moe` ran `GEMM1 → materialize [M, top_k, 2·EI] → read it back → SiLU(gate)*up → GEMM2`. At batch 57 that intermediate is ~15 MB written, ~15 MB read, plus a ~7.5 MB write — roughly **1.2 GB of round-trip traffic per forward pass** across 16 layers. Nsight Compute puts this kernel at **96.4% of L2 throughput with DRAM at only 66–68%**, so the ceiling it is pinned against is L2 traffic, which makes deleting an intermediate round-trip precisely the right lever on the kernel that owns 45% of GPU time.
+
+**Solution**: `w1` packs `[gate ; up]` along N, so each kernel program now computes **two** B tiles — gate at `offs_bn`, up at `offs_bn + N` — keeps two accumulators, and applies the activation from registers, writing the EI-wide result straight out. The wide intermediate is never allocated. The N grid halves, so each program does 2× the work.
+
+**Bit-exact, verified.** The K-loop is untouched, so the fp32 accumulators are identical. The epilogue then deliberately reproduces the *unfused op order* rather than the more accurate one: accumulators are rounded to bf16 **first** (reproducing the intermediate store), SiLU is evaluated as `x/(1+exp(-x))` in fp32 with the result rounded back to bf16 before the multiply — matching what ATen's bf16 SiLU (`opmath_t=float`) and bf16 mul do elementwise. Computing straight from the fp32 accumulators would be *more* precise and therefore **not** bit-identical.
+
+The one property that could not be established by construction is that Triton's `tl.exp` lowers to the same instruction as ATen's `expf`. `eval/test_fused_silu_epilogue.py` measures it instead of assuming: **bit-exact at every shape from M=1 to M=2048**, with end-to-end token sequences identical. `LLADA_MOE_FUSED_SILU=0` disables the fusion if a future Triton version ever breaks that.
+
+### 4. Narrowed `lm_head` (`model.py`, `generate.py`)
+
+**Problem**: `lm_head` is the widest GEMM in the model (2048 → 157,184, ~644 MB of weights). Every forward pass ran it over its *entire* input, and the callers then discarded most of the result:
+
+| Call site | Logits used | Logits computed |
+|---|---|---|
+| Cache prime | **none** — return discarded | whole sequence (~2,500 rows) |
+| Block finalize | **none** — return discarded | whole suffix, once per block |
+| Denoising step | `[:, :block_length]` | whole suffix, up to 16× longer |
+
+**Solution**: `LLaDAMoEKV.forward(num_logits=N)` runs the final norm and `lm_head` over only the first `N` positions; `0` skips the head entirely. The transformer layers still run over the full input — the K/V written to the cache and the future-`[MASK]` context the model was trained to see both depend on it — so only the vocabulary projection is narrowed. `None` (the default) preserves the original behavior, leaving `generate_dense` and the diagnostic scripts untouched.
+
+**Exact**: GEMM rows are independent, so surviving rows compute identical dot products, and RMSNorm reduces along the feature axis, so slicing *before* the norm is safe too. Verified bit-exact on CPU/fp32 and CUDA/bf16 with the real Triton MoE (`eval/test_num_logits_slice.py`), and character-identical at full 7B scale.
+
+Worth ~2–4% end-to-end on its own — the sliced GEMM becomes bandwidth-bound rather than disappearing, since those 644 MB of weights stream regardless of row count. It also removes an ~800 MB peak allocation at `gen_length=1024`, which matters on a 24 GB card.
+
 ---
 
 ## Benchmark Results
 
 ### Single-GPU: Baseline vs Optimized (NVIDIA A40-24Q)
 
-32-token generation benchmark on **NVIDIA A40-24Q**, PyTorch 2.5.1+cu118, Triton kernel tuned using `tuning_fused_moe_triton.py`.
-
-> Historical note: this specific run used top-5 expert activation, an optimization since removed (see note above) — kept here as the original measurement of the KV-cache + fused-MoE speedup, which is independent of expert count. Reproduce at the current static top-8 default with:
+128-token generation benchmark on **NVIDIA A40-24Q**, PyTorch 2.5.1+cu118, static top-8 both sides, Triton kernel tuned on this GPU with `tuning_fused_moe_triton.py`. Both sides use the same fixed-schedule decoding, so this isolates the *engine* speedup from the decoding-algorithm win documented under [Adaptive Decoding](#adaptive-decoding-threshold-based-token-selection).
 
 ```bash
-python eval/check_time_inference.py --weight-dir weights
+python -m eval.check_time_inference --weight-dir weights \
+    --gen-length 128 --steps 128 --block-length 32 --mode both --num-runs 3
 ```
 
-| Configuration | top-k | Time (s) | Tok/s | Speedup | Token Divergence |
-|---|:---:|---:|---:|:---:|:---:|
-| **Baseline** (`src/`, unfused, no cache) | 8 | 6.49 | 4.93 | 1.00× | — |
-| **Optimized** (`model_update/`, tuned kernel, historical top-5 run) | 5 | 1.73 | 18.50 | **3.75×** | 9.38% |
+| Configuration | top-k | Time (s) | Tok/s | Speedup |
+|---|:---:|---:|---:|:---:|
+| **Baseline** (`src/`, unfused, no cache) | 8 | 29.69 | 4.31 | 1.00× |
+| **Optimized** (`model_update/`, fused MoE + SiLU epilogue + KV cache + narrowed `lm_head`, tuned) | 8 | **4.60** | **27.86** | **6.46×** |
+
+This is the same configuration as the 2-GPU benchmark below, so the two are directly comparable: **one A40-24Q now matches what 2× A6000 with TP+EP achieved** (4.60 s vs 4.26 s, against baselines of 29.69 s and 26.19 s respectively — the A40 is ~13% slower hardware).
+
+> The benchmark also reports `Token Divergence`, which was 0/128 on this run. Do not read that as a correctness result: the benchmark prompt (`"The chemical symbol for gold is Au and for silver is"`) is answered in two tokens and EOS-padded for the other ~126, so both paths trivially agree on padding. The real correctness evidence is the bit-exactness tests and the GSM8K results under [Correctness Verification](#correctness-verification).
+
+> **Historical**: this table previously reported **3.75×** from a 32-token run using top-5 expert activation (an optimization since removed). The improvement since then comes from the vectorized `moe_align_block_size`, the fused SiLU epilogue, the narrowed `lm_head`, and — largest of all — actually having a tuned `moe_tune_config.json` on the benchmark GPU. See [Where the 6.46× comes from](#where-the-646-comes-from).
 
 ### Multi-GPU: Baseline vs Optimized + TP/EP (2× NVIDIA RTX A6000)
 
@@ -129,16 +160,41 @@ bash eval/benchmark_compare.sh --weight-dir ./weights --gen-length 128 --steps 1
 ### Speedup Breakdown
 
 ```
-              Speedup vs Baseline
+              Speedup vs Baseline  (128 tok, steps=128, block=32, top-8)
 
-  1 GPU  ██████████████████████████████████████  3.75×   (KV cache + fused MoE, A40-24Q, historical top-5 run)
-  2 GPU  ██████████████████████████████████████████████████████████████  6.15×   (TP+EP, 2x A6000, PCIe PHB, vectorized MoE alignment)
+  1 GPU  ████████████████████████████████████████████████████████████████  6.46×   (A40-24Q, tuned kernel + SiLU epilogue + narrowed lm_head)
+  2 GPU  █████████████████████████████████████████████████████████████     6.15×   (TP+EP, 2x A6000, PCIe PHB, vectorized MoE alignment)
 
   ────────────────────────────────────────────────────────────────────
   1.0×      2.0×      3.0×      4.0×      5.0×      6.0×
 ```
 
-> **Note on PCIe scaling**: The 1-GPU and 2-GPU rows above aren't a clean doubling comparison — different hardware (A40-24Q vs A6000) and expert count (historical top-5 vs current top-8) — so treat each as its own measurement, not a scaling ratio. Separately, the 2-GPU TP+EP architecture inserts two `dist.all_reduce()` synchronizations per layer — 32 network hops per generated token — over PCIe Host Bridge (`PHB`) rather than high-speed NVLink, adding a fixed communication cost. At Batch Size 1, this overhead partially offsets the compute gains from splitting work across 2 GPUs. Near-linear 2× per-GPU-throughput scaling is achieved at larger batch sizes where compute dominates.
+> **Note on PCIe scaling**: The two rows use the same generation config but different hardware (A40-24Q vs A6000), so treat each as its own measurement rather than a scaling ratio — the 1-GPU row being *higher* reflects a year of single-GPU kernel work, not that one A40 out-computes two A6000s. Separately, the 2-GPU TP+EP architecture inserts two `dist.all_reduce()` synchronizations per layer — 32 network hops per generated token — over PCIe Host Bridge (`PHB`) rather than high-speed NVLink, adding a fixed communication cost. At Batch Size 1, this overhead partially offsets the compute gains from splitting work across 2 GPUs. Near-linear 2× per-GPU-throughput scaling is achieved at larger batch sizes where compute dominates. The 2-GPU row has **not** been re-measured since the SiLU epilogue and `lm_head` changes landed.
+
+### Where the 6.46× comes from
+
+Measured on the A40-24Q at `gen_length=1024, steps=512, block_length=64, confidence_threshold=0.9` (the recommended deployment config), each step applied cumulatively:
+
+| Stage | Time | Tok/s | Delta |
+|---|---:|---:|---:|
+| Starting point | 3.39 s | 302.4 | — |
+| \+ narrowed `lm_head` | 3.24 s | 316.1 | +4.4% |
+| \+ MoE autotune, then fused SiLU epilogue | **2.35 s** | **435.3** | **+27.5%** |
+
+**The single largest contributor was running the autotuner at all.** There was no `moe_tune_config.json` on this machine, so the kernel owning 45% of GPU time had been falling back to hardcoded configs. Isolating it (same measurement methodology, fusion held off) showed the full MoE pipeline going 8.08 → 3.64 ms at M=2048 (**2.2×**) and 4.29 → 2.45 ms at M=1024 (**1.8×**); small M barely moved. **If you deploy on different hardware, re-run the tuner — it is worth more than either kernel change.**
+
+The SiLU epilogue is a clean +1–10% on top, measured per-M with the tuned configs (`eval/test_fused_silu_epilogue.py`, Part 3):
+
+| M | Unfused | Fused | Delta |
+|---:|---:|---:|---:|
+| 1 | 0.656 ms | 0.635 ms | +3.2% |
+| 32 | 1.682 ms | 1.671 ms | +0.7% |
+| 57 | 1.727 ms | 1.710 ms | +1.0% |
+| 256 | 1.908 ms | 1.841 ms | +3.5% |
+| 1024 | 2.450 ms | 2.214 ms | +9.6% |
+| 2048 | 3.637 ms | 3.539 ms | +2.7% |
+
+> On the same measurement *before* tuning, M=256 showed a **−24.5% regression**. That was a fallback-config artifact (`BM=64, BN=64` — two fp32 accumulators plus doubled B-tile shared memory outweighing the saved traffic), not a property of the fusion; it disappears entirely once the tuner picks a config for the fused shape. This is why `tuning_fused_moe_triton.py` benchmarks the pipeline that production actually runs, following `FUSE_SILU` rather than assuming the unfused chain.
 
 ### Understanding Token Divergence (9.38%)
 
@@ -172,11 +228,13 @@ Standard Triton autotune (`@triton.autotune`) has two critical weaknesses for Mo
 
 ### What the Autotuner Does
 
-- **Benchmarks the complete pipeline**: `GEMM1 → SiLU+mul activation → GEMM2 → sum`, not just the first GEMM.
+- **Benchmarks the complete pipeline**: `GEMM1 → SiLU+mul activation → GEMM2 → sum`, not just the first GEMM — and specifically the pipeline production runs, following `FUSE_SILU` so that the fused-epilogue variant (which has a different shared-memory budget and a halved N grid) is scored on its own terms.
 - **Composite scoring**: `score = latency_ms × (1 + padding_penalty × padding_ratio)`. This explicitly penalizes configs that inflate the padded token count.
 - **Caps `BLOCK_SIZE_M ≤ 64`** by default to prevent padding explosion for small-to-medium batch sizes.
-- **Profiles each candidate**: reports shared memory usage, estimated SM occupancy, and padding ratio so you can understand why a config was chosen.
-- **Validates correctness** of the winning config against a reference before writing the JSON (cosine similarity > 0.999 required).
+- **Profiles each candidate**: reports padding ratio so you can understand why a config was chosen. (The shared-memory and SM-occupancy columns read their values from Triton's compiled-kernel metadata via `getattr(meta, "shared", None)`, which returns `None` on recent Triton versions — those two columns currently print `None` and are not used in config selection.)
+- **Validates correctness** of the winning config against a reference before writing the JSON (cosine similarity > 0.999 required — note this is *not* a bit-exactness check, so retuning can legitimately shift generation output; see the accuracy note below).
+
+> **Retuning is not numerically neutral.** Changing `BLOCK_SIZE_K` regroups the fp32 accumulation in the K-loop, so a retuned kernel can produce different tokens from the same weights and seed. That is expected and accepted here — the winner is validated at `cos_sim > 0.999`, not bit-equality. In practice a full retune on the A40-24Q left GSM8K accuracy completely unchanged (88.0%, 44/50, same as before), but treat a few points of movement after retuning as normal rather than as a regression.
 
 ### Usage
 
@@ -377,7 +435,9 @@ The Chrome trace above answers "is the GPU busy," but not *why* individual kerne
 | Achieved occupancy | ~8.3% | ~65% |
 | "No eligible warp" cycles | ~79.7% | ~93% (81.6% of it: L1TEX/memory scoreboard stalls) |
 
-Attention was **occupancy-starved**: only 16 blocks (one per KV head, B=1) against 84 SMs, so ~80% of cycles had literally no warp with work ready to issue — a launch-configuration problem, not a bandwidth or compute one. MoE was **already memory-bandwidth-bound**, pinned near the A6000's DRAM bandwidth ceiling: with 16 active tokens split across top-8-of-64 routing, each expert averages ~2 tokens, so the kernel spends most of its time streaming that expert's full weight matrix from memory to process almost nothing — the classic thin-GEMM regime. This is the mechanistic explanation for why kernel-launch-overhead techniques tried and reverted earlier (`torch.compile` on `Attention.forward` and on the SiLU×mul MoE activation, CUDA graph capture/replay — see git history) showed no benefit or a regression: neither technique changes how much work a kernel does once launched, and in both cases the bottleneck was underutilization *within* the kernel, not dispatch overhead *around* it.
+Attention was **occupancy-starved**: only 16 blocks (one per KV head, B=1) against 84 SMs, so ~80% of cycles had literally no warp with work ready to issue — a launch-configuration problem, not a bandwidth or compute one. MoE was **memory-bound**: with 16 active tokens split across top-8-of-64 routing, each expert averages ~2 tokens, so the kernel spends most of its time streaming that expert's full weight matrix from memory to process almost nothing — the classic thin-GEMM regime. This is the mechanistic explanation for why kernel-launch-overhead techniques tried and reverted earlier (`torch.compile` on `Attention.forward` and on the SiLU×mul MoE activation, CUDA graph capture/replay — see git history) showed no benefit or a regression: neither technique changes how much work a kernel does once launched, and in both cases the bottleneck was underutilization *within* the kernel, not dispatch overhead *around* it.
+
+> **Correction — the "~96% of peak" figure above is L2, not DRAM.** Re-reading the raw `ncu` output (`ncu_deep_report_b32.txt`) shows `L2 Cache Throughput = 96.35%` while `DRAM Throughput` sits at only **66–68%**. The row is labelled "Memory Throughput" in Nsight's Speed-of-Light section, which reports the *most utilized* memory subsystem — here L2, not DRAM. This distinction turned out to matter: reading it as "already at the DRAM ceiling, nothing left to gain" argues against touching the kernel at all, whereas an L2-traffic ceiling says removing intermediate tensors is exactly the lever. Acting on the corrected reading produced the fused SiLU epilogue (Optimization 3), which deletes ~1.2 GB of per-forward round-trip traffic and is worth up to +9.6%.
 
 **Batching directly fixes both, by two different mechanisms — confirmed at the kernel level, not inferred from throughput alone:**
 
@@ -535,10 +595,13 @@ That 9/10 turned out to be an optimistic small sample. Re-run at n=50/seed=42 wi
 | MMLU-Pro | machine A | 32 | 16 | 0.5 | 44.0% acc (n=50, validated above) |
 | MMLU-Pro | A5000 | 32 | 16 | 0.5 | 36.0% acc (n=50) — same command/seed, different GPU |
 | GSM8K, original | machine A | 64 | 16 | 0.25 | **0% acc** — degenerate repetition on nearly every question |
-| GSM8K, doubled steps | machine A | 64 | 32 | 0.5 | **77.4% acc** (partial run, ~31/50 completed before interruption) |
+| GSM8K, doubled steps | machine A | 64 | 32 | 0.5 | **77.4% acc** (partial run, ~31/50 — superseded, see below) |
+| GSM8K, doubled steps | machine A (A40-24Q) | 64 | 32 | 0.5 | **88.0% acc** (44/50, clean n=50 re-run) |
 | GSM8K, doubled steps | A5000 | 64 | 32 | 0.5 | **88.0% acc** (n=50) — occasional repetition remains (~1-2/50) |
 
-**Cross-hardware variance**: identical code, seed, and config produced different accuracy on different GPUs (MMLU-Pro 44%→36%, GSM8K ~77%→88%). `seed=42` controls Python/CPU-side RNG only; it doesn't pin down GPU kernel floating-point arithmetic, and diffusion decoding is unusually sensitive to that because a tiny per-step logit difference can flip which token gets selected at a branch point, changing every subsequent step's context. Treat any single accuracy number here as directionally correct but not a portable, exact guarantee across hardware.
+**Cross-hardware variance — partially retracted for GSM8K.** The original claim here was that identical code, seed, and config produced different accuracy on different GPUs (MMLU-Pro 44%→36%, GSM8K ~77%→88%). A clean n=50 re-run of GSM8K on machine A (A40-24Q) scored **88.0% (44/50) — identical to the A5000's result**, so the GSM8K half of that claim was an artifact of the earlier run being interrupted at ~31/50, not a real hardware effect. Two further details reinforce this: question **#39 is the repetition failure on both machines**, the same question the A5000 run singled out; and the 88.0% survived a full MoE kernel retune (which changes `BLOCK_SIZE_K` and therefore the fp32 K-loop accumulation order) without moving at all.
+
+The MMLU-Pro variance (44%→36%) has **not** been re-tested and may still be real. The underlying mechanism remains plausible in general — `seed=42` controls Python/CPU-side RNG only, not GPU kernel floating-point arithmetic, and diffusion decoding can amplify a tiny per-step logit difference into a different token at a branch point. But GSM8K turned out to be far more reproducible across hardware than this section originally claimed, so treat the remaining variance claim as unverified rather than established.
 
 **Guideline, now documented in `generate_cached`'s docstring and enforced with a runtime warning: `confidence_threshold` needs `steps_per_block >= block_length / 2`.** Below that ratio, the last-step force-reveal does too much of the block's work at once and safety degrades toward the same failure the naive per-position threshold had. Above it, the failure becomes rare rather than universal — but "rare" is not "fixed"; treat `confidence_threshold` as a real accuracy/speed trade with a residual, unresolved tail risk on long generations, not a strictly-better default.
 
@@ -603,6 +666,11 @@ After the kernel-level investigation closed (see Correctness Verification: the ~
 | `model_update`, fixed schedule, steps=512 | 76.0% | 33.8 |
 | `model_update`, threshold=0.76/low=0.62 (dInfer's own tuned values), steps=512 | 76.0% | 8.0 |
 | **`model_update`, threshold=0.9/low=0.4, steps=512** | **88.0%** | **8.6** |
+| **`model_update`, same config, after the SiLU epilogue + `lm_head` + retune** | **88.0%** | **6.1** |
+
+> The last row re-runs the identical command after the optimizations in this document landed: accuracy held exactly (44/50), while per-question time dropped from 8.6 s to **6.1 s** (−29%), matching the microbenchmark's −27.5%.
+
+> **Caveat on the absolute number.** `_grade_gsm8k` falls back to "the last number anywhere in the raw response" when the extracted answer span contains no digits (`eval/correctness/run_math_reasoning_code.py`, added to handle `Final Answer:` followed by a multi-line LaTeX block). For a chain-of-thought answer that is usually the result, but it is a permissive rule: in the 44/50 run, **3 correct answers rest on it** (questions where the displayed extraction was `'The'`, `'$$'`, `'**'`). Since the same grader scores the HF reference rows, comparisons *within* this table remain valid — but the "+5.59 pts vs the paper's 82.41%" claim is softer than it looks, because the paper's grader is unlikely to be this lenient.
 
 Three conclusions from the full matrix:
 
@@ -749,6 +817,8 @@ python -m eval.throughput.run_throughput            # concurrent request through
 │   ├── profile_kv_concat.py                Isolates KV-cache torch.cat cost vs attention math cost
 │   ├── profile_kernel_occupancy.sh         Nsight Compute (ncu) wrapper: occupancy/memory-bandwidth/warp-stall profiling
 │   ├── test_moe_align_block_size.py        Regression test: vectorized MoE token-alignment vs a frozen reference
+│   ├── test_num_logits_slice.py            Regression test: narrowed lm_head vs a frozen copy of the pre-change loop
+│   ├── test_fused_silu_epilogue.py         Regression test + benchmark: fused SiLU epilogue vs the unfused path
 │   ├── test_select_transfer_indices.py     Regression test: vectorized per-row top-k selection vs a frozen reference
 │   ├── correctness/
 │   │   ├── run_correctness.py              MMLU / MMLU-Pro accuracy evaluation
