@@ -234,14 +234,18 @@ def _generate_block_cached(
         if not mask_index.any():
             break  # every row's block already fully unmasked -- no forward call needed
 
+        # The layers run over the whole suffix (future MASK context is load-
+        # bearing, see below), but only the active block's logits are ever
+        # used -- num_logits keeps lm_head from projecting the rest to a
+        # 157k-wide vocabulary just to have it sliced away here.
         suffix_ids = x[:, block_start:]
-        suffix_logits, _ = model(
+        logits, _ = model(
             suffix_ids,
             position_offset=block_start,
             cache_buffer=cache_buffer,
             write_pos=block_start,
+            num_logits=block_length,
         )
-        logits = suffix_logits[:, :block_length]
 
         logits_with_noise = add_gumbel_noise(logits, temperature)
         x0_raw = logits_with_noise.argmax(dim=-1)  # the model's own top pick at EVERY position, unmodified
@@ -279,12 +283,15 @@ def _generate_block_cached(
     # causes premature EOS collapse in later blocks. Only [block_start:block_end)
     # actually gets committed; the freshly-computed K/V for future blocks is
     # provisional and gets overwritten again once those blocks are processed.
+    # num_logits=0: this pass exists purely for its K/V side effect on
+    # cache_buffer -- the logits were computed and discarded outright.
     remaining_ids = x[:, block_start:]
     model(
         remaining_ids,
         position_offset=block_start,
         cache_buffer=cache_buffer,
         write_pos=block_start,
+        num_logits=0,
     )
     cache_buffer.commit(block_end)
 
@@ -376,7 +383,10 @@ def generate_cached(
     # [0:P) actually gets committed; the freshly-computed K/V for the
     # (all-MASK) generation region is provisional and gets overwritten once
     # block 0 is processed.
-    model(x, position_offset=0, cache_buffer=cache_buffer, write_pos=0)
+    # num_logits=0: like the finalize pass, this one is run only for its K/V
+    # side effect -- its logits were computed over the entire (prompt +
+    # all-MASK) sequence and thrown away.
+    model(x, position_offset=0, cache_buffer=cache_buffer, write_pos=0, num_logits=0)
     cache_buffer.commit(P)
 
     for block_idx in range(num_blocks):

@@ -356,6 +356,7 @@ class LLaDAMoEKV(nn.Module):
         past_kv: Optional[KVCache] = None,
         cache_buffer: Optional[KVCacheBuffer] = None,
         write_pos: Optional[int] = None,
+        num_logits: Optional[int] = None,
     ):
         """
         input_ids: [B, T] — either the full sequence (past_kv=None, e.g. prefix
@@ -368,8 +369,31 @@ class LLaDAMoEKV(nn.Module):
                    given, K/V for input_ids are written into the buffer at
                    write_pos and attention reads a view of it, instead of
                    cat-ing a fresh tensor from past_kv every call.
-        Returns: logits [B, T, VS] for input_ids positions only, and
-                 new_kv: list of (k,v) per layer for input_ids' own tokens
+        num_logits: run the final norm + lm_head over only the FIRST
+                   num_logits positions of input_ids. None (default) keeps
+                   the original behavior (all T positions); 0 skips the head
+                   entirely and returns None for logits.
+
+                   Every transformer layer still runs over the full T — the
+                   K/V written to the cache, and the mask-placeholder context
+                   the model was trained to see, both depend on it (see
+                   _generate_block_cached / generate_cached in generate.py).
+                   Only the vocabulary projection is narrowed, and callers
+                   already discard everything past their own slice: the cache
+                   prime and block finalize calls discard the logits outright,
+                   and each denoising step uses only [:, :block_length] of a
+                   suffix that can be 16x longer. lm_head is the widest GEMM
+                   in the model (H=2048 -> VS=157184, ~644MB of weights), so
+                   this is both the dominant discarded compute and an ~800MB
+                   peak allocation that never needed to exist.
+
+                   Exact, not approximate: GEMM rows are independent, so the
+                   surviving rows compute identical dot products, and RMSNorm
+                   reduces along the feature axis so each token's
+                   normalization is independent of the others. Slicing before
+                   self.norm rather than after is therefore also exact.
+        Returns: logits [B, num_logits or T, VS] (None when num_logits == 0),
+                 and new_kv: list of (k,v) per layer for input_ids' own tokens
                  (caller decides whether/when to append these to the cache).
         """
         cfg = self.cfg
@@ -390,6 +414,11 @@ class LLaDAMoEKV(nn.Module):
                 cache_buffer=cache_buffer, layer_idx=i, write_pos=write_pos,
             )
             new_kv.append(kv_i)
+
+        if num_logits == 0:
+            return None, new_kv
+        if num_logits is not None:
+            x = x[:, :num_logits]
 
         x = self.norm(x)
         logits = self.lm_head(x)
