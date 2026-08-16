@@ -1,6 +1,6 @@
 # LLaDA-MoE-7B-A1B-Instruct — Optimized Inference Engine
 
-Self-contained PyTorch reimplementation of [inclusionAI/LLaDA-MoE-7B-A1B-Instruct](https://huggingface.co/inclusionAI/LLaDA-MoE-7B-A1B-Instruct) with four stacked inference optimizations — **Triton Fused MoE** (with the SiLU activation fused into the first GEMM's epilogue), **Block-wise KV Caching**, and a **narrowed `lm_head`** — running the model's native static top-8 expert routing. **6.46× faster than the baseline on a single GPU.** Includes an OpenAI-compatible API server, a full evaluation suite, and an end-to-end-aware Triton autotuner.
+Self-contained PyTorch reimplementation of [inclusionAI/LLaDA-MoE-7B-A1B-Instruct](https://huggingface.co/inclusionAI/LLaDA-MoE-7B-A1B-Instruct) with four stacked inference optimizations — **Triton Fused MoE** (with the SiLU activation fused into the first GEMM's epilogue), **Block-wise KV Caching**, and a **narrowed `lm_head`** — running the model's native static top-8 expert routing. **6.46× faster than the baseline on a single request, and 54× on total-pipeline throughput under concurrent load.** Includes an OpenAI-compatible API server, a full evaluation suite, and an end-to-end-aware Triton autotuner.
 
 ---
 
@@ -195,6 +195,57 @@ The SiLU epilogue is a clean +1–10% on top, measured per-M with the tuned conf
 | 2048 | 3.637 ms | 3.539 ms | +2.7% |
 
 > On the same measurement *before* tuning, M=256 showed a **−24.5% regression**. That was a fallback-config artifact (`BM=64, BN=64` — two fp32 accumulators plus doubled B-tile shared memory outweighing the saved traffic), not a property of the fusion; it disappears entirely once the tuner picks a config for the fused shape. This is why `tuning_fused_moe_triton.py` benchmarks the pipeline that production actually runs, following `FUSE_SILU` rather than assuming the unfused chain.
+
+### Total-Pipeline Throughput: 54×
+
+The 6.46× above is a *single-request* engine comparison. Under concurrent load the gap is much larger, because the optimizations that made batching possible — block-wise KV caching and the narrowed `lm_head` — are what free the memory a batch needs. Both rows below were measured through the **same HTTP client, same load harness, same generation config**, so this is a pipeline-to-pipeline number rather than two measurements stitched together:
+
+| Pipeline | Throughput |
+|---|---:|
+| `src/` via HTTP, serialized | **4.5 tok/s** |
+| `model_update/` (`fast_dense`, `BATCH_MAX_SIZE=32`) | **243.2 tok/s** |
+| | **54×** |
+
+```bash
+# baseline
+bash start.sh --backend ours --weight-dir weights
+python -m eval.throughput.run_throughput --base-url http://localhost:8000 \
+    --concurrency 4 --n-requests 4 --fixed-prompt --max-tokens 128 --steps 128 --block-length 32
+
+# optimized
+BATCH_MAX_SIZE=32 bash start.sh --backend fast_dense --weight-dir weights
+python -m eval.throughput.run_throughput --base-url http://localhost:8000 \
+    --concurrency 32 --n-requests 64 --fixed-prompt --max-tokens 128 --steps 128 --block-length 32
+```
+
+> The baseline uses only 4 requests because a serialized backend's aggregate throughput is independent of concurrency — every request takes ~28s and they queue, so 4 requests measure the same tok/s as 32 in an eighth of the time. (`run_throughput.py` sets no `aiohttp.ClientTimeout`, so it inherits the 300s default and will time out on a serialized backend past ~10 requests.)
+
+**The baseline's single-request throughput is its ceiling, not a configuration choice**: `src/generate.py` hardcodes the batch dimension to 1 (`x = torch.full((1, P + gen_length), ...)`, ignoring `prompt_ids.shape[0]`), so passing a batched prompt raises a shape error. Even with that fixed, `src/` has no KV cache and recomputes full-sequence logits every step — at B=32 that is ~7 GB per step for the decode tail alone.
+
+The number decomposes, which is the check that it is real:
+
+    6.46x (engine, B=1 both sides)  x  8.7x (batching, 27.86 -> 243.2 tok/s)  =  56x predicted
+                                                                                54x measured
+
+Three independent measurement paths agreeing to within 4%.
+
+### Throughput vs Batch Size (single A40-24Q, 24 GB)
+
+Measured with `--max-tokens 128 --steps 128 --block-length 32`, `--concurrency` equal to `BATCH_MAX_SIZE`:
+
+| `BATCH_MAX_SIZE` | Tok/s | Δ throughput | Δ batch | p50 latency |
+|---:|---:|---:|---:|---:|
+| 8 | 150.3 | — | — | 6.77 s |
+| 16 | 204.8 | +36.3% | +100% | 9.93 s |
+| 24 | 224.8 | +9.8% | +50% | 13.56 s |
+| **32** | **243.2** | +8.2% | +33% | 16.71 s |
+| 48 | **0/96 requests succeeded** | — | — | — |
+
+**Throughput is already past the knee by batch 32** — 8→32 is 4× the batch for 1.62× the throughput, and the last step bought 8.2%. This independently confirms the Nsight finding below that MoE's efficiency gain is front-loaded: by B=32 the kernel has stopped being weight-streaming-limited, so extra tokens no longer ride along free. Further memory-reduction work to enable larger batches would buy single-digit percentages, not multiples.
+
+> **The default `BATCH_MAX_SIZE=64` is sized for a 48 GB A6000 and fails on a 24 GB card.** At 48 the server died between the health check and the load, taking all 96 requests with it — [server.py](src/server.py)'s batch handler catches `Exception` and fails the *entire* batch, so there is no split-and-retry and no memory-aware cap. On 24 GB use `BATCH_MAX_SIZE=32`; if latency matters, 24 gives up 8% throughput for 3.2s less p50.
+>
+> Rough sizing, calibrated against the failure boundary above — per sequence at total length `L` and block length `b`: KV cache `128 KB × L`, MoE transients `~48 KB × L` (peak is the cache-prime call, where `M = B × L`), logits `307 KB × b`. So `B_max ≈ (free_vram − safety) / (L × 176 KB + b × 307 KB)`.
 
 ### Understanding Token Divergence (9.38%)
 
@@ -518,6 +569,8 @@ Raw output, Run B (`BATCH_MAX_SIZE=64`):
 | Latency p99 | 56.72s | 52.01s | −8% |
 
 Not a throughput/latency tradeoff — a win on both simultaneously. With `BATCH_MAX_SIZE=8`, 128 concurrent requests need 16 sequential batch rounds, so most requests queue behind many earlier rounds before starting at all (hence p50/p95/p99 all clustered near the tail, ~56s). With `BATCH_MAX_SIZE=64`, only 2 rounds are needed, so most requests start almost immediately. `BATCH_MAX_SIZE`'s default was changed from 8 to 64 in `src/server.py` based on this data.
+
+> **This measurement is A6000-specific (48 GB) and the resulting default does not port down.** On a 24 GB card, `BATCH_MAX_SIZE=48` kills the server outright and takes every in-flight request with it; the safe maximum is 32. See [Throughput vs Batch Size](#throughput-vs-batch-size-single-a40-24q-24-gb) for the measured curve, the failure boundary, and a sizing formula. The default remains 64 because it is correct on the hardware it was tuned for, but it should be set explicitly per deployment — nothing in the code derives it from available memory.
 
 #### Removing Dead Time Between Batches: Collector/Executor Pipelining
 
