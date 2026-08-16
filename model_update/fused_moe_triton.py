@@ -30,26 +30,47 @@ def _shared_mem_limit() -> int:
 
 SHARED_MEM_LIMIT = _shared_mem_limit()
 
-def get_best_config(M: int, E: int) -> Dict[str, Any]:
+# Fuse the SiLU(gate)*up activation into GEMM1's epilogue instead of running it
+# as a separate elementwise pass over a materialized [M, top_k, 2*EI] tensor.
+# Set LLADA_MOE_FUSED_SILU=0 to fall back to the unfused path (the A/B switch
+# eval/test_fused_silu_epilogue.py uses, and the escape hatch if a future
+# Triton version's tl.exp stops matching CUDA's expf -- see _silu_epilogue
+# notes in fused_moe_kernel).
+FUSE_SILU = os.environ.get("LLADA_MOE_FUSED_SILU", "1") != "0"
+
+
+def _shmem_bytes(bm: int, bn: int, bk: int, ns: int, silu_epilogue: bool) -> int:
+    """Per-block shared memory for one pipelined stage set.
+
+    The SiLU epilogue keeps TWO B tiles in flight per K step (the gate columns
+    at offs_bn and the up columns at offs_bn + N/2), so its B-side footprint
+    doubles. get_best_config picks ONE config used by both GEMMs, so the guard
+    has to size for the more expensive of the two.
+    """
+    b_tiles = 2 if silu_epilogue else 1
+    return (bm * bk + b_tiles * bk * bn) * ns * 2
+
+
+def get_best_config(M: int, E: int, silu_epilogue: bool = False) -> Dict[str, Any]:
     config = None
     if TUNED_CONFIGS:
         m_keys = [int(k) for k in TUNED_CONFIGS.keys()]
         closest_m = min(m_keys, key=lambda k: abs(k - M))
         candidate = TUNED_CONFIGS[str(closest_m)].copy()
-        
+
         # Calculate shared memory requirement
         bm = candidate.get('BLOCK_SIZE_M', 64)
         bn = candidate.get('BLOCK_SIZE_N', 64)
         bk = candidate.get('BLOCK_SIZE_K', 32)
         ns = candidate.get('num_stages', 2)
-        shmem = (bm * bk + bk * bn) * ns * 2
-        
+        shmem = _shmem_bytes(bm, bn, bk, ns, silu_epilogue)
+
         if shmem <= SHARED_MEM_LIMIT:
             config = candidate
         else:
             # Try reducing num_stages to 2
             candidate['num_stages'] = 2
-            shmem_reduced = (bm * bk + bk * bn) * 2 * 2
+            shmem_reduced = _shmem_bytes(bm, bn, bk, 2, silu_epilogue)
             if shmem_reduced <= SHARED_MEM_LIMIT:
                 config = candidate
 
@@ -75,8 +96,35 @@ def fused_moe_kernel(
         BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
         GROUP_SIZE_M: tl.constexpr, MUL_ROUTED_WEIGHT: tl.constexpr, top_k: tl.constexpr,
         compute_type: tl.constexpr, use_fp8_w8a8: tl.constexpr, use_int8_w8a16: tl.constexpr,
-        is_first_gemm: tl.constexpr):
-    
+        is_first_gemm: tl.constexpr, SILU_EPILOGUE: tl.constexpr):
+    """
+    SILU_EPILOGUE (GEMM1 only): w1 packs [gate ; up] along N, so the unfused
+    path materialized the full [M, top_k, 2*EI] product, read it back, and ran
+    SiLU(gate)*up as a separate elementwise pass. Here `N` is the OUTPUT width
+    (EI, i.e. half of w1's N) and each program computes two B tiles -- the gate
+    columns at offs_bn and the up columns at offs_bn + N -- then applies the
+    activation from registers, writing EI-wide output directly. Removes a
+    ~15MB write + read + write per layer per forward at B=57, on a kernel that
+    ncu measures at 96% L2 throughput.
+
+    Bit-exactness: the K-loop is untouched, so the accumulators are identical
+    to the unfused path's. The epilogue then reproduces the unfused op order
+    exactly rather than taking the more accurate route -- accumulators are
+    rounded to `compute_type` FIRST (reproducing the intermediate_cache1
+    store), and SiLU is evaluated as x/(1+exp(-x)) in fp32 with the result
+    rounded back to compute_type before the multiply, matching what ATen's
+    bf16 SiLU (opmath_t=float) and bf16 mul do elementwise. Computing the
+    activation straight from the fp32 accumulators would be MORE precise and
+    therefore NOT bit-identical, which is not what we want here.
+
+    The one thing this cannot guarantee by construction is that Triton's
+    tl.exp lowers to the same instruction as CUDA's expf. A last-ulp fp32
+    difference there would almost always vanish in the round to bf16, but
+    "almost always" is not "never" -- eval/test_fused_silu_epilogue.py
+    measures it directly rather than assuming, and LLADA_MOE_FUSED_SILU=0
+    disables the fusion if it ever stops matching.
+    """
+
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
@@ -106,12 +154,34 @@ def fused_moe_kernel(
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
+    if SILU_EPILOGUE:
+        # N is the output (gate) width here, so the matching `up` columns of
+        # w1 sit exactly N further along the same expert's weight block.
+        b_up_ptrs = b_ptr + off_experts * stride_be + (
+            offs_k[:, None] * stride_bk + (offs_bn + N)[None, :] * stride_bn)
+        accumulator_up = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         a = tl.load(a_ptrs, mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K), other=0.0)
         b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
         accumulator += tl.dot(a, b)
+        if SILU_EPILOGUE:
+            b_up = tl.load(b_up_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+            accumulator_up += tl.dot(a, b_up)
+            b_up_ptrs += BLOCK_SIZE_K * stride_bk
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    if SILU_EPILOGUE:
+        # Round to compute_type FIRST -- this is the intermediate_cache1 store
+        # the unfused path performed. Skipping it would be more accurate and
+        # therefore not bit-identical.
+        gate = accumulator.to(compute_type).to(tl.float32)
+        up = accumulator_up.to(compute_type).to(tl.float32)
+        # ATen's bf16 SiLU computes x/(1+exp(-x)) with opmath_t=float, then
+        # rounds to bf16; the following mul then rounds again. Same order here.
+        silu = gate / (1.0 + tl.exp(-gate))
+        accumulator = silu.to(compute_type).to(tl.float32) * up
 
     if MUL_ROUTED_WEIGHT:
         moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
@@ -189,57 +259,84 @@ def invoke_fused_moe_kernel(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor,
                             topk_weights: torch.Tensor, topk_ids: torch.Tensor,
                             sorted_token_ids: torch.Tensor, expert_ids: torch.Tensor,
                             num_tokens_post_padded: torch.Tensor,
-                            mul_routed_weight: bool, top_k: int, config: Dict[str, Any]) -> None:
+                            mul_routed_weight: bool, top_k: int, config: Dict[str, Any],
+                            silu_epilogue: bool = False) -> None:
     compute_type = tl.bfloat16 if A.dtype == torch.bfloat16 else tl.float16
-    grid = lambda META: (triton.cdiv(sorted_token_ids.shape[0], META['BLOCK_SIZE_M']) * triton.cdiv(B.shape[1], META['BLOCK_SIZE_N']), )
     is_first_gemm = not mul_routed_weight
-    
+
+    # With the SiLU epilogue, each program consumes two of w1's N tiles and
+    # emits one, so the output is half as wide and the N grid halves with it.
+    n_out = B.shape[1] // 2 if silu_epilogue else B.shape[1]
+
+    # C is [M, top_k, N] on the unfused path but the already-flattened
+    # [M*top_k, N] that GEMM2 reads when the epilogue is on; offs_token indexes
+    # rows either way, so take the last two strides rather than fixed axes.
+    stride_cm, stride_cn = C.stride(-2), C.stride(-1)
+
+    grid = lambda META: (triton.cdiv(sorted_token_ids.shape[0], META['BLOCK_SIZE_M'])
+                         * triton.cdiv(n_out, META['BLOCK_SIZE_N']), )
+
     kernel_kwargs = config.copy()
     num_warps = kernel_kwargs.pop('num_warps', 4)
     num_stages = kernel_kwargs.pop('num_stages', 2)
-    
+
     fused_moe_kernel[grid](
         A, B, C, None, None,
         topk_weights, sorted_token_ids, expert_ids, num_tokens_post_padded,
-        B.shape[1], B.shape[2], sorted_token_ids.shape[0], topk_ids.numel(),
+        n_out, B.shape[2], sorted_token_ids.shape[0], topk_ids.numel(),
         A.stride(0), A.stride(1),
         B.stride(0), B.stride(2), B.stride(1),
-        C.stride(1), C.stride(2),
+        stride_cm, stride_cn,
         0, 0,
         MUL_ROUTED_WEIGHT=mul_routed_weight, top_k=top_k,
         compute_type=compute_type, use_fp8_w8a8=False, use_int8_w8a16=False,
-        is_first_gemm=is_first_gemm,
+        is_first_gemm=is_first_gemm, SILU_EPILOGUE=silu_epilogue,
         num_warps=num_warps, num_stages=num_stages,
         **kernel_kwargs,
     )
 
 def fused_moe(hidden_states: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor,
-              gating_output: torch.Tensor, topk_ids: torch.Tensor):
+              gating_output: torch.Tensor, topk_ids: torch.Tensor,
+              fuse_silu: Optional[bool] = None):
+    """fuse_silu: None follows the FUSE_SILU module default (env-overridable);
+    True/False force it, which is how eval/test_fused_silu_epilogue.py A/Bs the
+    two paths against each other in one process."""
     # This standalone fused_moe handles the W1 (Gate+Up) and W2 (Down) projections.
     M, K = hidden_states.shape
     E, N, _ = w1.shape
     top_k = topk_ids.shape[1]
-    
-    config = get_best_config(M, E)
+
+    silu_epilogue = FUSE_SILU if fuse_silu is None else fuse_silu
+    config = get_best_config(M, E, silu_epilogue=silu_epilogue)
 
     # 1. Align Block Size
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(topk_ids, config['BLOCK_SIZE_M'], E)
 
-    # 2. First GEMM: x @ W1
-    intermediate_cache1 = torch.empty((M, topk_ids.shape[1], N), device=hidden_states.device, dtype=hidden_states.dtype)
-    invoke_fused_moe_kernel(
-        hidden_states, w1, intermediate_cache1,
-        gating_output, topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded,
-        mul_routed_weight=False, top_k=top_k, config=config
-    )
+    # 2. First GEMM: x @ W1, with SiLU(gate)*up folded into the epilogue when
+    #    enabled -- writing the EI-wide activated result straight out instead
+    #    of a 2*EI-wide intermediate that then has to be re-read.
+    if silu_epilogue:
+        intermediate_cache2 = torch.empty((M * top_k, N // 2), device=hidden_states.device, dtype=hidden_states.dtype)
+        invoke_fused_moe_kernel(
+            hidden_states, w1, intermediate_cache2,
+            gating_output, topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded,
+            mul_routed_weight=False, top_k=top_k, config=config, silu_epilogue=True
+        )
+    else:
+        intermediate_cache1 = torch.empty((M, top_k, N), device=hidden_states.device, dtype=hidden_states.dtype)
+        invoke_fused_moe_kernel(
+            hidden_states, w1, intermediate_cache1,
+            gating_output, topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded,
+            mul_routed_weight=False, top_k=top_k, config=config
+        )
 
-    # 3. Activation: F.silu(gate) * up
-    # W1 is usually [Gate, Up] concatenated.
-    gate, up = intermediate_cache1.chunk(2, dim=-1)
-    intermediate_cache2 = (torch.nn.functional.silu(gate) * up).view(M * topk_ids.shape[1], N // 2)
+        # 3. Activation: F.silu(gate) * up
+        # W1 is usually [Gate, Up] concatenated.
+        gate, up = intermediate_cache1.chunk(2, dim=-1)
+        intermediate_cache2 = (torch.nn.functional.silu(gate) * up).view(M * top_k, N // 2)
 
     # 4. Second GEMM: (activated) @ W2
-    intermediate_cache3 = torch.empty((M, topk_ids.shape[1], w2.shape[1]), device=hidden_states.device, dtype=hidden_states.dtype)
+    intermediate_cache3 = torch.empty((M, top_k, w2.shape[1]), device=hidden_states.device, dtype=hidden_states.dtype)
     invoke_fused_moe_kernel(
         intermediate_cache2, w2, intermediate_cache3,
         gating_output, topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded,

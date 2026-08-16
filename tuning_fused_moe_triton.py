@@ -11,6 +11,8 @@ from model_update.fused_moe_triton import (
     moe_align_block_size,
     fused_moe_kernel,
     SHARED_MEM_LIMIT,
+    FUSE_SILU,
+    _shmem_bytes,
 )
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -78,8 +80,12 @@ def get_config_grid(max_block_m: int = 64, shmem_limit: int = None):
     for bm, bn, bk, gm, nw, ns in itertools.product(
             block_m, block_n, block_k, group_m, num_warps, num_stages):
         # ── Hard shmem guard ───────────────────────────────────────────────
-        # Formula: tiles_a + tiles_b per stage, each element is 2 bytes (bf16)
-        shmem = (bm * bk + bk * bn) * ns * 2
+        # tiles_a + tiles_b per stage, 2 bytes per bf16 element -- via the
+        # shared _shmem_bytes() helper so this search space and the runtime
+        # guard in get_best_config() cannot drift apart. With the SiLU epilogue
+        # fused, GEMM1 keeps two B tiles in flight, so the budget is stricter
+        # and some configs that were legal unfused are pruned here.
+        shmem = _shmem_bytes(bm, bn, bk, ns, FUSE_SILU)
         if shmem > shmem_limit:
             continue
         configs.append({
@@ -134,24 +140,44 @@ def benchmark_full_pipeline(M, E, N, K, top_k, config, penalty_weight=0.5):
     padded_EM = sorted_token_ids.shape[0]
     padding_ratio = (padded_EM - real_EM) / max(real_EM, 1)
 
-    # Pre-allocate caches (same as production code)
-    cache1 = torch.empty((M, top_k, N),       device=device, dtype=dtype)
-    cache2 = torch.empty((M, top_k, K),        device=device, dtype=dtype)
+    # Pre-allocate caches (same as production code). Which caches exist depends
+    # on whether the SiLU epilogue is fused: with it on, GEMM1 writes the
+    # EI-wide activated result directly and the 2*EI-wide cache1 never exists.
+    # The tuner has to measure the pipeline production actually runs -- its
+    # whole premise is scoring the real GEMM1 -> act -> GEMM2 -> sum chain
+    # rather than one GEMM in isolation, and the fused epilogue changes both
+    # the traffic and the shared-memory budget that scoring depends on.
+    fuse_silu = FUSE_SILU
+    cache2 = torch.empty((M, top_k, K), device=device, dtype=dtype)
+    if fuse_silu:
+        act_out = torch.empty((M * top_k, N // 2), device=device, dtype=dtype)
+    else:
+        cache1 = torch.empty((M, top_k, N), device=device, dtype=dtype)
 
     def run_full_pipeline():
-        # GEMM 1: hidden @ W1
-        invoke_fused_moe_kernel(
-            hidden_states, w1, cache1,
-            topk_weights, topk_ids,
-            sorted_token_ids, expert_ids, num_tokens_post_padded,
-            False, top_k, config,
-        )
-        # SiLU activation (same as fused_moe production code)
-        gate, up = cache1.chunk(2, dim=-1)
-        act_out  = (torch.nn.functional.silu(gate) * up).view(M * top_k, N // 2)
+        if fuse_silu:
+            # GEMM 1 + SiLU(gate)*up epilogue
+            invoke_fused_moe_kernel(
+                hidden_states, w1, act_out,
+                topk_weights, topk_ids,
+                sorted_token_ids, expert_ids, num_tokens_post_padded,
+                False, top_k, config, silu_epilogue=True,
+            )
+            act = act_out
+        else:
+            # GEMM 1: hidden @ W1
+            invoke_fused_moe_kernel(
+                hidden_states, w1, cache1,
+                topk_weights, topk_ids,
+                sorted_token_ids, expert_ids, num_tokens_post_padded,
+                False, top_k, config,
+            )
+            # SiLU activation (same as fused_moe production code)
+            gate, up = cache1.chunk(2, dim=-1)
+            act = (torch.nn.functional.silu(gate) * up).view(M * top_k, N // 2)
         # GEMM 2: activated @ W2
         invoke_fused_moe_kernel(
-            act_out, w2, cache2,
+            act, w2, cache2,
             topk_weights, topk_ids,
             sorted_token_ids, expert_ids, num_tokens_post_padded,
             True, top_k, config,
@@ -265,7 +291,9 @@ def verify_correctness(E, N, K, top_k, config_under_test, reference_config):
 
     def _run_with(cfg):
         orig = _ft.get_best_config
-        _ft.get_best_config = lambda m, e: cfg
+        # **kw absorbs get_best_config's silu_epilogue argument -- the whole
+        # point of the patch is to force `cfg` regardless of what was asked for.
+        _ft.get_best_config = lambda m, e, **kw: cfg
         try:
             out = _ft.fused_moe(hs, w1, w2, tws, tids)
         finally:
