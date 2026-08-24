@@ -9,6 +9,7 @@ Self-contained PyTorch reimplementation of [inclusionAI/LLaDA-MoE-7B-A1B-Instruc
 - [Architecture Overview](#architecture-overview)
 - [Optimizations](#optimizations)
 - [Benchmark Results](#benchmark-results)
+- [Quantization (INT8 experts)](#quantization-int8-experts)
 - [Triton Autotuner](#triton-autotuner)
 - [Correctness Verification](#correctness-verification)
 - [Parallelism Support](#parallelism-support)
@@ -262,6 +263,51 @@ In the single-GPU benchmark above, the historical top-5 run diverged from baseli
 Since LLaDA uses **bidirectional (non-causal) attention**, the baseline lets tokens "see" future `[MASK]` tokens in upcoming blocks. The cached version cannot (future blocks aren't computed yet). The 3 divergent tokens are cases where seeing vs not seeing future masks tips the `argmax` prediction differently.
 
 > **This is not a quality issue** — both outputs are valid denoising trajectories. The masked diffusion process has multiple valid solutions, and the 3 tokens that diverge are near confidence-boundary cases.
+
+---
+
+## Quantization (INT8 experts)
+
+**This engine runs BF16 end to end.** Nothing in `model_update/` quantizes anything — the `use_fp8_w8a8` / `use_int8_w8a16` parameters in `fused_moe_kernel` are inherited from the vLLM kernel this one derives from, are always passed `False`, and are never referenced in the kernel body.
+
+INT8 expert quantization is available as an **external, optional layer**: [`LLaDA_Quant`](https://github.com/Ahmed-Hedhili-se/LLaDA_Quant) imports this repository unmodified, quantizes the MoE expert weights (`w1`/`w2` — ~92% of the model), and serves them through the same `fast_dense` backend. Router, attention, norms, embeddings and `lm_head` stay BF16.
+
+```bash
+# from the LLaDA_Quant checkout, this repo untouched
+python benchmarks/serve_quantized.py --repo ~/test_llada \
+    --weight-dir ~/test_llada/weights --backend fast_dense \
+    --bits 8 --group-size 128 --execution-mode packed --fused --port 8000
+```
+
+### What it costs and what it buys
+
+`MEASURED` on a single RTX A6000 (48 GB), 128-token generation, `steps=128 block_length=32`, through this repo's own `eval/throughput/run_throughput.py`. `PACKED` stores INT8 and expands per weight access; `+ fused` routes the packed bytes straight into a W8A16 grouped-expert kernel that dequantizes inside the K-loop.
+
+| Load | BF16 | INT8 PACKED | INT8 PACKED + fused |
+|---|---:|---:|---:|
+| Single request | 11.88 s | 60.57 s (0.20×) | **10.71 s (1.11×)** |
+| Concurrency 32 | 230.5 tok/s | — | **227.6 tok/s (0.99×)** |
+| **Concurrency 64** | **230.8 tok/s** | 98.3 tok/s (0.43×) | **114.4 tok/s (0.50×)** |
+| Resident | 13.70 GiB | 7.89 GiB | **7.89 GiB (0.58×)** |
+
+**Memory drops 42% at every load. Speed depends entirely on batch size**, and inverts:
+
+- **Single request** — quantized *and* 1.11× faster than BF16. The expert GEMM is weight-bandwidth-bound here, so halving the weight bytes helps directly.
+- **Concurrency 32** — parity. This is the roofline crossover: W8A16 pays off below ~101 rows per expert, and batch 32 sits well above it.
+- **Concurrency 64** — **BF16 is 2.02× faster.** Not a crossover effect: BF16 is flat from c=32 to c=64 (230.5 → 230.8) while the quantized arm halves (227.6 → 114.4). Two untested causes, tracked in `LLaDA_Quant`: the W8A16 kernel's tiles are untuned while this repo's BF16 path gets tuned tiles from `moe_tune_config.json`, and the BF16 arm keeps the [fused SiLU epilogue](#3-fused-silu-epilogue-fused_moe_tritonpy) that the quantized path gives up by design.
+
+Accuracy, GSM8K n=200, seed 42, recommended threshold config:
+
+| Config | Accuracy | vs BF16 | McNemar |
+|---|---|---|---|
+| BF16 | 75.5% (151/200) | — | — |
+| INT8 PACKED + fused | 73.5% (147/200) | −2.0 pt | p = 0.627 |
+
+### Recommendation
+
+**For throughput serving on a card that fits the model, stay on BF16.** This engine reaches 230 tok/s at concurrency 32–64 in BF16, and quantization cannot beat that — it reclaims memory you are not short of, at up to half the throughput.
+
+Quantization earns its place when **memory is the binding constraint**: a 24 GB card, a longer context, or a larger batch than BF16 leaves room for — and for **single-request latency**, where it is genuinely faster *and* smaller.
 
 ---
 
