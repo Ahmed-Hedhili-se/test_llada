@@ -121,6 +121,53 @@ Worth ~2–4% end-to-end on its own — the sliced GEMM becomes bandwidth-bound 
 
 ---
 
+### 5. Fused RMSNorm and Decode Tail (`fused_ops.py`)
+
+**Problem**: two hot spots that were pure overhead rather than useful work.
+
+`RMSNorm` in eager form is eight launches — `x.float()`, `pow(2)`, `mean(-1)`, `+eps`, `rsqrt`, two multiplies, `.to(dtype)` — and the model runs **65 of them per forward pass** (16 layers × 4, plus the final norm). That accounted for roughly **30% of all kernel launches**. `q_norm`/`k_norm` are the worst offenders: they reduce over only `HD=128`, so almost none of their cost is arithmetic.
+
+The decode tail did `logits.float()` (a full fp32 copy of a `[B, block, 157184]` tensor) → full-vocabulary `softmax` → `gather` of exactly one probability per position, plus a separate `argmax`. Three passes over a 157k-wide fp32 tensor to produce two numbers per position.
+
+**Solution**: one Triton kernel each. Measured on an A6000:
+
+| RMSNorm shape | Speedup | | Decode tail shape | Speedup |
+|---|---:|---|---|---:|
+| 2048×2048 | 9.36× | | 1×32×157184 | 3.08× |
+| 16384×2048 | 11.35× | | 8×32×157184 | 6.32× |
+| 262144×128 | 9.29× | | 32×32×157184 | 5.96× |
+
+The decode tail's **argmax matches at 100%** for every shape — it is pure comparison, so it must.
+
+**End to end**, concurrency 32, fixed prompts, 12192 output tokens in every arm:
+
+| | Wall | Tok/s |
+|---|---:|---:|
+| Unfused | 52.5 s | 232.1 |
+| **Fused** | **43.9 s** | **277.9 — +19.7%** |
+| Unfused (repeat) | 52.6 s | 231.6 |
+
+The repeat baseline is there on purpose: an earlier A/B in this project showed ~4% run-to-run variance, so a single pair could not have settled a claim this size. These two agree to 0.2%.
+
+> **This is a batched gain.** The same fusions on single-request GSM8K measure ~2% (366.8 s → 358.3 s): at batch 1 the MoE's weight streaming dominates and these two are a small share of it. At batch 32 they are a much larger fraction, and cutting ~30% of launches also eats into the ~25% of wall-clock that was idle.
+
+**Not bit-exact** — both reassociate a reduction. GSM8K n=50 seed=42 on the same box: 72.0% unfused vs 74.0% fused, a one-question difference and noise at that sample size. The stronger evidence is `eval/test_fusions.py`'s token-identity check, where both reproduce the unfused generation exactly. Disable with `LLADA_FUSE_RMSNORM=0` / `LLADA_FUSE_DECODE=0`. The decode fusion applies only at `temperature=0`, where `add_gumbel_noise` is the identity.
+
+### Rejected: fused QKV
+
+One `q/k/v` GEMM instead of three, measured at FULL_CFG and **dropped**:
+
+| tokens | bit-exact | speedup |
+|---:|---|---:|
+| 32 | no (8.3e-05) | 1.62× |
+| 256 | no (2.7e-03) | 0.99× |
+| 1024 | yes | **0.96× — slower** |
+| 2048 | yes | 1.17× |
+
+This engine runs at `M = batch × suffix_length`, so batch 32 at `block_length=32` sits near M=1024 — exactly where fusing loses. The only clear win is at M=32, below its operating range, and M=256 pays a 2.7e-03 relative difference for nothing. cuBLAS picks better kernels for the three narrow shapes than for the wide one at these sizes. `eval/test_fusions.py` still measures it, since the answer is shape- and cuBLAS-dependent rather than universal.
+
+---
+
 ## Benchmark Results
 
 ### Single-GPU: Baseline vs Optimized (NVIDIA A40-24Q)
