@@ -1,0 +1,5 @@
+# Shell scripts must keep LF even when checked out on Windows: this repo is
+# deployed to Linux, and a CRLF start.sh fails with
+# "set: pipefail: invalid option name" because the \r becomes part of the
+# option. Hit twice during development via scp from a Windows checkout.
+*.sh text eol=lf
