@@ -184,6 +184,46 @@ PROFILE_DIR = os.environ.get("PROFILE_DIR", "traces")
 _last_batch_end_time: Optional[float] = None  # only _run_batch touches this -- single executor thread, no lock needed
 
 
+def _generate_with_oom_retry(gen_fn, input_ids, gen_kwargs, batch_size: int):
+    """Run a batch, halving it on CUDA OOM instead of failing every request.
+
+    Without this, one oversized batch is catastrophic rather than merely slow:
+    the caller's `except Exception` marks EVERY request in the batch as failed.
+    Measured on a 24 GB card, `BATCH_MAX_SIZE=48` produced **0 of 96 requests
+    succeeded** -- a single config step past the memory limit took down the
+    whole load.
+
+    Halving works because the batch dimension is independent: splitting into
+    sub-batches and concatenating gives the same rows back. It is not free --
+    the sub-batches run sequentially, so a batch that needs two halves takes
+    roughly twice as long -- but degrading throughput beats returning errors.
+
+    Only `torch.cuda.OutOfMemoryError` is retried. Any other exception is a real
+    bug and is re-raised immediately, so this cannot mask one by quietly
+    retrying it at a smaller size.
+    """
+    import torch as _t
+
+    chunk = batch_size
+    while True:
+        try:
+            if chunk >= batch_size:
+                return gen_fn(MODEL, input_ids, **gen_kwargs)
+            outs = []
+            for start in range(0, batch_size, chunk):
+                outs.append(gen_fn(MODEL, input_ids[start:start + chunk], **gen_kwargs))
+            return _t.cat(outs, dim=0)
+        except _t.cuda.OutOfMemoryError:
+            if chunk <= 1:
+                # Even one sequence does not fit; splitting further is
+                # impossible and the caller should see the real error.
+                raise
+            chunk = max(1, chunk // 2)
+            _t.cuda.empty_cache()
+            print(f"[batch] CUDA OOM at chunk={chunk * 2}, retrying at chunk={chunk} "
+                  f"(batch of {batch_size})", flush=True)
+
+
 def _run_batch(batch: list["_PendingRequest"]):
     global _last_batch_end_time
     if not batch:
@@ -300,7 +340,7 @@ def _run_batch(batch: list["_PendingRequest"]):
             print(f"[profile] wrote {trace_path}", flush=True)
         else:
             with torch.no_grad():
-                out_ids = gen_fn(MODEL, input_ids, **gen_kwargs)
+                out_ids = _generate_with_oom_retry(gen_fn, input_ids, gen_kwargs, len(batch))
         for i, req in enumerate(batch):
             req.result = out_ids[i : i + 1]
     except Exception as e:

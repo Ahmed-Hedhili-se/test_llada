@@ -58,7 +58,7 @@ async def send_request(session: aiohttp.ClientSession, base_url: str, prompt: st
 
 async def run_benchmark(base_urls: list[str], concurrency: int, max_tokens: int,
                          steps: int, block_length: int, n_requests: int,
-                         fixed_prompt: bool = False):
+                         fixed_prompt: bool = False, timeout: float = 1800.0):
     """
     base_urls: one or more independent backend URLs. Prompts are round-robined
     across them and a SINGLE semaphore of size `concurrency` is shared across
@@ -81,7 +81,9 @@ async def run_benchmark(base_urls: list[str], concurrency: int, max_tokens: int,
     )
     connector = aiohttp.TCPConnector(limit=concurrency)
 
-    async with aiohttp.ClientSession(connector=connector) as session:
+    async with aiohttp.ClientSession(
+            connector=connector,
+            timeout=aiohttp.ClientTimeout(total=timeout, sock_connect=15)) as session:
         # Warm up every backend once, not just the first.
         print(f"Warming up {len(base_urls)} backend(s)...", flush=True)
         await asyncio.gather(*[
@@ -145,6 +147,12 @@ def main():
     ap.add_argument("--steps", type=int, default=128)
     ap.add_argument("--block-length", type=int, default=32)
     ap.add_argument("--n-requests", type=int, default=16)
+    ap.add_argument("--timeout", type=float, default=1800.0,
+                    help="Per-request ceiling in seconds. aiohttp defaults to 300, "
+                         "which silently aborts healthy requests against a slow or "
+                         "serialized backend -- the src/ baseline takes ~30s per "
+                         "request, so 32 queued requests blow past it. Raise for "
+                         "long generations.")
     ap.add_argument(
         "--fixed-prompt", action="store_true",
         help="Send the same prompt for every request instead of cycling "
@@ -160,6 +168,7 @@ def main():
         base_urls, args.concurrency, args.max_tokens,
         args.steps, args.block_length, args.n_requests,
         fixed_prompt=args.fixed_prompt,
+        timeout=args.timeout,
     ))
 
 

@@ -22,6 +22,7 @@ PORT=8000
 REPLICA_PORT_BASE=8100
 GPUS=""
 REPLICAS=""
+DRY_RUN=0
 BACKEND="fast_dense"
 BATCH_MAX_SIZE="${BATCH_MAX_SIZE:-}"
 LOG_DIR="$SCRIPT_DIR/dp_logs"
@@ -34,6 +35,7 @@ while [[ $# -gt 0 ]]; do
         --replica-port)   REPLICA_PORT_BASE="$2"; shift 2 ;;
         --gpus)           GPUS="$2";              shift 2 ;;
         --replicas)       REPLICAS="$2";          shift 2 ;;
+        --dry-run)        DRY_RUN=1;              shift 1 ;;
         --backend)        BACKEND="$2";           shift 2 ;;
         --batch-max-size) BATCH_MAX_SIZE="$2";    shift 2 ;;
         --log-dir)        LOG_DIR="$2";           shift 2 ;;
@@ -81,6 +83,17 @@ fi
 if [[ ${#QUANT_ARGS[@]} -gt 0 && "$BACKEND" != "fast_dense" ]]; then
     echo "Quantization needs --backend fast_dense (got '$BACKEND')."
     exit 1
+fi
+
+echo "Placement plan:"
+for ((i = 0; i < REPLICAS; i++)); do
+    echo "  replica $i -> GPU $((i % GPUS)), port $((REPLICA_PORT_BASE + i))"
+done
+echo ""
+
+if [[ "$DRY_RUN" == "1" ]]; then
+    echo "--dry-run: nothing launched."
+    exit 0
 fi
 
 mkdir -p "$LOG_DIR"
