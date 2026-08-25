@@ -21,6 +21,7 @@ VENV="${VENV:-$SCRIPT_DIR/.venv}"
 PORT=8000
 REPLICA_PORT_BASE=8100
 GPUS=""
+REPLICAS=""
 BACKEND="fast_dense"
 BATCH_MAX_SIZE="${BATCH_MAX_SIZE:-}"
 LOG_DIR="$SCRIPT_DIR/dp_logs"
@@ -32,6 +33,7 @@ while [[ $# -gt 0 ]]; do
         --port)           PORT="$2";              shift 2 ;;
         --replica-port)   REPLICA_PORT_BASE="$2"; shift 2 ;;
         --gpus)           GPUS="$2";              shift 2 ;;
+        --replicas)       REPLICAS="$2";          shift 2 ;;
         --backend)        BACKEND="$2";           shift 2 ;;
         --batch-max-size) BATCH_MAX_SIZE="$2";    shift 2 ;;
         --log-dir)        LOG_DIR="$2";           shift 2 ;;
@@ -61,6 +63,21 @@ if [[ "$GPUS" -lt 1 ]]; then
     exit 1
 fi
 
+# Replicas default to one per GPU, but the two are separable. The model is
+# ~14 GiB, so an 80 GiB card holds several -- and on a single-GPU box this is
+# the only way to exercise multi-replica routing at all. Replica i is pinned to
+# GPU (i % GPUS), so replicas beyond GPUS share cards round-robin.
+REPLICAS="${REPLICAS:-$GPUS}"
+if [[ "$REPLICAS" -lt 1 ]]; then
+    echo "--replicas must be >= 1 (got '$REPLICAS')."
+    exit 1
+fi
+if [[ "$REPLICAS" -gt "$GPUS" ]]; then
+    echo "Note: $REPLICAS replicas across $GPUS GPU(s) -- they will share cards."
+    echo "      Each holds its own full copy of the weights; size --batch-max-size"
+    echo "      for the per-GPU total, not per replica."
+fi
+
 if [[ ${#QUANT_ARGS[@]} -gt 0 && "$BACKEND" != "fast_dense" ]]; then
     echo "Quantization needs --backend fast_dense (got '$BACKEND')."
     exit 1
@@ -81,18 +98,33 @@ trap cleanup EXIT INT TERM
 echo "================================================================"
 echo "  LLaDA-MoE data-parallel deployment"
 echo "================================================================"
-echo "  Replicas : $GPUS (one per GPU)"
+echo "  Replicas : $REPLICAS across $GPUS GPU(s)"
 echo "  Router   : http://0.0.0.0:$PORT"
 echo "  Backend  : $BACKEND${QUANT_ARGS[*]:+  ${QUANT_ARGS[*]}}"
 echo "  Logs     : $LOG_DIR"
 echo ""
 
-for ((i = 0; i < GPUS; i++)); do
+for ((i = 0; i < REPLICAS; i++)); do
     rport=$((REPLICA_PORT_BASE + i))
+    gpu=$((i % GPUS))
     # CUDA_VISIBLE_DEVICES pins the replica; inside it the GPU is always
     # cuda:0, which is also what makes each replica's tp_size == 1 and keeps
     # the batching path enabled.
-    env CUDA_VISIBLE_DEVICES="$i" \
+    #
+    # Each replica needs its OWN rendezvous port. src.server calls
+    # init_distributed() unconditionally, which stands up a TCPStore -- and its
+    # default MASTER_PORT is 29500 for everyone, so on a single host only the
+    # first replica binds and the rest die with EADDRINUSE. Without this, N
+    # replicas on one node means N-1 dead GPUs.
+    #
+    # All four variables must be set together: distributed.py fills in the
+    # single-process defaults only when MASTER_ADDR is absent, so setting the
+    # port alone would skip RANK/WORLD_SIZE and fail inside env:// rendezvous.
+    env CUDA_VISIBLE_DEVICES="$gpu" \
+        MASTER_ADDR=127.0.0.1 \
+        MASTER_PORT=$((29500 + i)) \
+        RANK=0 \
+        WORLD_SIZE=1 \
         ${BATCH_MAX_SIZE:+BATCH_MAX_SIZE="$BATCH_MAX_SIZE"} \
         "$PY" -m src.server \
             --weight-dir "$WEIGHT_DIR" \
@@ -103,12 +135,12 @@ for ((i = 0; i < GPUS; i++)); do
             "${QUANT_ARGS[@]}" > "$LOG_DIR/replica_$i.log" 2>&1 &
     PIDS+=("$!")
     BACKENDS="${BACKENDS:+$BACKENDS,}http://127.0.0.1:$rport"
-    echo "  replica $i -> GPU $i, port $rport (pid ${PIDS[-1]})"
+    echo "  replica $i -> GPU $gpu, port $rport (pid ${PIDS[-1]})"
 done
 
 echo ""
 echo "Waiting for replicas to load (a 7B checkpoint takes a few minutes)..."
-for ((i = 0; i < GPUS; i++)); do
+for ((i = 0; i < REPLICAS; i++)); do
     rport=$((REPLICA_PORT_BASE + i))
     for _ in $(seq 240); do
         if curl -sf "http://127.0.0.1:$rport/health" >/dev/null 2>&1; then
