@@ -2,7 +2,7 @@
 
 Self-contained PyTorch reimplementation of [inclusionAI/LLaDA-MoE-7B-A1B-Instruct](https://huggingface.co/inclusionAI/LLaDA-MoE-7B-A1B-Instruct), a masked-diffusion LLM. Triton fused MoE, block-wise KV caching, fused RMSNorm/decode kernels, variable-length batching, an OpenAI-compatible server, a data-parallel router, and an end-to-end-aware autotuner.
 
-**8.19× single-request vs the unoptimized baseline; 277.9 tok/s batched** (single RTX A6000).
+**8.70× single-request and 103× total-pipeline throughput vs the unoptimized baseline** (single RTX A6000).
 
 ---
 
@@ -62,18 +62,30 @@ python -m eval.check_time_inference --weight-dir weights \
 
 | | Time | Tok/s | Speedup |
 |---|---:|---:|---:|
-| Baseline (`src/`, unfused, no cache) | 44.25 s | 2.89 | 1.00× |
-| **Optimized** | **5.41 s** | **23.68** | **8.19×** |
+| Baseline (`src/`, unfused, no cache) | 46.67 s | 2.74 | 1.00× |
+| **Optimized** | **5.37 s** | **23.85** | **8.70×** |
 
 > The ratio is **not hardware-portable**. `src/`'s MoE loops 64 experts in Python, so the baseline is CPU-dispatch-bound while the optimized path is GPU-bound. An earlier measurement on a different box (A40-24Q) gave 6.46× with a 29.69 s baseline — the difference is mostly the host CPU, not the engine.
+
+### Total pipeline: 103×
+
+Both arms through the same HTTP client and load harness, so this is a deployment-to-deployment number:
+
+| Pipeline | Tok/s |
+|---|---:|
+| `src/` over HTTP, serialized | **2.7** |
+| `model_update/`, `BATCH_MAX_SIZE=32`, concurrency 32 | **278.3** |
+| | **103×** |
+
+It decomposes as **8.70× engine × 11.67× batching = 101.5**, within 1.5% of the direct ratio — the check that makes the figure trustworthy rather than a headline. The baseline is single-request by construction: `src/generate.py` hardcodes the batch dimension to 1.
 
 ### Batched throughput — A6000, `BATCH_MAX_SIZE=32`, concurrency 32
 
 | | Tok/s |
 |---|---:|
 | Fixed prompts, fusions off | 232.1 |
-| **Fixed prompts, fusions on** | **277.9 (+19.7%)** |
-| Varied prompts (8 prompts, 6 lengths) | ~198 |
+| **Fixed prompts, fusions on** | **278.3 (+19.7%)** |
+| **Varied prompts** (8 prompts, 6 lengths) | **240.0** |
 
 The fusion gain is a **batched** gain; the same fusions on single-request GSM8K measure ~2%, because MoE weight streaming dominates at batch 1.
 
@@ -113,6 +125,7 @@ bash start.sh --backend fast_dense --weight-dir weights --quantize int8
 
 | Load | BF16 | INT8 PACKED | INT8 PACKED + fused W8A16 |
 |---|---:|---:|---:|
+| GSM8K, per question (anchored) | 7.2 s | — | **5.8 s (1.24×)** |
 | Single request | 11.88 s | 60.57 s (0.20×) | **10.71 s (1.11×)** |
 | Concurrency 32 | 230.5 tok/s | — | 227.6 tok/s (0.99×) |
 | Concurrency 64 | 230.8 tok/s | 98.3 (0.43×) | 114.4 tok/s (0.50×) |
@@ -164,12 +177,16 @@ Opt-in threshold decoding (`confidence_threshold`), ported from dInfer's `Hierar
 
 GSM8K, n=50, seed 42, chat-templated:
 
+`ANCHORED` — A6000, GSM8K n=50 seed=42, `max_tokens=1024 steps=512 block_length=64`, threshold 0.9/low 0.4, under the fixed question selection:
+
 | Config | Accuracy | s/question |
 |---|---:|---:|
-| HF reference, fixed schedule, steps=512 | 82.0% | 212.2 |
-| `model_update`, fixed schedule, steps=512 | 76.0% | 33.8 |
-| **`model_update`, threshold=0.9/low=0.4, steps=512** | **88.0%** | **8.6** |
-| same, after the SiLU epilogue + `lm_head` + retune | 88.0% | **6.1** |
+| **BF16** | **74.0%** (37/50) | **7.2** |
+| **INT8 + fused W8A16** | **76.0%** (38/50) | **5.8** |
+
+Same 50 questions, same box — the first genuinely comparable accuracy pair in this project. INT8 is 19% faster *and* one question ahead, which at n=50 is noise on the accuracy axis and a real win on the time axis.
+
+> `HISTORICAL, NOT REPRODUCIBLE AS STATED` — earlier runs reported 88.0% (threshold 0.9/0.4) against an HF reference at 82.0%, and 76.0% for the fixed schedule. Those predate the `_stable_subset` fix, so `--seed 42` selected a *different* 50 questions on a different machine. They are not wrong for the set they saw, and they are not comparable to the table above. Re-run before quoting.
 
 > **`steps_per_block >= block_length / 2` is mandatory when a threshold is set.** At ratio 0.25 generation collapses into degenerate repetition (0% accuracy); at 0.5 it recovers fully. A runtime warning fires below the guideline. A `remask_threshold` mechanism was tried for the residual repetition and made things categorically worse (0%) — reverted.
 
