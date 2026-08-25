@@ -201,7 +201,17 @@ def _run_batch(batch: list["_PendingRequest"]):
     # the pipelining isn't working as intended.
     now = time.monotonic()
     gap_str = f"{now - _last_batch_end_time:.3f}s" if _last_batch_end_time is not None else "n/a (first batch)"
-    print(f"[batch] size={len(batch)} key={batch[0].key} gap_since_prev_batch_end={gap_str}", flush=True)
+    # pad_frac: the share of prompt columns that are padding once every row is
+    # left-padded to the batch's longest prompt. This is the direct measurement
+    # padding waste, and the reason the nearest-length experiment above could
+    # be settled at all: inferring it from tok/s does not work, because
+    # different prompts also generate different numbers of tokens, so two runs
+    # are not comparable on throughput alone.
+    _w = [r.input_ids.shape[1] for r in batch]
+    _pad_frac = 1.0 - (sum(_w) / (max(_w) * len(_w))) if _w else 0.0
+    print(f"[batch] size={len(batch)} key={batch[0].key} "
+          f"prompt_len_min={min(_w)} max={max(_w)} pad_frac={_pad_frac:.3f} "
+          f"gap_since_prev_batch_end={gap_str}", flush=True)
     try:
         from model_update.generate import generate_cached, generate_dense
         first = batch[0]
@@ -330,13 +340,31 @@ def _batch_collector():
                 key = _pending_queue[0].key
                 matching = sum(1 for r in _pending_queue if r.key == key)
                 if matching >= BATCH_MAX_SIZE or time.monotonic() >= deadline:
-                    batch, remaining = [], []
-                    for req in _pending_queue:
-                        if req.key == key and len(batch) < BATCH_MAX_SIZE:
-                            batch.append(req)
-                        else:
-                            remaining.append(req)
-                    _pending_queue[:] = remaining
+                    # Arrival order, deliberately. Prompt length left the
+                    # batching key when left-padding landed, so a batch can now
+                    # mix a 33-token prompt with a 51-token one and pad
+                    # everything to the longest -- which looks like something
+                    # worth optimising.
+                    #
+                    # It was tried and REVERTED. Selecting the requests closest
+                    # in length to the oldest waiter made padding measurably
+                    # WORSE: mean pad_frac 0.1709 (arrival order) -> 0.1993
+                    # (nearest-length), A6000, concurrency 96, BATCH_MAX_SIZE=32,
+                    # varied prompts. Pulling the similar-length requests into
+                    # one batch strands the outliers together in later batches,
+                    # so a locally tighter batch is paid for by looser ones
+                    # after it. Arrival order keeps the spread homogeneous
+                    # across batches and wins on the total.
+                    #
+                    # A global bucketing pass over the whole queue might beat
+                    # both, but it needs a starvation guard that nearest-length
+                    # got for free by always keeping the oldest request, and
+                    # the padded columns are prompt tokens against a
+                    # gen_length-dominated sequence, so the ceiling is small.
+                    # Measure with pad_frac in the [batch] line before trying.
+                    batch = [r for r in _pending_queue if r.key == key][:BATCH_MAX_SIZE]
+                    chosen = {id(r) for r in batch}
+                    _pending_queue[:] = [r for r in _pending_queue if id(r) not in chosen]
                     if not _pending_queue:
                         _new_request_event.clear()
                     # else: event stays set, loop continues immediately for
