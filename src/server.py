@@ -412,6 +412,13 @@ def health():
     return {"status": "ok", "model": "LLaDA-MoE-7B-A1B-Instruct", "backend": BACKEND}
 
 
+@app.get("/v1/quantization")
+def quantization_status():
+    """What is actually being served, so an A/B arm is verifiable over HTTP
+    rather than inferred from which terminal launched it."""
+    return QUANTIZATION or {"quantized": False, "label": "BF16 (unmodified)"}
+
+
 @app.get("/v1/models")
 def list_models():
     return {
@@ -666,6 +673,85 @@ def completions(req: CompletionRequest):
 
 
 # ── Startup ────────────────────────────────────────────────────────────────────
+#: Set by apply_quantization(); reported by /v1/quantization so a served model
+#: can be identified over HTTP. Without it there is no way to tell a quantized
+#: server from a BF16 one, and forgetting to restart between A/B arms silently
+#: produces two identical result files that look like "quantization changed
+#: nothing".
+QUANTIZATION: Optional[dict] = None
+
+
+def apply_quantization(bits: int = 8, group_size: int = 128,
+                       mode: str = "packed", fused: bool = True) -> dict:
+    """Quantize the loaded model's MoE experts using the LLaDA_Quant toolkit.
+
+    LLaDA_Quant is an **optional** dependency -- deliberately not in
+    requirements.txt, because this engine is BF16 and everything it claims is
+    measured that way. It is imported lazily, here, so a server that never
+    passes --quantize neither needs it installed nor pays for importing it.
+
+    Order matters and is why this runs after load_model() rather than inside
+    it: PACKED mode replaces w1/w2 with properties that dequantize on read, so
+    any in-place write into them afterwards (which is exactly what
+    load_state_dict_from_unfused does) would land in a temporary and vanish.
+    The experts must be fully populated first.
+    """
+    global QUANTIZATION
+
+    if BACKEND != "fast_dense":
+        raise SystemExit(
+            f"--quantize needs --backend fast_dense; got '{BACKEND}'. The other "
+            "backends do not build fused expert blocks (w1/w2), so there is "
+            "nothing for the expert adapter to match."
+        )
+
+    try:
+        from LLaDA_Quant.api import quantize_model
+        from LLaDA_Quant.config import QuantConfig
+    except ImportError as exc:
+        raise SystemExit(
+            "--quantize needs the LLaDA_Quant toolkit, which is an optional "
+            "dependency and is not installed.\n"
+            "  pip install -e /path/to/LLaDA_Quant\n"
+            f"(import failed: {exc})"
+        ) from exc
+
+    print(f"Quantizing MoE experts: INT{bits} g{group_size} {mode}...")
+    config = QuantConfig(
+        bits=bits,
+        group_size=group_size,
+        targets=("expert",),
+        execution_mode=mode,
+        expect_expert_blocks=MODEL.cfg.NL,
+    )
+    result = quantize_model(MODEL, config)
+
+    fused_blocks = []
+    if fused and mode == "packed" and bits == 8:
+        from LLaDA_Quant.runtime import fused_block
+
+        # strict: a run that quietly fell back to dequantize-per-access would
+        # still serve, ~6x slower, and be written up as a fused number.
+        fused_blocks = fused_block.install(MODEL, strict=True)
+    elif fused and bits == 4:
+        print("  note: INT4 has no fused kernel; using dequantize-per-access.")
+
+    QUANTIZATION = {
+        "quantized": True,
+        "bits": bits,
+        "group_size": group_size,
+        "execution_mode": mode,
+        "fused_kernel": bool(fused_blocks),
+        "fused_blocks": len(fused_blocks),
+        "expert_blocks": len(result.expert_blocks),
+    }
+    print(f"  {QUANTIZATION}")
+    if mode == "reference":
+        print("  REFERENCE mode uses MORE memory than not quantizing. "
+              "Accuracy evaluation only -- never report it as a saving.")
+    return QUANTIZATION
+
+
 def load_model(weight_dir: str, device: str, backend: str):
     global MODEL, TOKENIZER, DEVICE, BACKEND
     DEVICE = device
@@ -725,6 +811,19 @@ def main():
     # In distributed mode, we override device with local rank
     ap.add_argument("--device", default=f"cuda:{get_tp_rank()}" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--backend", choices=["ours", "ours_kv", "fast_dense", "hf"], default="ours")
+    ap.add_argument("--quantize", choices=["int8", "int4"], default=None,
+                    help="Quantize the MoE experts via the LLaDA_Quant toolkit "
+                         "(optional dependency, not installed by requirements.txt). "
+                         "Requires --backend fast_dense. int8 gets the fused W8A16 "
+                         "kernel; int4 has none and runs dequantize-per-access.")
+    ap.add_argument("--quant-group-size", type=int, default=128)
+    ap.add_argument("--quant-mode", choices=["packed", "reference"], default="packed",
+                    help="packed: real memory reduction (deploy). reference: same "
+                         "numerics at BF16 speed but MORE memory than not "
+                         "quantizing -- accuracy evaluation only.")
+    ap.add_argument("--no-fused-quant", action="store_true",
+                    help="Skip the fused W8A16 kernel and dequantize on every "
+                         "weight access instead. ~6x slower; for A/B only.")
     args = ap.parse_args()
 
     # Override device if TP is active
@@ -732,6 +831,14 @@ def main():
         args.device = f"cuda:{get_tp_rank()}"
 
     load_model(args.weight_dir, args.device, args.backend)
+
+    if args.quantize:
+        apply_quantization(
+            bits=8 if args.quantize == "int8" else 4,
+            group_size=args.quant_group_size,
+            mode=args.quant_mode,
+            fused=not args.no_fused_quant,
+        )
 
     if get_tp_size() > 1 and get_tp_rank() != 0:
         print(f"Rank {get_tp_rank()} waiting for generation tasks...")
