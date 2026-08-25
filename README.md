@@ -230,6 +230,34 @@ The number decomposes, which is the check that it is real:
 
 Three independent measurement paths agreeing to within 4%.
 
+### Variable-Length Batching
+
+Until recently `src/server.py` could only batch requests whose prompts tokenized to **exactly** the same length. The cause was one line -- `Attention.forward` called `scaled_dot_product_attention(..., attn_mask=None)`, so padding was impossible, so `prompt_token_length` had to be part of the batching key.
+
+**Every throughput number above this section was measured with `--fixed-prompt`, and that was not incidental.** The throughput harness cycles 8 prompts spanning 6 distinct token lengths; at concurrency 32 the old key split them into batches averaging ~4 requests. Real traffic, where no two prompts are the same length, fragmented the queue and the batching path stopped mattering.
+
+`generate_cached(..., prompt_lens=...)` now accepts **left-padded** prompts. Left rather than right because the block loop walks `block_start = P + block_idx * block_length` once for the whole batch, so every row's prompt must end at the same column.
+
+Two mechanisms make the padding inert, and both are required:
+
+- **Per-row RoPE positions** (`build_rope_freqs_from_positions`) -- each row's first real token is position 0, so a padded prompt encodes identically to the unpadded one. Using the shifted absolute offsets instead would encode each prompt as though it began partway into the sequence.
+- **An additive attention mask** over the pad columns -- which also protects the KV cache, whose slots there hold uninitialised `torch.empty` values.
+
+Both are opt-in and default to `None`; `apply_rope` keeps its original 2-D branch, and `generate_cached` falls back to the untouched path when no row needs padding, so **equal-length batches remain bit-identical**.
+
+`MEASURED` -- A6000, concurrency 32, `BATCH_MAX_SIZE=32`, `--max-tokens 128 --steps 128 --block-length 32`:
+
+| Prompts | Batches formed | Tok/s |
+|---|---|---:|
+| Fixed (`--fixed-prompt`) | 32 | 230.5 |
+| **Varied (8 prompts, 6 lengths)** | **32** (was ~4) | **194.1** |
+
+194.1 is below the fixed-prompt figure because padding to the batch maximum is real extra work. It is also the first throughput number here produced by traffic that looks like traffic.
+
+> `eval/test_variable_length_batch.py` asserts the property this rests on: a short prompt batched beside a longer one produces **exactly** what it produces alone, token for token under greedy decoding. It also checks that pad ids of 0, 999 and `MASK_ID` all stay out of the output -- a leak through the mask would silently perturb attention rather than raise.
+
+> `generate_dense` is unchanged and still grouped by length: it has no `prompt_lens` parameter, so mixed lengths would mis-slice its output.
+
 ### Throughput vs Batch Size (single A40-24Q, 24 GB)
 
 Measured with `--max-tokens 128 --steps 128 --block-length 32`, `--concurrency` equal to `BATCH_MAX_SIZE`:
