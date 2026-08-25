@@ -110,6 +110,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -349,10 +350,29 @@ def _load_gsm8k(limit: int, num_fewshot: int = 4) -> list[TaskItem]:
             subject="gsm8k",
         ))
 
-    if limit and len(items) > limit:
-        random.shuffle(items)
-        items = items[:limit]
-    return items
+    return _stable_subset(items, limit)
+
+
+def _stable_subset(items: list, limit: int) -> list:
+    """Pick `limit` items reproducibly, on any machine.
+
+    `random.shuffle(items)` alone is only deterministic given a fixed INPUT
+    order, and the input comes from a HuggingFace dataset whose row order can
+    differ by `datasets` version or cache state. The same --seed therefore
+    selected different questions on different machines, which silently made
+    cross-machine accuracy numbers incomparable -- two runs reported as the
+    same benchmark were not the same 50 questions.
+
+    Sorting by a content hash first pins the input order to the content, so the
+    seed alone determines the subset. sha1 over the prompt is used rather than
+    Python's hash(), which is randomised per process by PYTHONHASHSEED and would
+    reintroduce exactly the problem this fixes.
+    """
+    if not limit or len(items) <= limit:
+        return items
+    items = sorted(items, key=lambda it: hashlib.sha1(it.prompt.encode("utf-8")).hexdigest())
+    random.shuffle(items)
+    return items[:limit]
 
 
 def _load_bbh(subtask: Optional[str], limit: int) -> list[TaskItem]:
@@ -380,10 +400,7 @@ def _load_bbh(subtask: Optional[str], limit: int) -> list[TaskItem]:
                 subject=name,
             ))
 
-    if limit and len(items) > limit:
-        random.shuffle(items)
-        items = items[:limit]
-    return items
+    return _stable_subset(items, limit)
 
 
 def _load_cruxeval(limit: int) -> list[TaskItem]:
@@ -403,10 +420,7 @@ def _load_cruxeval(limit: int) -> list[TaskItem]:
             subject="cruxeval",
         ))
 
-    if limit and len(items) > limit:
-        random.shuffle(items)
-        items = items[:limit]
-    return items
+    return _stable_subset(items, limit)
 
 
 def load_task(task: str, limit: int, num_fewshot: int = 4) -> tuple[list[TaskItem], str]:
