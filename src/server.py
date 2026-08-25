@@ -143,9 +143,25 @@ class _PendingRequest:
         # requests must share the exact same generation config to be batched
         # into one generate_cached()/generate_dense() call, same reasoning as
         # gen_length/steps/block_length already being here.
+        #
+        # prompt_token_length is deliberately NOT here. It used to be, because
+        # attention ran with attn_mask=None and could not tolerate padding --
+        # which meant two users whose prompts tokenized to 51 and 52 tokens
+        # could never share a batch. Under real traffic that fragmented the
+        # queue into batches of one or two and the batching path stopped
+        # mattering; every throughput figure in the README was measured with
+        # --fixed-prompt for exactly that reason. generate_cached now accepts
+        # left-padded prompts plus prompt_lens, so length is no longer part of
+        # a request's identity.
+        #
+        # The no_cache (generate_dense) path still cannot pad, and is grouped
+        # by length below rather than here.
         return (
-            self.gen_length, self.steps, self.block_length, self.input_ids.shape[1],
+            self.gen_length, self.steps, self.block_length,
             self.confidence_threshold, self.low_confidence_threshold, self.no_cache,
+            # generate_dense has no prompt_lens parameter, so mixed lengths
+            # would silently mis-slice its output. Keep those grouped by length.
+            self.input_ids.shape[1] if self.no_cache else None,
         )
 
 
@@ -188,8 +204,39 @@ def _run_batch(batch: list["_PendingRequest"]):
     print(f"[batch] size={len(batch)} key={batch[0].key} gap_since_prev_batch_end={gap_str}", flush=True)
     try:
         from model_update.generate import generate_cached, generate_dense
-        input_ids = torch.cat([r.input_ids for r in batch], dim=0)
         first = batch[0]
+
+        # Mixed prompt lengths are LEFT-padded so every row's prompt ends at
+        # the same column, which is what lets the block loop use one
+        # block_start for the batch. prompt_lens travels alongside so the model
+        # can give each row its own RoPE positions and mask the pad columns
+        # out; without it a shorter prompt would be encoded as though it began
+        # partway into the sequence.
+        prompt_lens = None
+        widths = {r.input_ids.shape[1] for r in batch}
+        if len(widths) == 1:
+            input_ids = torch.cat([r.input_ids for r in batch], dim=0)
+        else:
+            max_len = max(widths)
+            pad_id = TOKENIZER.pad_token_id
+            if pad_id is None:
+                # Value is irrelevant -- these columns are masked out of
+                # attention -- but it must be a valid embedding index.
+                pad_id = TOKENIZER.eos_token_id or 0
+            rows = []
+            for r in batch:
+                ids = r.input_ids
+                pad = max_len - ids.shape[1]
+                if pad:
+                    ids = torch.cat(
+                        [torch.full((1, pad), pad_id, dtype=ids.dtype, device=ids.device), ids],
+                        dim=1,
+                    )
+                rows.append(ids)
+            input_ids = torch.cat(rows, dim=0)
+            prompt_lens = torch.tensor(
+                [r.input_ids.shape[1] for r in batch], device=input_ids.device
+            )
         if first.no_cache:
             # generate_dense has no confidence_threshold support (see its
             # docstring) -- ChatRequest already rejects that combination
@@ -211,6 +258,7 @@ def _run_batch(batch: list["_PendingRequest"]):
                 temperature=first.temperature,
                 confidence_threshold=first.confidence_threshold,
                 low_confidence_threshold=first.low_confidence_threshold,
+                prompt_lens=prompt_lens,
             )
         if PROFILE_BATCHES:
             # Chrome/Perfetto trace JSON -- shows actual GPU busy vs idle

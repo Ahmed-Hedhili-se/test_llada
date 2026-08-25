@@ -180,14 +180,42 @@ def build_rope_freqs(start_pos: int, end_pos: int, head_dim: int, theta: float, 
     return emb.cos(), emb.sin()
 
 
+def build_rope_freqs_from_positions(positions: torch.Tensor, head_dim: int, theta: float):
+    """Per-row RoPE for a left-padded batch.
+
+    Batching prompts of different lengths means left-padding them to a common
+    width, which shifts every real token right by that row's pad count. Feeding
+    the resulting absolute offsets to RoPE would encode each prompt as if it
+    started partway into the sequence -- a different input, not a padded one.
+    So positions are supplied per row (pad slots collapse to 0 and are masked
+    out of attention anyway), and cos/sin come back [B, T, HD] instead of
+    [T, HD].
+
+    positions: [B, T] int64 -- the true position of each slot in its own
+               sequence, 0-based, ignoring padding.
+    """
+    inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, device=positions.device).float() / head_dim))
+    freqs = positions.float().unsqueeze(-1) * inv_freq            # [B, T, HD/2]
+    emb = torch.cat([freqs, freqs], dim=-1)                        # [B, T, HD]
+    return emb.cos(), emb.sin()
+
+
 def rotate_half(x):
     x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2:]
     return torch.cat([-x2, x1], dim=-1)
 
 
 def apply_rope(q, k, cos, sin):
-    cos = cos.unsqueeze(0).unsqueeze(0)
-    sin = sin.unsqueeze(0).unsqueeze(0)
+    # [T, HD] (one shared position range) or [B, T, HD] (per-row, left-padded
+    # batch). q/k are [B, H, T, HD], so both need a head axis inserted; the
+    # shared case additionally needs a batch axis. The 2-D branch is the
+    # original code path, unchanged, so equal-length batches stay bit-identical.
+    if cos.dim() == 2:
+        cos = cos.unsqueeze(0).unsqueeze(0)
+        sin = sin.unsqueeze(0).unsqueeze(0)
+    else:
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
     return q * cos + rotate_half(q) * sin, k * cos + rotate_half(k) * sin
 
 
@@ -219,6 +247,7 @@ class Attention(nn.Module):
         cache_buffer: Optional["KVCacheBuffer"] = None,
         layer_idx: Optional[int] = None,
         write_pos: Optional[int] = None,
+        attn_mask: Optional[torch.Tensor] = None,
     ):
         """
         x: [B, Ta, H] active-block hidden states
@@ -256,7 +285,9 @@ class Attention(nn.Module):
         else:
             k_full, v_full = k, v
 
-        out = F.scaled_dot_product_attention(q, k_full, v_full, attn_mask=None, is_causal=False)
+        # attn_mask is [B, 1, 1, Tk] and marks left-padding slots unattendable.
+        # None (equal-length batch, or B=1) keeps the original call exactly.
+        out = F.scaled_dot_product_attention(q, k_full, v_full, attn_mask=attn_mask, is_causal=False)
         out = out.transpose(1, 2).reshape(B, Ta, self.NH_local * cfg.HD)
         
         attn_out = self.o_proj(out)
@@ -330,10 +361,12 @@ class Layer(nn.Module):
         cache_buffer: Optional["KVCacheBuffer"] = None,
         layer_idx: Optional[int] = None,
         write_pos: Optional[int] = None,
+        attn_mask: Optional[torch.Tensor] = None,
     ):
         attn_out, kv_new = self.self_attn(
             self.input_layernorm(x), cos, sin, past_kv,
             cache_buffer=cache_buffer, layer_idx=layer_idx, write_pos=write_pos,
+            attn_mask=attn_mask,
         )
         x = x + attn_out
         x = x + self.mlp(self.post_attention_layernorm(x))
@@ -357,6 +390,8 @@ class LLaDAMoEKV(nn.Module):
         cache_buffer: Optional[KVCacheBuffer] = None,
         write_pos: Optional[int] = None,
         num_logits: Optional[int] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        attn_mask: Optional[torch.Tensor] = None,
     ):
         """
         input_ids: [B, T] — either the full sequence (past_kv=None, e.g. prefix
@@ -402,7 +437,13 @@ class LLaDAMoEKV(nn.Module):
 
         x = self.embed_tokens(input_ids)
 
-        cos, sin = build_rope_freqs(position_offset, position_offset + T, cfg.HD, cfg.THETA, device)
+        if position_ids is None:
+            cos, sin = build_rope_freqs(position_offset, position_offset + T, cfg.HD, cfg.THETA, device)
+        else:
+            # Left-padded batch: every row carries its own offsets, so the pad
+            # slots cannot shift a shorter prompt's encoding (see
+            # build_rope_freqs_from_positions).
+            cos, sin = build_rope_freqs_from_positions(position_ids, cfg.HD, cfg.THETA)
         cos = cos.to(x.dtype)
         sin = sin.to(x.dtype)
 
@@ -412,6 +453,7 @@ class LLaDAMoEKV(nn.Module):
             x, kv_i = layer(
                 x, cos, sin, layer_past,
                 cache_buffer=cache_buffer, layer_idx=i, write_pos=write_pos,
+                attn_mask=attn_mask,
             )
             new_kv.append(kv_i)
 

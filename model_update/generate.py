@@ -177,8 +177,14 @@ def _generate_block_cached(
     remasking: str,
     confidence_threshold: Optional[float] = None,
     low_confidence_threshold: Optional[float] = 0.4,
+    position_ids: Optional[torch.Tensor] = None,
+    pad_mask: Optional[torch.Tensor] = None,
 ):
     """
+    position_ids/pad_mask: set only when the batch mixes prompt lengths and was
+    left-padded to a common width (see generate_cached). Both None keeps the
+    original single-length path untouched.
+
     confidence_threshold: opt-in hierarchical threshold-based token
     selection (select_transfer_indices_hierarchy, ported from dInfer's
     HierarchyDecoder) instead of the default fixed per-step reveal count
@@ -245,6 +251,10 @@ def _generate_block_cached(
             cache_buffer=cache_buffer,
             write_pos=block_start,
             num_logits=block_length,
+            position_ids=None if position_ids is None else position_ids[:, block_start:],
+            # The key axis spans the whole cache up to block_end, not just the
+            # suffix, since attention reads [prefix ; active] from the buffer.
+            attn_mask=None if pad_mask is None else pad_mask[..., :x.shape[1]],
         )
 
         logits_with_noise = add_gumbel_noise(logits, temperature)
@@ -292,6 +302,8 @@ def _generate_block_cached(
         cache_buffer=cache_buffer,
         write_pos=block_start,
         num_logits=0,
+        position_ids=None if position_ids is None else position_ids[:, block_start:],
+        attn_mask=None if pad_mask is None else pad_mask[..., :x.shape[1]],
     )
     cache_buffer.commit(block_end)
 
@@ -309,11 +321,32 @@ def generate_cached(
     remasking: str = "low_confidence",
     confidence_threshold: Optional[float] = None,
     low_confidence_threshold: Optional[float] = 0.4,
+    prompt_lens: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Same signature/semantics as generate.generate(), minus cfg_scale
     (CFG doubles the batch and complicates cache bookkeeping; add back
     once single-sequence caching is verified correct).
+
+    prompt_lens: [B] int, the true (unpadded) length of each row of
+    `prompt_ids`, which must be LEFT-padded to a common width. This is what
+    lets a batch mix prompt lengths -- without it, `src/server.py` can only
+    group requests whose prompts happen to tokenize to exactly the same
+    length, which in real traffic collapses batches to one or two requests.
+
+    Left-padding rather than right-padding because generation has to start at
+    a single column for the whole batch: the block loop below walks
+    `block_start = P + block_idx * block_length` once, not per row. Padding on
+    the left aligns every prompt's END at column P.
+
+    Two things follow from the padding and are handled here:
+      * RoPE positions are computed per row, so a padded prompt is encoded
+        identically to the same prompt unpadded (pad slots take position 0);
+      * an additive attention mask makes the pad columns unattendable, which
+        also covers the KV cache -- the buffer holds uninitialised values at
+        those slots and must never be read.
+
+    None (the default) is the original equal-length path, untouched.
 
     confidence_threshold: opt-in hierarchical threshold-based decoding
     (select_transfer_indices_hierarchy, ported from dInfer's
@@ -364,6 +397,37 @@ def generate_cached(
     x = torch.full((B, total_len), MASK_ID, dtype=torch.long, device=device)
     x[:, :P] = prompt_ids
 
+    position_ids = None
+    pad_mask = None
+    if prompt_lens is not None:
+        prompt_lens = prompt_lens.to(device=device, dtype=torch.long)
+        if int(prompt_lens.max()) > P:
+            raise ValueError(
+                f"prompt_lens max {int(prompt_lens.max())} exceeds the padded "
+                f"prompt width {P}; prompt_ids must already be left-padded."
+            )
+        pad_len = P - prompt_lens                                   # [B]
+        cols = torch.arange(total_len, device=device).unsqueeze(0)  # [1, total_len]
+
+        # Real content starts at column pad_len[b]. Subtracting it gives each
+        # row positions 0..(its own length + gen_length), so a padded prompt
+        # encodes exactly like the unpadded one. Pad slots clamp to 0 and are
+        # masked out, so their value is irrelevant.
+        position_ids = (cols - pad_len.unsqueeze(1)).clamp_(min=0)
+
+        # Additive -inf on the pad columns of the KEY axis. Additive rather
+        # than boolean because SDPA adds it pre-softmax, which composes with
+        # any future mask; broadcast over heads and queries.
+        is_pad = cols < pad_len.unsqueeze(1)                         # [B, total_len]
+        if is_pad.any():
+            dtype = next(model.parameters()).dtype
+            pad_mask = torch.zeros(B, 1, 1, total_len, device=device, dtype=dtype)
+            pad_mask.masked_fill_(is_pad.view(B, 1, 1, total_len), torch.finfo(dtype).min)
+        else:
+            # Equal lengths after all: fall back to the untouched fast path
+            # rather than carrying an all-zero mask through every layer.
+            position_ids = None
+
     cache_buffer = KVCacheBuffer(
         num_layers=model.cfg.NL,
         batch_size=B,
@@ -386,7 +450,8 @@ def generate_cached(
     # num_logits=0: like the finalize pass, this one is run only for its K/V
     # side effect -- its logits were computed over the entire (prompt +
     # all-MASK) sequence and thrown away.
-    model(x, position_offset=0, cache_buffer=cache_buffer, write_pos=0, num_logits=0)
+    model(x, position_offset=0, cache_buffer=cache_buffer, write_pos=0, num_logits=0,
+          position_ids=position_ids, attn_mask=pad_mask)
     cache_buffer.commit(P)
 
     for block_idx in range(num_blocks):
@@ -404,8 +469,12 @@ def generate_cached(
             remasking=remasking,
             confidence_threshold=confidence_threshold,
             low_confidence_threshold=low_confidence_threshold,
+            position_ids=position_ids,
+            pad_mask=pad_mask,
         )
 
+    # Generation always occupies [P, P+gen_length) for every row -- that is the
+    # point of left-padding -- so the slice is uniform even with mixed prompts.
     return x[:, P:]
 
 
