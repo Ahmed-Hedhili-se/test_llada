@@ -1,1035 +1,247 @@
 # LLaDA-MoE-7B-A1B-Instruct — Optimized Inference Engine
 
-Self-contained PyTorch reimplementation of [inclusionAI/LLaDA-MoE-7B-A1B-Instruct](https://huggingface.co/inclusionAI/LLaDA-MoE-7B-A1B-Instruct) with four stacked inference optimizations — **Triton Fused MoE** (with the SiLU activation fused into the first GEMM's epilogue), **Block-wise KV Caching**, and a **narrowed `lm_head`** — running the model's native static top-8 expert routing. **6.46× faster than the baseline on a single request, and 54× on total-pipeline throughput under concurrent load.** Includes an OpenAI-compatible API server, a full evaluation suite, and an end-to-end-aware Triton autotuner.
+Self-contained PyTorch reimplementation of [inclusionAI/LLaDA-MoE-7B-A1B-Instruct](https://huggingface.co/inclusionAI/LLaDA-MoE-7B-A1B-Instruct), a masked-diffusion LLM. Triton fused MoE, block-wise KV caching, fused RMSNorm/decode kernels, variable-length batching, an OpenAI-compatible server, a data-parallel router, and an end-to-end-aware autotuner.
+
+**8.19× single-request vs the unoptimized baseline; 277.9 tok/s batched** (single RTX A6000).
 
 ---
 
-## Table of Contents
+## Contents
 
-- [Architecture Overview](#architecture-overview)
-- [Optimizations](#optimizations)
-- [Benchmark Results](#benchmark-results)
-- [Quantization (INT8 experts)](#quantization-int8-experts)
-- [Triton Autotuner](#triton-autotuner)
-- [Correctness Verification](#correctness-verification)
-- [Parallelism Support](#parallelism-support)
-- [Getting Started](#getting-started)
-- [Usage](#usage)
-- [Project Structure](#project-structure)
-- [Dependencies](#dependencies)
+- [Architecture](#architecture) · [Optimizations](#optimizations) · [Benchmarks](#benchmarks)
+- [Quantization](#quantization-int8-experts) · [Autotuner](#triton-autotuner) · [Correctness](#correctness)
+- [Decoding](#adaptive-decoding) · [Multi-GPU](#multi-gpu) · [Getting Started](#getting-started) · [Structure](#project-structure)
 
 ---
 
-## Architecture Overview
+## Architecture
 
-LLaDA-MoE is a **Masked Diffusion Language Model** — it generates text by iteratively unmasking `[MASK]` tokens rather than autoregressive next-token prediction.
+Generation is iterative unmasking, not next-token prediction. Every forward pass sees the entire sequence; `[MASK]` tokens are progressively replaced over N denoising steps, highest-confidence first.
 
-| Parameter | Value |
+| | |
 |---|---|
-| Layers | 16 (all MoE) |
-| Hidden dim | 2048 |
-| Attention | 16 heads, MHA, head dim 128 |
-| Experts per layer | 64 |
-| Default active experts (top-k) | 8 |
-| Expert inner dim | 1024 |
+| Layers / hidden / heads | 16 (all MoE) / 2048 / 16 (MHA, head dim 128) |
+| Experts | 64, top-8, inner dim 1024 |
 | Vocabulary | 157,184 |
-| Positional encoding | RoPE (θ = 50,000) |
-| Attention type | Bidirectional (non-causal) |
-| Generation method | Iterative masked diffusion |
+| Attention | **Bidirectional** (non-causal), RoPE θ=50,000 |
 
-> **Key difference from autoregressive LLMs**: Each forward pass sees the *entire* sequence (prompt + masked positions). Generation starts with all target tokens as `[MASK]` and progressively unmasks them over N denoising steps, selecting the highest-confidence predictions at each step.
+Each expert is a SwiGLU FFN: `W1 = [gate ; up]` (2048 → 2×1024), `SiLU(gate) ⊙ up`, then `W2` (1024 → 2048). Expert weights are ~92% of the model.
 
-### Expert Architecture (SwiGLU FFN)
-
-Each of the 64 experts is a small feed-forward network with a **SwiGLU** activation:
-
-```
-Input x (dim 2048)
-   │
-   ├──► W1 = [gate_proj ; up_proj]  (dim 2048 → 2×1024)
-   │         │
-   │    split into gate, up
-   │         │
-   │    SiLU(gate) ⊙ up     ← SwiGLU activation
-   │         │
-   └──► W2 = down_proj       (dim 1024 → 2048)
-            │
-        Output (dim 2048)
-```
-
-The router selects the **top-k** experts per token, runs each through this FFN, and produces a weighted sum of their outputs.
+> Static top-8 throughout. Reduced expert activation (top-5, step ramps, adaptive thresholds) was evaluated and dropped — this checkpoint's router is near-uniform, so fewer experts cost accuracy without a compensating win.
 
 ---
 
 ## Optimizations
 
-The `model_update/` directory implements two stacked optimizations over the baseline (`src/`):
+`src/` is the unoptimized reference. `model_update/` is the optimized engine.
 
-### 1. Triton Fused MoE (`fused_moe_triton.py`)
+**1. Triton fused MoE** — the baseline loops all 64 experts sequentially. One grouped-GEMM kernel replaces 64 launches: tokens are sorted by expert, padded to block boundaries, processed together. `moe_align_block_size` is fully vectorized (the original made 128 host-device syncs per call).
 
-**Problem**: The baseline loops over all 64 experts sequentially, calling small matmuls one at a time.
+**2. Block-wise KV caching** — prompt and finalized blocks have fixed content, so their post-RoPE K/V never change. Each step computes only the active block against `[cached ; fresh]`. A block's K/V is committed only after it is fully unmasked, and priming runs over the *full* mask-filled sequence — the model was trained to always see one, and truncating it causes premature EOS collapse.
 
-**Solution**: A single Triton grouped-GEMM kernel fuses all active expert computations into one GPU kernel launch. Tokens are sorted by expert assignment, padded to block boundaries, and processed together.
+**3. Fused SiLU epilogue** — `w1` packs `[gate ; up]` along N, so each program computes two B tiles and applies `SiLU(gate)*up` in registers, never materializing the 2·EI-wide intermediate (~1.2 GB of round-trip traffic per forward). **Bit-exact**: accumulators are rounded to bf16 *before* the activation, reproducing the unfused op order exactly.
 
-```
-Baseline (src/):     for expert in 64_experts: expert(tokens)   → 64 kernel launches
-Optimized:           fused_moe_kernel(all_tokens, all_experts)  → 1 kernel launch
-```
+**4. Narrowed `lm_head`** — `lm_head` is the widest GEMM (2048 → 157,184, ~644 MB of weights) and callers discarded most of its output: the cache-prime and block-finalize passes discard *all* of it. `num_logits` restricts it to the rows actually consumed. **Bit-exact** (GEMM rows are independent; RMSNorm reduces along the feature axis).
 
-At runtime, `fused_moe_triton.py` loads a hardware-tuned configuration from `moe_tune_config.json` (generated by the autotuner) to select the optimal Triton tile sizes for the current GPU. If no JSON is found, safe fallback configs are used automatically.
+**5. Fused RMSNorm + decode tail** — eager RMSNorm is 8 launches, and the model runs 65 per forward (~30% of all kernel launches). The decode tail did a full fp32 copy → 157k-wide softmax → gather of one value. One Triton kernel each: **9.1–11.4×** and **3.1–6.3×** respectively. Not bit-exact (both reassociate a reduction); disable with `LLADA_FUSE_RMSNORM=0` / `LLADA_FUSE_DECODE=0`.
 
-### 2. Block-wise KV Caching
+**6. Variable-length batching** — prompts of different lengths are left-padded to a common width, with per-row RoPE positions and an additive attention mask. Before this, requests could only batch if their prompts tokenized to *exactly* the same length.
 
-**Problem**: In masked diffusion, each denoising step re-runs the full model over the entire sequence (prompt + all generated tokens), even though the prompt tokens never change.
-
-**Solution**: Cache the Key/Value tensors from finalized tokens (prompt + already-generated blocks). Each denoising step only computes over the *active block*, attending against `[cached K/V ; fresh K/V]`.
-
-```
-Baseline:    model(full_sequence)         every step
-Optimized:   model(active_block, cache)   each step only processes the current block
-```
-
-> **Correctness rule**: A block's K/V is only pushed to the permanent cache *after* it is fully unmasked. Caching mid-denoising K/V would bake in stale masked-token representations.
-
-> **On reduced expert activation**: an earlier version of this project explored running fewer than 8 experts per token (fixed top-5, a step-based ramp, and per-token adaptive/nucleus thresholding) to cut MoE compute further. All three were evaluated and dropped — the accuracy cost wasn't worth it, and for this checkpoint's router (routing weights are nearly uniform across all 64 experts) adaptive thresholding had no real advantage over a fixed count either. The model now always routes to its native top-8.
-
-### 3. Fused SiLU Epilogue (`fused_moe_triton.py`)
-
-**Problem**: `fused_moe` ran `GEMM1 → materialize [M, top_k, 2·EI] → read it back → SiLU(gate)*up → GEMM2`. At batch 57 that intermediate is ~15 MB written, ~15 MB read, plus a ~7.5 MB write — roughly **1.2 GB of round-trip traffic per forward pass** across 16 layers. Nsight Compute puts this kernel at **96.4% of L2 throughput with DRAM at only 66–68%**, so the ceiling it is pinned against is L2 traffic, which makes deleting an intermediate round-trip precisely the right lever on the kernel that owns 45% of GPU time.
-
-**Solution**: `w1` packs `[gate ; up]` along N, so each kernel program now computes **two** B tiles — gate at `offs_bn`, up at `offs_bn + N` — keeps two accumulators, and applies the activation from registers, writing the EI-wide result straight out. The wide intermediate is never allocated. The N grid halves, so each program does 2× the work.
-
-**Bit-exact, verified.** The K-loop is untouched, so the fp32 accumulators are identical. The epilogue then deliberately reproduces the *unfused op order* rather than the more accurate one: accumulators are rounded to bf16 **first** (reproducing the intermediate store), SiLU is evaluated as `x/(1+exp(-x))` in fp32 with the result rounded back to bf16 before the multiply — matching what ATen's bf16 SiLU (`opmath_t=float`) and bf16 mul do elementwise. Computing straight from the fp32 accumulators would be *more* precise and therefore **not** bit-identical.
-
-The one property that could not be established by construction is that Triton's `tl.exp` lowers to the same instruction as ATen's `expf`. `eval/test_fused_silu_epilogue.py` measures it instead of assuming: **bit-exact at every shape from M=1 to M=2048**, with end-to-end token sequences identical. `LLADA_MOE_FUSED_SILU=0` disables the fusion if a future Triton version ever breaks that.
-
-### 4. Narrowed `lm_head` (`model.py`, `generate.py`)
-
-**Problem**: `lm_head` is the widest GEMM in the model (2048 → 157,184, ~644 MB of weights). Every forward pass ran it over its *entire* input, and the callers then discarded most of the result:
-
-| Call site | Logits used | Logits computed |
-|---|---|---|
-| Cache prime | **none** — return discarded | whole sequence (~2,500 rows) |
-| Block finalize | **none** — return discarded | whole suffix, once per block |
-| Denoising step | `[:, :block_length]` | whole suffix, up to 16× longer |
-
-**Solution**: `LLaDAMoEKV.forward(num_logits=N)` runs the final norm and `lm_head` over only the first `N` positions; `0` skips the head entirely. The transformer layers still run over the full input — the K/V written to the cache and the future-`[MASK]` context the model was trained to see both depend on it — so only the vocabulary projection is narrowed. `None` (the default) preserves the original behavior, leaving `generate_dense` and the diagnostic scripts untouched.
-
-**Exact**: GEMM rows are independent, so surviving rows compute identical dot products, and RMSNorm reduces along the feature axis, so slicing *before* the norm is safe too. Verified bit-exact on CPU/fp32 and CUDA/bf16 with the real Triton MoE (`eval/test_num_logits_slice.py`), and character-identical at full 7B scale.
-
-Worth ~2–4% end-to-end on its own — the sliced GEMM becomes bandwidth-bound rather than disappearing, since those 644 MB of weights stream regardless of row count. It also removes an ~800 MB peak allocation at `gen_length=1024`, which matters on a 24 GB card.
+**Rejected: fused QKV.** One GEMM instead of three measured 1.62× at M=32, 0.99× at M=256, **0.96× at M=1024**, 1.17× at M=2048. This engine runs at M = batch × suffix_length, so batch 32 at block 32 sits near M=1024 — exactly where it loses. `eval/test_fusions.py` still measures it, since the answer is cuBLAS- and shape-dependent.
 
 ---
 
-### 5. Fused RMSNorm and Decode Tail (`fused_ops.py`)
+## Benchmarks
 
-**Problem**: two hot spots that were pure overhead rather than useful work.
-
-`RMSNorm` in eager form is eight launches — `x.float()`, `pow(2)`, `mean(-1)`, `+eps`, `rsqrt`, two multiplies, `.to(dtype)` — and the model runs **65 of them per forward pass** (16 layers × 4, plus the final norm). That accounted for roughly **30% of all kernel launches**. `q_norm`/`k_norm` are the worst offenders: they reduce over only `HD=128`, so almost none of their cost is arithmetic.
-
-The decode tail did `logits.float()` (a full fp32 copy of a `[B, block, 157184]` tensor) → full-vocabulary `softmax` → `gather` of exactly one probability per position, plus a separate `argmax`. Three passes over a 157k-wide fp32 tensor to produce two numbers per position.
-
-**Solution**: one Triton kernel each. Measured on an A6000:
-
-| RMSNorm shape | Speedup | | Decode tail shape | Speedup |
-|---|---:|---|---|---:|
-| 2048×2048 | 9.36× | | 1×32×157184 | 3.08× |
-| 16384×2048 | 11.35× | | 8×32×157184 | 6.32× |
-| 262144×128 | 9.29× | | 32×32×157184 | 5.96× |
-
-The decode tail's **argmax matches at 100%** for every shape — it is pure comparison, so it must.
-
-**End to end**, concurrency 32, fixed prompts, 12192 output tokens in every arm:
-
-| | Wall | Tok/s |
-|---|---:|---:|
-| Unfused | 52.5 s | 232.1 |
-| **Fused** | **43.9 s** | **277.9 — +19.7%** |
-| Unfused (repeat) | 52.6 s | 231.6 |
-
-The repeat baseline is there on purpose: an earlier A/B in this project showed ~4% run-to-run variance, so a single pair could not have settled a claim this size. These two agree to 0.2%.
-
-> **This is a batched gain.** The same fusions on single-request GSM8K measure ~2% (366.8 s → 358.3 s): at batch 1 the MoE's weight streaming dominates and these two are a small share of it. At batch 32 they are a much larger fraction, and cutting ~30% of launches also eats into the ~25% of wall-clock that was idle.
-
-**Not bit-exact** — both reassociate a reduction. GSM8K n=50 seed=42 on the same box: 72.0% unfused vs 74.0% fused, a one-question difference and noise at that sample size. The stronger evidence is `eval/test_fusions.py`'s token-identity check, where both reproduce the unfused generation exactly. Disable with `LLADA_FUSE_RMSNORM=0` / `LLADA_FUSE_DECODE=0`. The decode fusion applies only at `temperature=0`, where `add_gumbel_noise` is the identity.
-
-### Rejected: fused QKV
-
-One `q/k/v` GEMM instead of three, measured at FULL_CFG and **dropped**:
-
-| tokens | bit-exact | speedup |
-|---:|---|---:|
-| 32 | no (8.3e-05) | 1.62× |
-| 256 | no (2.7e-03) | 0.99× |
-| 1024 | yes | **0.96× — slower** |
-| 2048 | yes | 1.17× |
-
-This engine runs at `M = batch × suffix_length`, so batch 32 at `block_length=32` sits near M=1024 — exactly where fusing loses. The only clear win is at M=32, below its operating range, and M=256 pays a 2.7e-03 relative difference for nothing. cuBLAS picks better kernels for the three narrow shapes than for the wide one at these sizes. `eval/test_fusions.py` still measures it, since the answer is shape- and cuBLAS-dependent rather than universal.
-
----
-
-## Benchmark Results
-
-### Single-GPU: Baseline vs Optimized (NVIDIA A40-24Q)
-
-128-token generation benchmark on **NVIDIA A40-24Q**, PyTorch 2.5.1+cu118, static top-8 both sides, Triton kernel tuned on this GPU with `tuning_fused_moe_triton.py`. Both sides use the same fixed-schedule decoding, so this isolates the *engine* speedup from the decoding-algorithm win documented under [Adaptive Decoding](#adaptive-decoding-threshold-based-token-selection).
+### Single request vs baseline — RTX A6000
 
 ```bash
 python -m eval.check_time_inference --weight-dir weights \
     --gen-length 128 --steps 128 --block-length 32 --mode both --num-runs 3
 ```
 
-| Configuration | top-k | Time (s) | Tok/s | Speedup |
-|---|:---:|---:|---:|:---:|
-| **Baseline** (`src/`, unfused, no cache) | 8 | 29.69 | 4.31 | 1.00× |
-| **Optimized** (`model_update/`, fused MoE + SiLU epilogue + KV cache + narrowed `lm_head`, tuned) | 8 | **4.60** | **27.86** | **6.46×** |
-
-This is the same configuration as the 2-GPU benchmark below, so the two are directly comparable: **one A40-24Q now matches what 2× A6000 with TP+EP achieved** (4.60 s vs 4.26 s, against baselines of 29.69 s and 26.19 s respectively — the A40 is ~13% slower hardware).
-
-> The benchmark also reports `Token Divergence`, which was 0/128 on this run. Do not read that as a correctness result: the benchmark prompt (`"The chemical symbol for gold is Au and for silver is"`) is answered in two tokens and EOS-padded for the other ~126, so both paths trivially agree on padding. The real correctness evidence is the bit-exactness tests and the GSM8K results under [Correctness Verification](#correctness-verification).
-
-> **Historical**: this table previously reported **3.75×** from a 32-token run using top-5 expert activation (an optimization since removed). The improvement since then comes from the vectorized `moe_align_block_size`, the fused SiLU epilogue, the narrowed `lm_head`, and — largest of all — actually having a tuned `moe_tune_config.json` on the benchmark GPU. See [Where the 6.46× comes from](#where-the-646-comes-from).
-
-### Multi-GPU: Baseline vs Optimized + TP/EP (2× NVIDIA RTX A6000)
-
-128-token generation benchmark on **2× NVIDIA RTX A6000 (49 GB each)** connected via **PCIe Host Bridge (PHB)**, PyTorch 2.5.1+cu121. Optimized model runs with Tensor Parallelism (Attention) + Expert Parallelism (MoE) via `torchrun`.
-
-```bash
-bash eval/benchmark_compare.sh --weight-dir ./weights --gen-length 128 --steps 128 --block-length 32 --num-runs 5
-```
-
-| Configuration | GPUs | top-k | Time (s) | Tok/s | Speedup |
-|---|:---:|:---:|---:|---:|:---:|
-| **Baseline** (`src/`, single GPU, no cache) | 1× A6000 | 8 | 26.19 | 4.89 | 1.00× |
-| **Optimized + TP/EP** (`model_update/`, KV cache + fused MoE, vectorized MoE alignment) | 2× A6000 | 8 | 4.26 | 30.04 | **6.15×** |
-
-> **Update**: `model_update/fused_moe_triton.py::moe_align_block_size` originally built its per-expert token/padding bookkeeping in a Python loop that called `.item()` twice per expert (128 host-device syncs per MoE call, ~70k over a full generation run) — each one stalls the CPU until the GPU catches up, serializing what should be back-to-back kernel launches. Rewriting it as a fully vectorized GPU computation (single sync at the end, to size the output tensor) raised this benchmark from 4.47× to **6.15×**. Verified bit-identical output against the original implementation (`eval/test_moe_align_block_size.py`).
-
-### Speedup Breakdown
-
-```
-              Speedup vs Baseline  (128 tok, steps=128, block=32, top-8)
-
-  1 GPU  ████████████████████████████████████████████████████████████████  6.46×   (A40-24Q, tuned kernel + SiLU epilogue + narrowed lm_head)
-  2 GPU  █████████████████████████████████████████████████████████████     6.15×   (TP+EP, 2x A6000, PCIe PHB, vectorized MoE alignment)
-
-  ────────────────────────────────────────────────────────────────────
-  1.0×      2.0×      3.0×      4.0×      5.0×      6.0×
-```
-
-> **Note on PCIe scaling**: The two rows use the same generation config but different hardware (A40-24Q vs A6000), so treat each as its own measurement rather than a scaling ratio — the 1-GPU row being *higher* reflects a year of single-GPU kernel work, not that one A40 out-computes two A6000s. Separately, the 2-GPU TP+EP architecture inserts two `dist.all_reduce()` synchronizations per layer — 32 network hops per generated token — over PCIe Host Bridge (`PHB`) rather than high-speed NVLink, adding a fixed communication cost. At Batch Size 1, this overhead partially offsets the compute gains from splitting work across 2 GPUs. Near-linear 2× per-GPU-throughput scaling is achieved at larger batch sizes where compute dominates. The 2-GPU row has **not** been re-measured since the SiLU epilogue and `lm_head` changes landed.
-
-### Where the 6.46× comes from
-
-Measured on the A40-24Q at `gen_length=1024, steps=512, block_length=64, confidence_threshold=0.9` (the recommended deployment config), each step applied cumulatively:
-
-| Stage | Time | Tok/s | Delta |
+| | Time | Tok/s | Speedup |
 |---|---:|---:|---:|
-| Starting point | 3.39 s | 302.4 | — |
-| \+ narrowed `lm_head` | 3.24 s | 316.1 | +4.4% |
-| \+ MoE autotune, then fused SiLU epilogue | **2.35 s** | **435.3** | **+27.5%** |
+| Baseline (`src/`, unfused, no cache) | 44.25 s | 2.89 | 1.00× |
+| **Optimized** | **5.41 s** | **23.68** | **8.19×** |
 
-**The single largest contributor was running the autotuner at all.** There was no `moe_tune_config.json` on this machine, so the kernel owning 45% of GPU time had been falling back to hardcoded configs. Isolating it (same measurement methodology, fusion held off) showed the full MoE pipeline going 8.08 → 3.64 ms at M=2048 (**2.2×**) and 4.29 → 2.45 ms at M=1024 (**1.8×**); small M barely moved. **If you deploy on different hardware, re-run the tuner — it is worth more than either kernel change.**
+> The ratio is **not hardware-portable**. `src/`'s MoE loops 64 experts in Python, so the baseline is CPU-dispatch-bound while the optimized path is GPU-bound. An earlier measurement on a different box (A40-24Q) gave 6.46× with a 29.69 s baseline — the difference is mostly the host CPU, not the engine.
 
-The SiLU epilogue is a clean +1–10% on top, measured per-M with the tuned configs (`eval/test_fused_silu_epilogue.py`, Part 3):
+### Batched throughput — A6000, `BATCH_MAX_SIZE=32`, concurrency 32
 
-| M | Unfused | Fused | Delta |
-|---:|---:|---:|---:|
-| 1 | 0.656 ms | 0.635 ms | +3.2% |
-| 32 | 1.682 ms | 1.671 ms | +0.7% |
-| 57 | 1.727 ms | 1.710 ms | +1.0% |
-| 256 | 1.908 ms | 1.841 ms | +3.5% |
-| 1024 | 2.450 ms | 2.214 ms | +9.6% |
-| 2048 | 3.637 ms | 3.539 ms | +2.7% |
-
-> On the same measurement *before* tuning, M=256 showed a **−24.5% regression**. That was a fallback-config artifact (`BM=64, BN=64` — two fp32 accumulators plus doubled B-tile shared memory outweighing the saved traffic), not a property of the fusion; it disappears entirely once the tuner picks a config for the fused shape. This is why `tuning_fused_moe_triton.py` benchmarks the pipeline that production actually runs, following `FUSE_SILU` rather than assuming the unfused chain.
-
-### Total-Pipeline Throughput: 54×
-
-The 6.46× above is a *single-request* engine comparison. Under concurrent load the gap is much larger, because the optimizations that made batching possible — block-wise KV caching and the narrowed `lm_head` — are what free the memory a batch needs. Both rows below were measured through the **same HTTP client, same load harness, same generation config**, so this is a pipeline-to-pipeline number rather than two measurements stitched together:
-
-| Pipeline | Throughput |
+| | Tok/s |
 |---|---:|
-| `src/` via HTTP, serialized | **4.5 tok/s** |
-| `model_update/` (`fast_dense`, `BATCH_MAX_SIZE=32`) | **243.2 tok/s** |
-| | **54×** |
+| Fixed prompts, fusions off | 232.1 |
+| **Fixed prompts, fusions on** | **277.9 (+19.7%)** |
+| Varied prompts (8 prompts, 6 lengths) | ~198 |
 
-```bash
-# baseline
-bash start.sh --backend ours --weight-dir weights
-python -m eval.throughput.run_throughput --base-url http://localhost:8000 \
-    --concurrency 4 --n-requests 4 --fixed-prompt --max-tokens 128 --steps 128 --block-length 32
+The fusion gain is a **batched** gain; the same fusions on single-request GSM8K measure ~2%, because MoE weight streaming dominates at batch 1.
 
-# optimized
-BATCH_MAX_SIZE=32 bash start.sh --backend fast_dense --weight-dir weights
-python -m eval.throughput.run_throughput --base-url http://localhost:8000 \
-    --concurrency 32 --n-requests 64 --fixed-prompt --max-tokens 128 --steps 128 --block-length 32
-```
+> Figures marked *fixed prompts* send an identical prompt for every request. Before variable-length batching that was the only way to fill a batch — with varied lengths the queue fragmented into batches of ~4. Treat fixed-prompt numbers as a ceiling, not as expected traffic.
 
-> The baseline uses only 4 requests because a serialized backend's aggregate throughput is independent of concurrency — every request takes ~28s and they queue, so 4 requests measure the same tok/s as 32 in an eighth of the time. (`run_throughput.py` sets no `aiohttp.ClientTimeout`, so it inherits the 300s default and will time out on a serialized backend past ~10 requests.)
+### Throughput vs batch size
 
-**The baseline's single-request throughput is its ceiling, not a configuration choice**: `src/generate.py` hardcodes the batch dimension to 1 (`x = torch.full((1, P + gen_length), ...)`, ignoring `prompt_ids.shape[0]`), so passing a batched prompt raises a shape error. Even with that fixed, `src/` has no KV cache and recomputes full-sequence logits every step — at B=32 that is ~7 GB per step for the decode tail alone.
-
-The number decomposes, which is the check that it is real:
-
-    6.46x (engine, B=1 both sides)  x  8.7x (batching, 27.86 -> 243.2 tok/s)  =  56x predicted
-                                                                                54x measured
-
-Three independent measurement paths agreeing to within 4%.
-
-### Variable-Length Batching
-
-Until recently `src/server.py` could only batch requests whose prompts tokenized to **exactly** the same length. The cause was one line -- `Attention.forward` called `scaled_dot_product_attention(..., attn_mask=None)`, so padding was impossible, so `prompt_token_length` had to be part of the batching key.
-
-**Every throughput number above this section was measured with `--fixed-prompt`, and that was not incidental.** The throughput harness cycles 8 prompts spanning 6 distinct token lengths; at concurrency 32 the old key split them into batches averaging ~4 requests. Real traffic, where no two prompts are the same length, fragmented the queue and the batching path stopped mattering.
-
-`generate_cached(..., prompt_lens=...)` now accepts **left-padded** prompts. Left rather than right because the block loop walks `block_start = P + block_idx * block_length` once for the whole batch, so every row's prompt must end at the same column.
-
-Two mechanisms make the padding inert, and both are required:
-
-- **Per-row RoPE positions** (`build_rope_freqs_from_positions`) -- each row's first real token is position 0, so a padded prompt encodes identically to the unpadded one. Using the shifted absolute offsets instead would encode each prompt as though it began partway into the sequence.
-- **An additive attention mask** over the pad columns -- which also protects the KV cache, whose slots there hold uninitialised `torch.empty` values.
-
-Both are opt-in and default to `None`; `apply_rope` keeps its original 2-D branch, and `generate_cached` falls back to the untouched path when no row needs padding, so **equal-length batches remain bit-identical**.
-
-`MEASURED` -- A6000, concurrency 32, `BATCH_MAX_SIZE=32`, `--max-tokens 128 --steps 128 --block-length 32`:
-
-| Prompts | Batches formed | Tok/s |
-|---|---|---:|
-| Fixed (`--fixed-prompt`) | 32 | 230.5 |
-| **Varied (8 prompts, 6 lengths)** | **32** (was ~4) | **194.1** |
-
-194.1 is below the fixed-prompt figure because padding to the batch maximum is real extra work. It is also the first throughput number here produced by traffic that looks like traffic.
-
-> `eval/test_variable_length_batch.py` asserts the property this rests on: a short prompt batched beside a longer one produces **exactly** what it produces alone, token for token under greedy decoding. It also checks that pad ids of 0, 999 and `MASK_ID` all stay out of the output -- a leak through the mask would silently perturb attention rather than raise.
-
-> `generate_dense` is unchanged and still grouped by length: it has no `prompt_lens` parameter, so mixed lengths would mis-slice its output.
-
-### Throughput vs Batch Size (single A40-24Q, 24 GB)
-
-Measured with `--max-tokens 128 --steps 128 --block-length 32`, `--concurrency` equal to `BATCH_MAX_SIZE`:
-
-| `BATCH_MAX_SIZE` | Tok/s | Δ throughput | Δ batch | p50 latency |
+| `BATCH_MAX_SIZE` | Tok/s | Δ throughput | Δ batch | p50 |
 |---:|---:|---:|---:|---:|
 | 8 | 150.3 | — | — | 6.77 s |
 | 16 | 204.8 | +36.3% | +100% | 9.93 s |
 | 24 | 224.8 | +9.8% | +50% | 13.56 s |
 | **32** | **243.2** | +8.2% | +33% | 16.71 s |
-| 48 | **0/96 requests succeeded** | — | — | — |
+| 48 | **0/96 succeeded** | — | — | — |
 
-**Throughput is already past the knee by batch 32** — 8→32 is 4× the batch for 1.62× the throughput, and the last step bought 8.2%. This independently confirms the Nsight finding below that MoE's efficiency gain is front-loaded: by B=32 the kernel has stopped being weight-streaming-limited, so extra tokens no longer ride along free. Further memory-reduction work to enable larger batches would buy single-digit percentages, not multiples.
+Throughput is past its knee by 32: 4× the batch buys 1.62× the throughput. The default of 64 was tuned on a 48 GB A6000 and **kills a 24 GB card** — set it per deployment. Rough sizing per sequence at length `L`, block `b`: KV `128 KB × L`, MoE transients `~48 KB × L`, logits `307 KB × b`.
 
-> **The default `BATCH_MAX_SIZE=64` is sized for a 48 GB A6000 and fails on a 24 GB card.** At 48 the server died between the health check and the load, taking all 96 requests with it — [server.py](src/server.py)'s batch handler catches `Exception` and fails the *entire* batch, so there is no split-and-retry and no memory-aware cap. On 24 GB use `BATCH_MAX_SIZE=32`; if latency matters, 24 gives up 8% throughput for 3.2s less p50.
->
-> Rough sizing, calibrated against the failure boundary above — per sequence at total length `L` and block length `b`: KV cache `128 KB × L`, MoE transients `~48 KB × L` (peak is the cache-prime call, where `M = B × L`), logits `307 KB × b`. So `B_max ≈ (free_vram − safety) / (L × 176 KB + b × 307 KB)`.
+### Kernel profile
 
-### Understanding Token Divergence (9.38%)
+`fused_moe_kernel` is **58.75% of GPU time** at **81% of theoretical weight-streaming bandwidth** — the expert weights (805 MB/layer) stream every forward regardless of token count. There is no kernel headroom left there; the levers are batching, quantization, or faster memory.
 
-In the single-GPU benchmark above, the historical top-5 run diverged from baseline by **9.38% (3/32 tokens)** — but this wasn't caused by using fewer experts:
-
-- The original testing (varying top-k across 8, 5, and 4 experts) found the divergence stayed at exactly 3 tokens regardless of expert count.
-- The cause is the **block-wise KV caching itself**, which changes the attention context:
-
-| | Baseline (`src/`) | Optimized (`model_update/`) |
-|---|---|---|
-| Each step runs | `model(entire_sequence)` | `model(active_block, cache)` |
-| Active tokens attend to | Prompt + current block + **future `[MASK]` blocks** | Prefix + current block only (**no future blocks**) |
-
-Since LLaDA uses **bidirectional (non-causal) attention**, the baseline lets tokens "see" future `[MASK]` tokens in upcoming blocks. The cached version cannot (future blocks aren't computed yet). The 3 divergent tokens are cases where seeing vs not seeing future masks tips the `argmax` prediction differently.
-
-> **This is not a quality issue** — both outputs are valid denoising trajectories. The masked diffusion process has multiple valid solutions, and the 3 tokens that diverge are near confidence-boundary cases.
+> Nsight's "Memory Throughput ~96%" is **L2**, not DRAM (DRAM sits at 66–68%). Read as a DRAM ceiling it says "nothing to gain"; read as an L2 ceiling it says "remove intermediate traffic" — which is what produced optimization 3.
 
 ---
 
 ## Quantization (INT8 experts)
 
-**This engine runs BF16 end to end.** Nothing in `model_update/` quantizes anything — the `use_fp8_w8a8` / `use_int8_w8a16` parameters in `fused_moe_kernel` are inherited from the vLLM kernel this one derives from, are always passed `False`, and are never referenced in the kernel body.
+**This engine runs BF16.** Nothing in `model_update/` quantizes anything — the `use_fp8_w8a8` / `use_int8_w8a16` parameters in `fused_moe_kernel` are inherited from vLLM, always `False`, never referenced.
 
-INT8 expert quantization is available as an **external, optional layer**: [`LLaDA_Quant`](https://github.com/Ahmed-Hedhili-se/LLaDA_Quant) imports this repository unmodified, quantizes the MoE expert weights (`w1`/`w2` — ~92% of the model), and serves them through the same `fast_dense` backend. Router, attention, norms, embeddings and `lm_head` stay BF16.
+INT8 is available through the optional [`LLaDA_Quant`](https://github.com/Ahmed-Hedhili-se/LLaDA_Quant) toolkit, imported lazily and absent from `requirements.txt`:
 
 ```bash
-# from the LLaDA_Quant checkout, this repo untouched
-python benchmarks/serve_quantized.py --repo ~/test_llada \
-    --weight-dir ~/test_llada/weights --backend fast_dense \
-    --bits 8 --group-size 128 --execution-mode packed --fused --port 8000
+bash start.sh --backend fast_dense --weight-dir weights --quantize int8
 ```
 
-### What it costs and what it buys
+`MEASURED` on one A6000, 128-token generation:
 
-`MEASURED` on a single RTX A6000 (48 GB), 128-token generation, `steps=128 block_length=32`, through this repo's own `eval/throughput/run_throughput.py`. `PACKED` stores INT8 and expands per weight access; `+ fused` routes the packed bytes straight into a W8A16 grouped-expert kernel that dequantizes inside the K-loop.
-
-| Load | BF16 | INT8 PACKED | INT8 PACKED + fused |
+| Load | BF16 | INT8 PACKED | INT8 PACKED + fused W8A16 |
 |---|---:|---:|---:|
 | Single request | 11.88 s | 60.57 s (0.20×) | **10.71 s (1.11×)** |
-| Concurrency 32 | 230.5 tok/s | — | **227.6 tok/s (0.99×)** |
-| **Concurrency 64** | **230.8 tok/s** | 98.3 tok/s (0.43×) | **114.4 tok/s (0.50×)** |
+| Concurrency 32 | 230.5 tok/s | — | 227.6 tok/s (0.99×) |
+| Concurrency 64 | 230.8 tok/s | 98.3 (0.43×) | 114.4 tok/s (0.50×) |
 | Resident | 13.70 GiB | 7.89 GiB | **7.89 GiB (0.58×)** |
 
-**Memory drops 42% at every load. Speed depends entirely on batch size**, and inverts:
+Memory drops 42% at every load; speed **inverts with batch size** — faster than BF16 at batch 1, parity at 32, half the speed at 64. The concurrency-64 collapse is not explained by the roofline (BF16 is flat from 32→64 while the quantized arm halves) and remains open.
 
-- **Single request** — quantized *and* 1.11× faster than BF16. The expert GEMM is weight-bandwidth-bound here, so halving the weight bytes helps directly.
-- **Concurrency 32** — parity. This is the roofline crossover: W8A16 pays off below ~101 rows per expert, and batch 32 sits well above it.
-- **Concurrency 64** — **BF16 is 2.02× faster.** Not a crossover effect: BF16 is flat from c=32 to c=64 (230.5 → 230.8) while the quantized arm halves (227.6 → 114.4). Two untested causes, tracked in `LLaDA_Quant`: the W8A16 kernel's tiles are untuned while this repo's BF16 path gets tuned tiles from `moe_tune_config.json`, and the BF16 arm keeps the [fused SiLU epilogue](#3-fused-silu-epilogue-fused_moe_tritonpy) that the quantized path gives up by design.
-
-Accuracy, GSM8K n=200, seed 42, recommended threshold config:
-
-| Config | Accuracy | vs BF16 | McNemar |
-|---|---|---|---|
-| BF16 | 75.5% (151/200) | — | — |
-| INT8 PACKED + fused | 73.5% (147/200) | −2.0 pt | p = 0.627 |
-
-### Recommendation
-
-**For throughput serving on a card that fits the model, stay on BF16.** This engine reaches 230 tok/s at concurrency 32–64 in BF16, and quantization cannot beat that — it reclaims memory you are not short of, at up to half the throughput.
-
-Quantization earns its place when **memory is the binding constraint**: a 24 GB card, a longer context, or a larger batch than BF16 leaves room for — and for **single-request latency**, where it is genuinely faster *and* smaller.
+**Recommendation:** on a card that fits the model, stay BF16 for throughput. Quantization earns its place when memory is the binding constraint, or for single-request latency.
 
 ---
-
 
 ## Triton Autotuner
 
-The autotuner in `tuning_fused_moe_triton.py` generates a hardware-specific `moe_tune_config.json` lookup table that `fused_moe_triton.py` loads at import time to select the best Triton kernel configuration for the actual batch sizes encountered during inference.
-
-### Why a Custom Autotuner?
-
-Standard Triton autotune (`@triton.autotune`) has two critical weaknesses for MoE inference:
-
-1. **It optimizes raw kernel latency**, not end-to-end throughput. A configuration with `BLOCK_SIZE_M=128` may execute 8,192 padded compute slots to process only 64 real token-expert pairs — fast in isolation, catastrophic under real GPU load.
-2. **It only benchmarks a single GEMM**, while the full MoE forward is `GEMM1 → SiLU+mul → GEMM2 → weighted_sum`. The optimal config for GEMM1 is not necessarily optimal for GEMM2 (different matrix aspect ratios).
-
-### What the Autotuner Does
-
-- **Benchmarks the complete pipeline**: `GEMM1 → SiLU+mul activation → GEMM2 → sum`, not just the first GEMM — and specifically the pipeline production runs, following `FUSE_SILU` so that the fused-epilogue variant (which has a different shared-memory budget and a halved N grid) is scored on its own terms.
-- **Composite scoring**: `score = latency_ms × (1 + padding_penalty × padding_ratio)`. This explicitly penalizes configs that inflate the padded token count.
-- **Caps `BLOCK_SIZE_M ≤ 64`** by default to prevent padding explosion for small-to-medium batch sizes.
-- **Profiles each candidate**: reports padding ratio so you can understand why a config was chosen. (The shared-memory and SM-occupancy columns read their values from Triton's compiled-kernel metadata via `getattr(meta, "shared", None)`, which returns `None` on recent Triton versions — those two columns currently print `None` and are not used in config selection.)
-- **Validates correctness** of the winning config against a reference before writing the JSON (cosine similarity > 0.999 required — note this is *not* a bit-exactness check, so retuning can legitimately shift generation output; see the accuracy note below).
-
-> **Retuning is not numerically neutral.** Changing `BLOCK_SIZE_K` regroups the fp32 accumulation in the K-loop, so a retuned kernel can produce different tokens from the same weights and seed. That is expected and accepted here — the winner is validated at `cos_sim > 0.999`, not bit-equality. In practice a full retune on the A40-24Q left GSM8K accuracy completely unchanged (88.0%, 44/50, same as before), but treat a few points of movement after retuning as normal rather than as a regression.
-
-### Usage
+`tuning_fused_moe_triton.py` generates a hardware-specific `moe_tune_config.json`, loaded at import time. **Run it on every new GPU** — it was the single largest speed win found in this project (2.2× on the MoE pipeline at M=2048).
 
 ```bash
-# Tune for the test model (fast, ~2 min)
-python tuning_fused_moe_triton.py --model SMALL_CFG
-
-# Tune for the full 7B production model (single GPU, no TP)
-python tuning_fused_moe_triton.py --model FULL_CFG
-
-# Tune for a multi-GPU deployment: pass the TP degree you will RUN with
+python tuning_fused_moe_triton.py --model FULL_CFG          # single GPU
 python tuning_fused_moe_triton.py --model FULL_CFG --tp-size 8
-
-# Custom penalty weight and block size cap
-python tuning_fused_moe_triton.py --model FULL_CFG --penalty 0.8 --max-block-m 32
-
-# Output to a custom file
-python tuning_fused_moe_triton.py --model FULL_CFG --output my_a100_config.json
 ```
 
-After tuning, the generated `moe_tune_config.json` is automatically detected and loaded by `model_update/fused_moe_triton.py` at import time. No other changes are needed.
-
-#### Tuning for multi-GPU (`--tp-size`)
-
-The MoE weights are **expert-sharded**, so at TP=N each rank's `w1` holds only `NE // N` experts and `fused_moe()` sees that smaller `E`. Since `E` drives the block-padding cost that the autotuner's score is built around, tuning at the global `NE=64` produces a config optimized for a workload that never actually runs at TP>1. Pass `--tp-size` to match your deployment:
-
-| Deployment | Command | Experts per GPU |
-| :--- | :--- | :--- |
-| 1 GPU | `--model FULL_CFG` | 64 |
-| 2 GPUs | `--model FULL_CFG --tp-size 2` | 32 |
-| 8 GPUs | `--model FULL_CFG --tp-size 8` | 8 |
-
-**Tune once on a single GPU — not once per GPU.** The tuner is a single-process, single-device script (it never initializes a process group). All ranks read the same `moe_tune_config.json` from the repo root at import time, so one run produces the config used by every GPU. On a homogeneous node (e.g. 8×H100) the optimal tile sizes are identical across devices, so re-running per GPU only wastes time.
-
-#### Hardware portability
-
-The shared-memory budget used to prune candidate configs is **queried from the device** (`SHARED_MEM_LIMIT` in `fused_moe_triton.py`), not hardcoded. This matters across generations: A40/A6000 (Ampere) allow ~100 KB per block while H100 (Hopper) allows ~227 KB. The same limit is enforced in both the tuner's search space and `get_best_config()`'s runtime guard, so the tuner can never select a config the loader would reject. `num_stages=4` is included in the search space when the budget permits it, and the occupancy estimate in `profile_config()` reads per-SM shared memory, registers, and max warps from the device as well.
-
-Re-tune when you change GPU generation or TP degree — the config file is hardware- and shard-specific.
+It scores the *complete* pipeline (`GEMM1 → activation → GEMM2 → sum`, following `FUSE_SILU`), not one GEMM, and penalizes configs that inflate padding: `score = latency × (1 + penalty × padding_ratio)`. Shared-memory limits are queried from the device. The winner is validated at `cos_sim > 0.999` — **not** bit-exactness, so retuning can legitimately shift generated tokens.
 
 ---
 
-## Correctness Verification
+## Correctness
 
-Verified against the HuggingFace reference implementation at the logit level:
+Against the HuggingFace reference at the logit level: **3,219/3,219 weights mapped**, logit cosine **0.9781**, top-1 token match **91.0%**.
 
-| Metric | Result |
+A residual ~6pt fixed-schedule gap vs HF was investigated and closed as **inherent, not a bug**: this checkpoint's router is near-uniform (top-1 weight ~1.7–5%), so bf16-level noise flips top-8 expert membership for 43–90% of positions per layer. A 2×2 kernel-isolation matrix exonerated the Triton MoE kernel entirely. See `INVESTIGATION_LOG.md` §2.9–2.11.
+
+Regression tests (`python -m eval.<name>`):
+
+| | |
 |---|---|
-| Weight mapping | 3,219 / 3,219 (100%) |
-| Logit cosine similarity | avg **0.9781** across 256 masked positions |
-| Top-1 token match | **91.0%** (233/256) |
-| Generation quality | Matches HF generation behavior with exact cosine precision |
+| `test_fusions` | RMSNorm / decode / QKV numerics + speed, and token identity |
+| `test_variable_length_batch` | a padded row reproduces its solo run **exactly** |
+| `test_num_logits_slice` | narrowed `lm_head` is bit-exact |
+| `test_moe_align_block_size` | vectorized alignment vs a frozen reference |
+| `test_select_transfer_indices` | vectorized per-row top-k vs a frozen reference |
+| `test_router` | dispatch, health, failover, recovery (no GPU needed) |
 
-**At the full-generation level, a real accuracy bug was found and fixed.** Comparing CoT MMLU-Pro accuracy between `model_update` and HF surfaced a large gap (28.0% vs HF's 46.0%) caused by `generate_cached`'s responses collapsing to a bare `"Final Answer: X"` with no reasoning content. Root cause: the KV-cache priming and finalize calls were missing the mask-placeholder context the model was trained to always see. Fixed in commit `a5f6ebe`; post-fix, MMLU-Pro rose to **40.0%** (HF: 46.0%).
-
-**A ~6-point residual gap remains, reproduced on a second task, but its cause is unresolved — an earlier "confirmed" explanation was retracted after a direct test.** Re-running the same `model_update`-vs-HF comparison on GSM8K (`gen_length=1024, block_length=64`) reproduced the same ~6pt gap (68.0% vs HF's 74.0%, n=50) on a completely different task from the original MMLU-Pro finding. Bucketing accuracy by response length (`eval/correctness/analyze_length_vs_gap.py`) initially looked like strong support for a block-commit-staleness explanation (the committed KV prefix only refreshes at block boundaries, not every step like HF) — the gap grew sharply with length, and `model_update` scored 0/6 on the longest (1200+ char) responses vs HF's 3/6.
-
-That explanation didn't survive a direct test. `generate_dense` (same model/weights, no KV cache at all) was added specifically to check it: if staleness were the cause, disabling caching should move accuracy toward HF's 74%. Instead, across two seeds:
-
-| Seed | Cached | No-cache | Direction |
-|---|---:|---:|---|
-| 42 | 68.0% (34/50) | 62.0% (31/50) | cached wins by 6.0pt |
-| 123 | 60.0% (30/50) | 66.0% (33/50) | no-cache wins by 6.0pt |
-| **Mean** | **64.0%** | **64.0%** | **identical** |
-
-The direction flips exactly between seeds and the means are identical — pure sampling noise, not a real caching effect. **The block-commit-staleness explanation is retracted.**
-
-**The actual root cause was then found at the forward-pass level, and the investigation is closed.** Tracing per-layer hidden states on a realistic 1525-token GSM8K prompt showed the divergence vs HF is *discrete*, not gradual: average cosine stays ~0.96-0.99 at every layer, but a small subset of positions collapses abruptly at layer 7 (min cosine 0.71 → 0.065) and stays broken through layer 14. Capturing the router's actual top-8 expert selections showed why: the two implementations pick a **different top-8 expert set for 43-90% of positions at every layer** — this checkpoint's router is near-uniform (top-1 weight ~1.7-5%, barely above random), so top-8 membership sits on a razor-thin boundary that any bf16-level numerical noise can flip. Most flips are harmless; occasionally one lands on a functionally different expert and cascades. The routing algorithm itself was verified identical against the real checkpoint's own `modeling_lladamoe.py` (fp32 softmax, flat top-8, no renormalization, no expert bias — exactly what `model_update` implements). A 2×2 kernel-isolation matrix (swapping the Triton fused MoE for an eager loop that matches HF line-for-line; loading HF with SDPA attention to match ours) **exonerated the Triton MoE kernel entirely** (no change) and showed attention-kernel alignment helps modestly (top-1 logit match 71.9% → 84.4%) — but the layer-7 collapse survives even the maximally-aligned configuration. What remains is micro-implementation detail (RMSNorm upcasting order, RoPE trig, op fusion order): unavoidable bf16 noise between any two independently-written implementations, amplified into discrete expert flips by the near-uniform router. **Not a bug; not fixable without literally becoming the HF implementation.** Same family of effect as the cross-hardware variance documented in the Adaptive Decoding section. A later matched-budget check reinforced the conclusion: doubling the step budget moves both engines up by the same amount (`model_update` 68%→76%, HF 74%→82% on GSM8K), leaving the gap at exactly −6pts at *both* budgets — the stability across configurations is precisely what an inherent numerical offset predicts, and what noise would not produce. The practical answer is at the decoding layer, where the recommended threshold config beats HF's best fixed-schedule result outright (+6pts at ~25x the speed — see "Recommended configuration" under Adaptive Decoding). See `INVESTIGATION_LOG.md` §2.9-2.11 for the complete investigation.
+> **Accuracy figures predating `_stable_subset` are not comparable across machines.** `random.shuffle` over a HuggingFace dataset whose row order varies by version meant the same `--seed` selected *different questions* on different boxes — two runs shared only 6 of their first 10. Fixed by sorting on a content hash before shuffling. Re-measure before comparing any historical accuracy number.
 
 ---
 
-## Parallelism Support
+## Adaptive Decoding
 
-The optimized model (`model_update/`) fully supports multi-GPU inference using a hybrid **Tensor Parallelism (TP) + Expert Parallelism (EP)** architecture via `torchrun`.
+Opt-in threshold decoding (`confidence_threshold`), ported from dInfer's `HierarchyDecoder`: at most one reveal per contiguous run of selectable positions, floored by `low_confidence_threshold`, unioned with positions clearing the threshold outright.
 
-| Feature | Status | Notes |
-|---|---|---|
-| Single-GPU inference | ✅ Fully supported | Default mode, no setup required |
-| TP (Attention Layers) | ✅ Fully supported | Q/K/V and O projections are column/row sharded across GPUs with an `all_reduce` synchronization at the end of the Attention block. |
-| EP (MoE Layers) | ✅ Fully supported | The 64 experts are sharded across GPUs (e.g., 32 per GPU on a 2-GPU setup). Each GPU processes only tokens routed to its local experts, followed by an `all_reduce` synchronization. |
-
-### Running Multi-GPU Inference
-
-To run the model on 2 GPUs:
-```bash
-# Benchmark (TP+EP)
-torchrun --nproc_per_node=2 eval/check_time_inference.py --weight-dir ./weights --mode optimized
-
-# API Server (TP+EP)
-torchrun --nproc_per_node=2 src/server.py --weight-dir ./weights --port 8000 --backend fast_dense
-```
-
-### Multi-GPU Scaling Expectations
-When scaling to multiple GPUs at **Batch Size 1**, you may observe that 2 GPUs do not yield a perfect 2x speedup compared to 1 GPU. This is expected behavior due to **PCIe communication overhead**.
-- The TP+EP architecture requires two synchronous `dist.all_reduce()` operations per layer (one for Attention, one for MoE).
-- For a 16-layer model, this means 32 network hops per generated token.
-- If your GPUs are connected via standard PCIe (e.g., `PHB` in `nvidia-smi topo -m`) rather than high-speed NVLink, these `all_reduce` calls add ~1-2 milliseconds of pure network delay per token. 
-- While compute time is halved, the added network latency limits the maximum theoretical speedup for small batch sizes. Near-linear scaling is achieved at larger *model*-batch sizes (multiple sequences processed together in one forward pass), where compute time dominates the fixed network latency.
-- **This does not extend to concurrent API requests as currently served** — see the next section. `src/server.py` processes one request at a time regardless of TP+EP, so concurrent load doesn't get the benefit described above at all; it queues instead.
-
-### Concurrent Request Throughput: TP+EP vs Data-Parallel Replicas
-
-> **Decision rule, confirmed by measurement on both sides**: for a **single request**, use **TP+EP** — 4.26s for 128 tokens, 6.15× vs baseline, because both GPUs cooperate on that one generation. For **concurrent requests**, use **DP** — ~2× better throughput and tail latency than a single TP+EP instance at matched load (`--concurrency 8`, validated across two independent test rounds). They optimize different things, and this server can only give you one per deployment — pick based on actual traffic pattern, not whichever number looks better in isolation. Full data and the mechanism behind the flip below.
-
-The TP+EP setup above is optimized for **single-request latency**, not concurrent throughput — those are different questions, and conflating them leads to the wrong serving topology.
-
-**Why they diverge**: `src/server.py` serializes every generation through one `request_lock` (`threading.Lock()`), because the TP worker process (`worker_loop()`, rank 1) is a simple `while True: receive one broadcast → run one generation → loop` with no concept of handling more than one request at a time. A single TP+EP instance therefore processes exactly **one generation at a time, system-wide**, no matter how many concurrent requests arrive — they queue behind the lock rather than executing in parallel.
-
-**Data-Parallel (DP) replicas** sidestep this: two independent single-GPU server processes (via `CUDA_VISIBLE_DEVICES`, one per physical GPU), each with its own separate lock, load-balanced by round-robining requests across both. Two independent queues instead of one.
-
-#### Benchmark: concurrent requests, 128-token generation each (`eval/throughput/run_throughput.py`, 2× A6000, `--concurrency 8`)
-
-```bash
-# TP+EP (1 instance, both GPUs cooperating per request)
-torchrun --nproc_per_node=2 --master_port=29501 src/server.py --weight-dir ./weights --port 8000 --backend fast_dense
-python -m eval.throughput.run_throughput --base-url http://localhost:8000 --concurrency 8 --n-requests 32
-
-# DP (2 independent single-GPU replicas -- note the distinct MASTER_PORT per
-# replica, since init_distributed() hardcodes 29500 when unset and two
-# replicas on one machine would otherwise collide on it)
-CUDA_VISIBLE_DEVICES=0 MASTER_ADDR=localhost MASTER_PORT=29500 RANK=0 WORLD_SIZE=1 \
-  python -m src.server --weight-dir ./weights --port 8000 --backend fast_dense --device cuda:0 &
-CUDA_VISIBLE_DEVICES=1 MASTER_ADDR=localhost MASTER_PORT=29501 RANK=0 WORLD_SIZE=1 \
-  python -m src.server --weight-dir ./weights --port 8001 --backend fast_dense --device cuda:0 &
-python -m eval.throughput.run_throughput --base-urls http://localhost:8000,http://localhost:8001 --concurrency 8 --n-requests 32
-```
-
-| Requests | Configuration | Output tok/s | p95 latency | p99 latency |
-|---:|---|---:|---:|---:|
-| 8  | TP+EP (1 instance) | 26.0 | 34.15s | 34.15s |
-| 8  | DP (2 replicas)     | 47.0 | 17.04s | 17.04s |
-| 32 | TP+EP (1 instance) | 26.0 | 34.78s | 34.79s |
-| 32 | DP (2 replicas)     | 46.6 | 17.31s | 17.34s |
-| 64 | TP+EP (1 instance) | 25.9 | 34.78s | 34.88s |
-| 64 | DP (2 replicas)     | 46.8 | 17.15s | 17.19s |
-
-**Result: DP gives ~1.8× higher throughput and ~2× lower tail latency than TP+EP under concurrent load, consistently across request counts (8/32/64) — not a one-off measurement.**
-
-The mechanism is plain queueing, not a GPU-compute-efficiency difference. TP+EP's single `request_lock` means `--concurrency 8` fully queues behind one lock: tail latency ≈ 8 × solo-request-time ≈ 8 × 4.26s ≈ 34s, matching the measured 34.15–34.88s almost exactly. DP splits the same 8 requests across two independently-locked queues of depth 4 each, roughly halving the wait: ≈ 4 × 4.26s ≈ 17s, again matching. Aggregate throughput follows the same arithmetic (solo tokens/request ÷ solo time, independent of which topology is queuing the requests).
-
-**Takeaway**: for concurrent multi-user serving on this hardware, prefer DP replicas over a single TP+EP instance — same 2 GPUs, ~2× better throughput and latency-under-load. TP+EP remains the right choice for single-request latency specifically (6.15× speedup, see the Multi-GPU benchmark above) — a lone DP replica only gets the single-GPU speedup, not the TP+EP-combined one.
-
-**Neither topology alone is a true fix for concurrency at scale.** Both are workarounds for `model_update/generate.py`'s `generate_cached` processing one request at a time. The model architecture already operates over a generic batch dimension — `KVCacheBuffer` takes `batch_size`, and `TritonFusedMoEBlock.forward` flattens `[B, T, H] → [B*T, H]` so tokens from different sequences in a batch share expert routing naturally — the gap was purely that nothing in `src/server.py` collected concurrent requests into a batched `generate_cached()` call. That gap is now closed for the single-GPU path (DP replicas or a plain single-GPU deployment) — see the next section for how it works and what it measured. TP+EP's `request_lock` path is intentionally left as-is; batching there would need the batch itself to survive `dist.broadcast_object_list()` to `worker_loop()` every step, real additional distributed-coordination risk on top of code that's already been the most failure-prone part of this project.
-
-### Server-Side Request Batching
-
-#### How it works
-
-`src/server.py` runs a dedicated background thread (`_batch_worker`) that collects concurrent requests instead of processing them one at a time, for `BACKEND == "fast_dense"` with `tp_size == 1` only. Once the first request of a new group arrives, it polls every `BATCH_POLL_INTERVAL_S` (default 5ms) for either `BATCH_MAX_SIZE` (default 64, see below) matching-key requests to accumulate, or `BATCH_WAIT_S` (default 50ms) total to elapse — whichever comes first — then runs that group as one `generate_cached()` call instead of N sequential ones. Requests only batch together if they share an identical `(gen_length, steps, block_length, prompt_token_length)` key: different-length prompts would need padding plus an attention mask, which nothing in `model_update/model.py` supports today (`F.scaled_dot_product_attention` is always called with `attn_mask=None`), so mismatched requests land in separate batches rather than being forced together unsafely.
-
-#### Validation: does it actually form large batches?
-
-```bash
-BATCH_MAX_SIZE=64 PROFILE_BATCHES=1 python -m src.server --weight-dir ./weights --port 8000 --backend fast_dense --device cuda:0
-python -m eval.throughput.run_throughput --base-url http://localhost:8000 --concurrency 64 --n-requests 64 --fixed-prompt
-```
-
-At `--concurrency 64`, the collection window reliably formed batches of 54–63 out of 64 concurrent requests (the small remainder landing in a second batch) — confirmed directly via server-side `[batch] size=N` logging, not inferred from throughput numbers alone. Aggregate throughput reached **194.2 tok/s** at concurrency 64, vs ~26–30 tok/s for the serialized baseline at the same load. Since every request in the dominant batch completes *simultaneously* (one shared `generate_cached()` call), that batch's wall-clock time is directly comparable to what serialization would have taken: `54 × 4.26s ≈ 230s` serialized vs ~33.7s measured — a **~6.8× speedup** for that group.
-
-#### GPU trace analysis (Chrome/Perfetto format via `PROFILE_BATCHES=1`)
-
-Exporting a `torch.profiler` trace per batch and analyzing actual CUDA kernel timing — rather than inferring utilization from wall-clock throughput alone — found:
-
-- **GPU busy 71.7%** of the batch's wall-clock window (batch of 57, 8-token/8-step generation) — decent utilization, not saturated, not wasted.
-- The idle 28.3% was **not** a few large stalls: **19,658 distinct idle gaps averaging ~8μs each** — the signature of kernel-launch overhead accumulating across many small operations, not one fixable bottleneck.
-- Of the busy time, `fused_moe_kernel` (the hand-written Triton kernel) alone accounted for **44.6%** — directly confirming, via hard trace evidence, the MoE-dominance finding from this project's very first profiling (`eval/time_fraction.py`). Attention (`pytorch_flash::flash_fwd_kernel`) was ~1.9%, confirming it's cheap, as established throughout this project.
-
-#### Fixing a real contributor: vectorizing `_generate_block_cached`'s per-row token selection
-
-The trace pointed at a fixable source of the fragmented idle time: `_generate_block_cached`'s confidence-based token-selection loop called `.item()` and ran an independent `torch.topk()` **per batch row, per denoising step** — the same class of host-sync cost `moe_align_block_size`'s vectorization eliminated for MoE routing (see Optimizations above), in a different function. Since `torch.topk` has no per-row-`k` mode, the fix takes one `topk` call at the batch's max `k`, then masks each row down to its own (smaller-or-equal) `k` via a broadcast comparison — `topk`'s output is sorted descending, so "keep the first `k_j` of `max_k`" is exactly the top-`k_j` for row `j`, not an approximation. `get_num_transfer_tokens` (called once per block rather than once per step) had the same root cause — a per-row tensor used as a slice bound implicitly triggers `__index__`, another hidden host sync — fixed the same way. Both are verified against frozen copies of the original loop-based implementations across randomized configs and edge cases in `eval/test_select_transfer_indices.py`, and confirmed bit-exact against real model inference: `eval/diagnose_cache_vs_dense.py`'s diagnostic question produced output identical, character-for-character, to this project's historical pre-fix correctness record.
-
-**Matched-batch-size before/after** (both traces at batch=57, isolating the code change from batch-composition noise — a same-config-different-size comparison at batch=31/33 initially looked *worse* than the batch=57 baseline, purely because a smaller batch has less parallel work to amortize the same fixed overhead over, not because of any regression; re-running until the batch size matched resolved the ambiguity):
-
-| Metric | Before | After | Change |
-|---|---:|---:|---:|
-| Total wall-clock span | 557.18ms | 521.13ms | **−6.5%** |
-| Busy time (actual GPU compute) | 399.71ms | 399.29ms | ~unchanged |
-| Idle time | 157.46ms | 121.85ms | **−22.6%** |
-| Busy % | 71.7% | 76.6% | **+4.9 points** |
-| Idle gaps | 19,658 | 17,773 | −9.6% |
-| Avg gap size | 8.01μs | 6.86μs | −14.4% |
-| Kernel launches | 17,108 | 16,246 | −5.0% |
-| CPU-side launch calls (`cuda_runtime`) | 27,156 | 24,250 | **−10.7%** |
-
-Busy time is essentially untouched, exactly as expected — the fix changes zero math, only removes overhead sitting around it — while every overhead-side metric improved: less idle time, fewer and smaller gaps, fewer kernel launches, fewer CPU-side dispatch calls. Not the dominant lever (MoE's kernel time still dwarfs everything else in this workload), but a real, correctly-attributed, measured 6.5% reduction in wall-clock time for the same batch of work.
-
-#### Kernel-Level Validation: Occupancy, Memory Bandwidth, and Instruction Stalls (Nsight Compute)
-
-The Chrome trace above answers "is the GPU busy," but not *why* individual kernels are cheap or expensive once running — that needs per-kernel hardware-counter profiling (`ncu`, NVIDIA Nsight Compute), not a wall-clock timeline. Profiled the two hot kernels (`fused_moe_kernel`, the Triton grouped-GEMM; `pytorch_flash::flash_fwd_kernel`, PyTorch's bundled flash-attention) directly on a single A6000 at `--batch-size 1`, `32`, and `64` (`eval/check_time_inference.py`), full metric set (`ncu --set full`), 16 kernel launches sampled at each size.
-
-**At B=1, both kernels were underutilizing the GPU, for two different root causes:**
-
-| Metric | Attention (`flash_fwd_kernel`) | MoE (`fused_moe_kernel`, GEMM1) |
-|---|---:|---:|
-| Grid size | 16 blocks (vs 84 SMs) | 1,632 blocks |
-| Memory bandwidth used | ~7% of peak | **~96% of peak** |
-| Compute throughput used | ~4.3% of peak | ~16% of peak |
-| Achieved occupancy | ~8.3% | ~65% |
-| "No eligible warp" cycles | ~79.7% | ~93% (81.6% of it: L1TEX/memory scoreboard stalls) |
-
-Attention was **occupancy-starved**: only 16 blocks (one per KV head, B=1) against 84 SMs, so ~80% of cycles had literally no warp with work ready to issue — a launch-configuration problem, not a bandwidth or compute one. MoE was **memory-bound**: with 16 active tokens split across top-8-of-64 routing, each expert averages ~2 tokens, so the kernel spends most of its time streaming that expert's full weight matrix from memory to process almost nothing — the classic thin-GEMM regime. This is the mechanistic explanation for why kernel-launch-overhead techniques tried and reverted earlier (`torch.compile` on `Attention.forward` and on the SiLU×mul MoE activation, CUDA graph capture/replay — see git history) showed no benefit or a regression: neither technique changes how much work a kernel does once launched, and in both cases the bottleneck was underutilization *within* the kernel, not dispatch overhead *around* it.
-
-> **Correction — the "~96% of peak" figure above is L2, not DRAM.** Re-reading the raw `ncu` output (`ncu_deep_report_b32.txt`) shows `L2 Cache Throughput = 96.35%` while `DRAM Throughput` sits at only **66–68%**. The row is labelled "Memory Throughput" in Nsight's Speed-of-Light section, which reports the *most utilized* memory subsystem — here L2, not DRAM. This distinction turned out to matter: reading it as "already at the DRAM ceiling, nothing left to gain" argues against touching the kernel at all, whereas an L2-traffic ceiling says removing intermediate tensors is exactly the lever. Acting on the corrected reading produced the fused SiLU epilogue (Optimization 3), which deletes ~1.2 GB of per-forward round-trip traffic and is worth up to +9.6%.
-
-**Batching directly fixes both, by two different mechanisms — confirmed at the kernel level, not inferred from throughput alone:**
-
-| Metric | Attention, B=1 → 32 → 64 | MoE GEMM1, B=1 → 32 → 64 |
-|---|---:|---:|
-| Achieved occupancy | 8.3% → 15.5% → 15.5% (plateaus) | 65% → 33% → 33% (config change, not regression — see below) |
-| Compute throughput | 4.3% → 32.3% → 37.4% | 16% → 41.3% → 41.7% |
-| Memory throughput | 7.0% → 59.7% → 75.7% | 96% → 96% → 98% (stays saturated) |
-| Duration vs. tokens processed | grid scales 32×/64× with B | 32× tokens in only ~1.9× time at B=32 (~17× more work per μs); duration scales ~linearly with B from 32→64 (efficiency plateaus) |
-
-More concurrent sequences directly multiplies attention's grid size (more blocks to fill the 84 SMs), and more tokens per expert raises MoE's arithmetic intensity (same weight-load cost now amortized over far more useful compute) — both are the batching lever, not a kernel-dispatch lever. MoE's efficiency gain is front-loaded: the big win (thin-GEMM fixed) happens by B=32; B=32→64 still helps (real additional throughput) but per-token cost stops improving. MoE's occupancy % drop from 65%→33% between B=1 and B=32 reflects Triton's `get_best_config` selecting a different tuned kernel configuration for larger token counts (128-thread vs 256-thread blocks), not an efficiency regression — compute throughput rose 2.6× over the same transition.
-
-**End-to-end validation with real concurrent HTTP traffic** (same A6000, `BACKEND=fast_dense`). Reproduce by restarting the server at each `BATCH_MAX_SIZE` and running the identical load against it:
-
-```bash
-# Run A: old default
-BATCH_MAX_SIZE=8 python -m src.server --weight-dir ./weights --port 8000 --backend fast_dense --device cuda:0 &
-python -m eval.check_server --base-url http://localhost:8000   # wait until this passes (model load takes ~45-70s)
-python -m eval.throughput.run_throughput --base-url http://localhost:8000 \
-    --concurrency 64 --n-requests 128 --max-tokens 128 --steps 128 --block-length 32 --fixed-prompt
-
-# Run B: new default -- restart the server, then repeat the identical load command
-pkill -f "src.server"
-BATCH_MAX_SIZE=64 python -m src.server --weight-dir ./weights --port 8000 --backend fast_dense --device cuda:0 &
-python -m eval.check_server --base-url http://localhost:8000
-python -m eval.throughput.run_throughput --base-url http://localhost:8000 \
-    --concurrency 64 --n-requests 128 --max-tokens 128 --steps 128 --block-length 32 --fixed-prompt
-```
-
-Raw output, Run A (`BATCH_MAX_SIZE=8`):
-
-```
-============================================================
-  LLaDA-MoE Throughput Benchmark
-============================================================
-  Backends:          1 (http://localhost:8000)
-  Requests:          128/128 succeeded
-  Concurrency:       64 (total, shared across backends)
-  max_tokens:        128  steps=128  block=32
-  Total wall time:   112.9s
-  Prompt tokens:     4352
-  Output tokens:     16256
-  Output tok/s:      144.0
-  Req/s:             1.13
-  Latency p50:       56.18s
-  Latency p95:       56.72s
-  Latency p99:       56.72s
-============================================================
-```
-
-Raw output, Run B (`BATCH_MAX_SIZE=64`):
-
-```
-============================================================
-  LLaDA-MoE Throughput Benchmark
-============================================================
-  Backends:          1 (http://localhost:8000)
-  Requests:          128/128 succeeded
-  Concurrency:       64 (total, shared across backends)
-  max_tokens:        128  steps=128  block=32
-  Total wall time:   81.5s
-  Prompt tokens:     4352
-  Output tokens:     16256
-  Output tok/s:      199.6
-  Req/s:             1.57
-  Latency p50:       36.89s
-  Latency p95:       44.56s
-  Latency p99:       52.01s
-============================================================
-```
-
-| Metric | `BATCH_MAX_SIZE=8` (old default) | `BATCH_MAX_SIZE=64` (new default) | Change |
-|---|---:|---:|---:|
-| Output tok/s | 144.0 | 199.6 | **+39%** |
-| Wall time (128 req) | 112.9s | 81.5s | −28% |
-| Latency p50 | 56.18s | 36.89s | **−34%** |
-| Latency p95 | 56.72s | 44.56s | −21% |
-| Latency p99 | 56.72s | 52.01s | −8% |
-
-Not a throughput/latency tradeoff — a win on both simultaneously. With `BATCH_MAX_SIZE=8`, 128 concurrent requests need 16 sequential batch rounds, so most requests queue behind many earlier rounds before starting at all (hence p50/p95/p99 all clustered near the tail, ~56s). With `BATCH_MAX_SIZE=64`, only 2 rounds are needed, so most requests start almost immediately. `BATCH_MAX_SIZE`'s default was changed from 8 to 64 in `src/server.py` based on this data.
-
-> **This measurement is A6000-specific (48 GB) and the resulting default does not port down.** On a 24 GB card, `BATCH_MAX_SIZE=48` kills the server outright and takes every in-flight request with it; the safe maximum is 32. See [Throughput vs Batch Size](#throughput-vs-batch-size-single-a40-24q-24-gb) for the measured curve, the failure boundary, and a sizing formula. The default remains 64 because it is correct on the hardware it was tuned for, but it should be set explicitly per deployment — nothing in the code derives it from available memory.
-
-#### Removing Dead Time Between Batches: Collector/Executor Pipelining
-
-The batching mechanism above still had a structural gap: the original single background thread (`_batch_worker`) called `generate_cached()` directly inside the same loop that collected requests. While one batch was generating — tens of seconds at production `gen_length` — a request arriving mid-batch got **zero** collection progress: it sat completely untouched in the pending queue until the *entire* current batch finished, then had to pay its own fresh `BATCH_WAIT_S` collection window on top of that. No overlap between batches at all.
-
-**Fix**: split the single worker into two threads connected by a queue. `_batch_collector` only forms batches (identical logic to before) and hands each one to `_ready_batches`; `_batch_executor` is the sole consumer — the only thread that ever calls `generate_cached()`, so GPU work still runs strictly one batch at a time, zero change to generation semantics or single-GPU serialization. What changes: the collector keeps accumulating and forming the *next* batch the entire time the executor is busy with the current one, so the next batch is usually already fully formed and ready the instant the executor finishes.
-
-**Validation**: added a `gap_since_prev_batch_end` field to the server's `[batch]` log line — the direct measurement of what this fix is meant to eliminate. Real concurrent load (`--concurrency 96 --n-requests 192`) produced 5 batches (41/55/41/3/52 — HTTP/thread-scheduling timing doesn't form clean, evenly-sized batches in practice) with these gaps between them:
-
-```
-[batch] size=41 ... gap_since_prev_batch_end=0.071s
-[batch] size=55 ... gap_since_prev_batch_end=0.002s
-[batch] size=41 ... gap_since_prev_batch_end=0.000s
-[batch] size=3  ... gap_since_prev_batch_end=0.000s
-[batch] size=52 ... gap_since_prev_batch_end=0.000s
-```
-
-Near-zero across every transition — the next batch was already formed and ready every time. (Aggregate client-side throughput turned out to be a poor way to validate this specific fix — the benchmark client's own concurrency semaphore only dispatches new requests once old ones return, which happens in synchronized bursts tied to batch completions, so it can't produce the kind of independent, staggered arrival pattern the fix actually targets. Measuring the gap directly from the server's own log sidesteps that confound entirely.)
-
-### Adaptive Decoding: Threshold-Based Token Selection
-
-A comparison against [SGLang's `--dllm-fdfo`](https://github.com/sgl-project/sglang) (First-Done-First-Out scheduling for diffusion LLMs) surfaced three gaps in this project's batching relative to that design:
-
-1. **Dead time between batches** — fixed above (collector/executor pipelining).
-2. **No confidence/threshold-based early stopping** — this project used a *uniform* fixed-step schedule (`get_num_transfer_tokens` divides each row's masked-token count evenly across every allotted step), so a block always takes the maximum configured number of steps regardless of how confident the model actually is.
-3. **True per-row FDFO** — splicing a brand-new, different-prompt request into a batch slot the instant an existing row's block finishes, mid-generation. This needs per-row independent KV-cache lifetime and per-row block boundaries instead of the current shared, batch-wide commit — a genuinely different architecture, closer to a multi-day rebuild of the batching layer than a fix, and it touches exactly the KV-cache logic that already caused a real accuracy bug once in this project (see Correctness Verification). Deliberately not attempted; scoped out as future work, not implemented here.
-
-Item 2 (and the batch-wide portion of item 3 — exiting early once an *entire* batch's block is already fully unmasked, with no per-row splicing) were implemented and validated, in two attempts.
-
-#### First attempt: naive per-position threshold — reverted
-
-The obvious implementation: at each step, reveal every currently-masked position whose confidence clears a threshold, instead of a fixed count, falling back to a row's single highest-confidence position when nothing qualifies (guaranteeing progress every step). Mechanism-tested thoroughly (CPU-only unit tests, an integration test proving the default path is provably unaffected and the threshold path never exceeds its step budget or leaves stray `MASK` tokens) and it worked correctly — but real evaluation told a different story:
-
-| Config | MMLU-Pro (n=50, seed=42) | Total time |
-|---|---:|---:|
-| Baseline (fixed schedule) | 36.0% (18/50) | 240.6s |
-| `confidence_threshold=0.9` (naive) | **24.0%** (12/50) | 169.5s |
-
-A third of correct answers lost, for only a 1.4x speedup — far below the 9.5x seen on an earlier trivial single-fact-completion prompt that turned out not to be representative of real generation. **Reverted.**
-
-**Why it failed, mechanistically**: at each step, the model predicts every masked position independently, with no knowledge of what the *other* positions will simultaneously become in that same step. Revealing every position that clears a threshold in one step — which can easily mean many tokens at once, since local per-position confidence reflects strong surface-level priors (common phrasing, grammar) even before the deeper logical content is worked out — locks in a burst of individually-plausible-but-jointly-uncoordinated tokens with no chance for the model to reconsider before the next step. The original fixed schedule's fine-grained, small-reveal-per-step approach (2 tokens/step on average at the CoT config used here) is effectively iterative self-consistency: each tiny commitment is followed by a fresh look at the updated context before the next one. Threshold decoding traded that away, and for long chain-of-thought reasoning chains, the compounding cost wasn't worth the speed.
-
-#### Second attempt: dInfer's `HierarchyDecoder` algorithm — validated, kept
-
-Rather than inventing a mitigation from scratch, checked whether [inclusionAI/dInfer](https://github.com/inclusionAI/dInfer) — the reference framework this project's GSM8K/BBH/CRUX-O eval config was already aligned to — had already solved this. It has: `dInfer/python/dinfer/decoding/parallel_strategy.py`'s simplest threshold decoder is mechanically equivalent to the naive attempt above (same default `threshold=0.9`, same model — its `SamplingParams` defaults use `mask_id=156895`, this exact model's `MASK_ID`) — but it also ships a `HierarchyDecoder`, whose own docstring says **"force separate decisions"**, directly addressing the failure mode just diagnosed.
-
-The algorithm, ported faithfully as `select_transfer_indices_hierarchy` (fully vectorized — segment IDs via cumsum, per-segment max via `scatter_reduce`; dInfer's own reference asserts batch size 1, generalized here to any batch size since the operations are already independent per row):
-
-1. At most **one** reveal per contiguous run of currently-masked positions (a "segment") — that segment's highest-confidence position. Instead of a free-for-all across the whole block, at most one decision per locally-correlated span per step.
-2. Segment picks are floored by `low_confidence_threshold` (default 0.4, matching dInfer) — a segment's pick doesn't count if even its best position isn't reasonably confident.
-3. Positions independently clearing `confidence_threshold` are unioned in regardless of the segment/floor gating (a genuinely confident position can still skip ahead), and the single globally highest-confidence position is always included unconditionally — guarantees progress every step.
-
-Re-validated on the identical benchmark:
-
-| Config | MMLU-Pro (n=50, seed=42) | Total time | Output tok/s* |
-|---|---:|---:|---:|
-| Baseline (fixed schedule) | 36.0% (18/50) | 240.6s | 53.2 |
-| Naive threshold=0.9 (reverted) | 24.0% (12/50) | 169.5s | 75.5 |
-| **`HierarchyDecoder`, threshold=0.9 (kept)** | **44.0%** (22/50) | 175.7s | **72.9** |
-
-<sub>*`max_tokens=256` is fixed and identical across all three runs (no EOS early-stopping in `generate_cached`), so tok/s = 256 × 50 ÷ total time is directly comparable.</sub>
-
-A win on **both** axes versus baseline at once — **+37% throughput and +8 accuracy points**, not a tradeoff — while keeping nearly all of the naive version's speed advantage (72.9 vs 75.5 tok/s) after fixing what made it unsafe. n=50 is a modest sample size, so treat this as a strong opt-in result rather than fully settled; it defaults to off (`confidence_threshold=None`) regardless.
-
-#### Failure mode on long generations: `steps_per_block` needs headroom relative to `block_length`
-
-The MMLU-Pro win above uses short completions (`max_tokens=256`, `block_length=32`, `steps_per_block=16`). Re-testing on GSM8K (`max_tokens=1024`, `block_length=64`, `steps_per_block=16` — same absolute step budget, twice the block width) surfaced a catastrophic regression: 0% accuracy, with generations collapsing into repeated tokens/phrases almost immediately.
-
-**Root cause**: `HierarchyDecoder`'s segment-based selection makes *organic* progress proportional to how many contiguous masked segments exist, and a block starts as a single giant segment (one reveal per step, by design, until enough gaps open it up). If `steps_per_block` is too small relative to `block_length`, most of the block never gets an individually-considered decision — it gets swept up by `_generate_block_cached`'s unconditional last-step force-reveal (`transfer_index = mask_index.clone()`), which reveals everything still masked in one uncoordinated shot. That is exactly the jointly-uncoordinated-reveal failure mode `HierarchyDecoder` exists to prevent, reintroduced by a different path. Confirmed by ruling out two other candidate mechanisms first (see below), then confirmed directly: doubling the step budget alone (`steps=512` instead of 256, same `block_length=64`, so `steps_per_block=32`) took a 10-question spot check from 0/10 to 9/10.
-
-That 9/10 turned out to be an optimistic small sample. Re-run at n=50/seed=42 with the same doubled-step config: **77.4% accuracy on the machine used for all testing up to that point** — a huge recovery from 0%, in line with the non-threshold baseline's ~82% (paper reference). (This particular run didn't finish all 50 questions -- the server process was interrupted partway through, after roughly 31 of 50 -- so treat this as a smaller-sample data point, not a clean n=50 result.) Re-run again, unchanged code/seed/config, after switching to a different single-GPU (A5000) machine: **88.0% accuracy (44/50)**, a clean full n=50 run — above the paper reference, with only one clear repetition case (`#39`) out of 50. So the ratio fix reliably prevents *catastrophic* collapse on both machines, but the exact accuracy is not hardware-portable and a low residual rate of repetition remains either way:
-
-| Config | Hardware | `block_length` | `steps_per_block` | ratio | Result |
-|---|---|---:|---:|---:|---|
-| MMLU-Pro | machine A | 32 | 16 | 0.5 | 44.0% acc (n=50, validated above) |
-| MMLU-Pro | A5000 | 32 | 16 | 0.5 | 36.0% acc (n=50) — same command/seed, different GPU |
-| GSM8K, original | machine A | 64 | 16 | 0.25 | **0% acc** — degenerate repetition on nearly every question |
-| GSM8K, doubled steps | machine A | 64 | 32 | 0.5 | **77.4% acc** (partial run, ~31/50 — superseded, see below) |
-| GSM8K, doubled steps | machine A (A40-24Q) | 64 | 32 | 0.5 | **88.0% acc** (44/50, clean n=50 re-run) |
-| GSM8K, doubled steps | A5000 | 64 | 32 | 0.5 | **88.0% acc** (n=50) — occasional repetition remains (~1-2/50) |
-
-**Cross-hardware variance — partially retracted for GSM8K.** The original claim here was that identical code, seed, and config produced different accuracy on different GPUs (MMLU-Pro 44%→36%, GSM8K ~77%→88%). A clean n=50 re-run of GSM8K on machine A (A40-24Q) scored **88.0% (44/50) — identical to the A5000's result**, so the GSM8K half of that claim was an artifact of the earlier run being interrupted at ~31/50, not a real hardware effect. Two further details reinforce this: question **#39 is the repetition failure on both machines**, the same question the A5000 run singled out; and the 88.0% survived a full MoE kernel retune (which changes `BLOCK_SIZE_K` and therefore the fp32 K-loop accumulation order) without moving at all.
-
-The MMLU-Pro variance (44%→36%) has **not** been re-tested and may still be real. The underlying mechanism remains plausible in general — `seed=42` controls Python/CPU-side RNG only, not GPU kernel floating-point arithmetic, and diffusion decoding can amplify a tiny per-step logit difference into a different token at a branch point. But GSM8K turned out to be far more reproducible across hardware than this section originally claimed, so treat the remaining variance claim as unverified rather than established.
-
-**Guideline, now documented in `generate_cached`'s docstring and enforced with a runtime warning: `confidence_threshold` needs `steps_per_block >= block_length / 2`.** Below that ratio, the last-step force-reveal does too much of the block's work at once and safety degrades toward the same failure the naive per-position threshold had. Above it, the failure becomes rare rather than universal — but "rare" is not "fixed"; treat `confidence_threshold` as a real accuracy/speed trade with a residual, unresolved tail risk on long generations, not a strictly-better default.
-
-**A second attempted fix, tried and reverted**: reasoned that the residual repetition might be a *different* mechanism — a locally-confident repetition loop forming mid-block, with no path to correct it before the forced last-step dump. Ported dInfer's `get_transfer_index_hierarchy_remask` as an opt-in `remask_threshold`: lets an already-revealed position be reverted to `MASK` and reconsidered if its confidence later drops. Thoroughly unit-tested (deterministic mock-model tests hand-tracing exact revert/revise sequences on the real small model) and tried on real GSM8K data twice:
-
-- At the *original*, unsafe ratio (0.25): no improvement, still 0/10.
-- At the *fixed*, safe ratio (0.5), giving remasking actual room to act: **made things categorically worse** — 0% accuracy (0/50), every generation collapsing into repeated-token garbage from question 1 onward, worse than plain hierarchy decoding at the same ratio (~77% on the same machine, see above).
-
-Likely mechanism: `select_transfer_indices_hierarchy`'s "always force the single highest-confidence selectable position" progress guarantee — needed so plain mask-filling never deadlocks — was also applied to the remask branch's selectable pool, which includes already-*decided* positions flagged shaky, not just genuinely-masked ones. When the global top-confidence position among that combined pool was a remask candidate rather than a still-masked one, it got unconditionally force-revised to the model's current top pick, bypassing `low_confidence_threshold` entirely. Combined with early-exit being disabled while remasking is active (so every block burns its full step budget), a block could spend many steps perpetually pulling already-settled positions back out of state and recommitting to new, often-barely-above-noise guesses — destroying the "reveal once, stay fixed" stability that made both the fixed schedule and plain hierarchy decoding work. Reverted entirely (not just defaulted off) rather than left in the codebase as a proven-harmful opt-in knob.
-
-#### Per-task results: not a uniform win
-
-Extending beyond MMLU-Pro/GSM8K to BBH, CRUX-O, and ARC-Challenge (all n=50, seed=42, default short-CoT config — `max_tokens=256`, `block_length=32`, `steps_per_block=16`, already at the safe 0.5 ratio) shows `confidence_threshold` is a genuine per-task trade, not a strictly-better default:
-
-| Task | Baseline | `confidence_threshold=0.9` | Δ |
-|---|---:|---:|---:|
-| BBH | 38.0% (19/50) | 42.0% (21/50) | +4.0 pts |
-| CRUX-O (cruxeval) | 18.0% (9/50) | 28.0% (14/50) | +10.0 pts |
-| ARC-Challenge | 88.0% (44/50) | 80.0% (40/50) | **-8.0 pts** |
-
-BBH and CRUX-O improve, matching the MMLU-Pro direction; ARC-Challenge regresses. A plausible reason: ARC-Challenge's baseline is already high (88%) — there's little room for the threshold path's coarser, faster reveals to help, and more room for it to lock in a wrong choice that the fixed schedule's finer-grained, more self-correcting reveals would have avoided. Combined with the cross-hardware variance above (same task, same everything else, different GPU alone moved MMLU-Pro 8 points), the overall conclusion is: `confidence_threshold` is worth evaluating per-task and per-deployment before enabling by default, not something to flip on globally based on one or two benchmark wins.
-
-**Config experiment, tried and reverted**: since the table above uses a short-CoT config (`max_tokens=256, block_length=32`) far below the paper's own `gen_length=1024, block_length=64` protocol (Section 4), BBH/CRUX-O/ARC-Challenge were switched to `max_tokens=1024, steps=256, block_length=64` to match it directly, on the theory this would make results more paper-comparable. Real evaluation showed the opposite — it made every one of these tasks worse except BBH (whose short answers never used the extra budget anyway):
-
-| Task | 256/32 config | 1024/64 config | Δ |
-|---|---:|---:|---:|
-| BBH baseline | 38.0% (19/50) | 38.0% (19/50) | 0 |
-| BBH + threshold | 42.0% (21/50) | 42.0% (21/50) | 0 |
-| CRUX-O baseline | 18.0% (9/50) | 14.0% (7/50) | -4.0 pts |
-| CRUX-O + threshold | 28.0% (14/50) | **4.0% (2/50)** | **-24.0 pts** |
-| ARC-Challenge baseline | 88.0% (44/50) | **60.0% (30/50)** | **-28.0 pts** |
-| ARC-Challenge + threshold | 80.0% (40/50) | **44.0% (22/50)** | **-36.0 pts** |
-
-Two separate mechanisms explain this: (1) for the `confidence_threshold` runs, `block_length=64` with `steps=256` gives `steps_per_block=16` — ratio 0.25, the same unsafe zone documented above that caused GSM8K's original collapse, striking CRUX-O the same way; (2) for the *baseline* runs, which shouldn't be vulnerable to that mechanism at all, `steps_per_block` stayed at 16 in both configs while `block_length` doubled — meaning roughly twice as many tokens get revealed per step (coarser granularity), undercutting the fixed schedule's fine-grained "iterative self-consistency" that the naive-threshold section above already identified as important, on top of simply giving a short-multiple-choice task 4x more room for its CoT to drift before the "Final Answer: X" line.
-
-The deeper lesson: the paper's `gen_length=1024, block_length=64` protocol is stated for its "generative benchmarks" specifically, and its MMLU-Pro-style numbers were almost certainly scored via log-likelihood over answer choices, not free-form generation at all — matching its generation-length knob doesn't make a fundamentally different scoring methodology (ours: generate CoT text, then extract via string search) more comparable to its results. **Reverted**: BBH, CRUX-O, and ARC-Challenge are back on the short `256/32` config (the numbers in the table above), which is what actually performs best under this harness.
-
-#### Prompting methodology vs dInfer's reference: chat-template, tried raw completion, kept chat-template
-
-A comparative code review against dInfer's actual eval config (`dInfer/evaluations/tasks/gsm8k/gsm8k-llada-moe.yaml`, Ant Group's own inference framework for this exact model) surfaced a structural difference: dInfer's reference feeds GSM8K as **raw few-shot text completion** — `doc_to_text: "Question: {{question}}\nPlease reason step by step\nAnswer:"`, no chat template, no system message, `generation_kwargs.until: ["Question:", "</s>", "<|im_end|>"]` for stopping — the classic lm-eval-harness pattern. This project's correctness harness instead sends the same few-shot text through the Instruct model's chat template (`apply_chat_template`) plus an added system-prompt instruction. The working hypothesis was that this mismatch explained the recurring markdown/chat-style noise in transcripts throughout this investigation (`**52**.`, `$$`, `The answer is **138**.`) and that switching to raw completion would reduce it and close some of the gap to the paper's 82.41%.
-
-Real evaluation disproved the hypothesis. A `/v1/completions` endpoint (`src/server.py`'s `CompletionRequest` — tokenizes the prompt directly, no chat template, with client-side stop-sequence truncation) and a `--raw-completion` flag on `run_math_reasoning_code.py` were added specifically to A/B this, holding task/seed/limit/config identical:
-
-| Prompting mode | GSM8K (n=50, seed=42) |
-|---|---:|
-| Chat-template (existing default) | **68.0%** (34/50) |
-| Raw completion (dInfer's actual format) | **58.0%** (29/50) |
-
-Raw completion scored 10 points *worse*, with visibly more frequent degenerate-repetition collapses in the transcripts, not fewer. Likely explanation: this is the **Instruct** (SFT'd) checkpoint, fine-tuned specifically on chat-formatted conversations — feeding it dInfer's raw-completion format (closer to what its *base* pretraining distribution looked like) is arguably more out-of-distribution for this specific checkpoint than the chat template it was actually tuned to expect, and that distribution shift outweighs whatever benefit avoiding chat-markdown-noise might have provided. dInfer's yaml tells us the convention its own harness follows (and how the paper's Table 3 number was plausibly produced) — it doesn't mean that convention is more reliable for this checkpoint when driven through a different, independently-built harness.
-
-**Kept as an opt-in diagnostic, not adopted as the default**: `--raw-completion` and `/v1/completions` remain in the codebase (real, working, useful for future A/B checks — e.g. on other tasks, or if the underlying repetition issue gets further reduced) but `run_math_reasoning_code.py`/`run_correctness.py` continue to default to the chat-template path, since it empirically performs better for this checkpoint under this harness.
-
-#### Recommended configuration: correctness is won at the decoding layer, not the kernel layer
-
-After the kernel-level investigation closed (see Correctness Verification: the ~6pt fixed-schedule gap vs HF is inherent numerical sensitivity, not fixable), a systematic decoding-config comparison on GSM8K (all n=50, seed=42, same machine, chat-templated) showed where the real correctness headroom lives:
+GSM8K, n=50, seed 42, chat-templated:
 
 | Config | Accuracy | s/question |
 |---|---:|---:|
-| HF reference, fixed schedule, steps=256 | 74.0% | ~101 |
-| `model_update`, fixed schedule, steps=256 | 68.0% | 17.6 |
 | HF reference, fixed schedule, steps=512 | 82.0% | 212.2 |
 | `model_update`, fixed schedule, steps=512 | 76.0% | 33.8 |
-| `model_update`, threshold=0.76/low=0.62 (dInfer's own tuned values), steps=512 | 76.0% | 8.0 |
 | **`model_update`, threshold=0.9/low=0.4, steps=512** | **88.0%** | **8.6** |
-| **`model_update`, same config, after the SiLU epilogue + `lm_head` + retune** | **88.0%** | **6.1** |
+| same, after the SiLU epilogue + `lm_head` + retune | 88.0% | **6.1** |
 
-> The last row re-runs the identical command after the optimizations in this document landed: accuracy held exactly (44/50), while per-question time dropped from 8.6 s to **6.1 s** (−29%), matching the microbenchmark's −27.5%.
+> **`steps_per_block >= block_length / 2` is mandatory when a threshold is set.** At ratio 0.25 generation collapses into degenerate repetition (0% accuracy); at 0.5 it recovers fully. A runtime warning fires below the guideline. A `remask_threshold` mechanism was tried for the residual repetition and made things categorically worse (0%) — reverted.
 
-> **Caveat on the absolute number.** `_grade_gsm8k` falls back to "the last number anywhere in the raw response" when the extracted answer span contains no digits (`eval/correctness/run_math_reasoning_code.py`, added to handle `Final Answer:` followed by a multi-line LaTeX block). For a chain-of-thought answer that is usually the result, but it is a permissive rule: in the 44/50 run, **3 correct answers rest on it** (questions where the displayed extraction was `'The'`, `'$$'`, `'**'`). Since the same grader scores the HF reference rows, comparisons *within* this table remain valid — but the "+5.59 pts vs the paper's 82.41%" claim is softer than it looks, because the paper's grader is unlikely to be this lenient.
+> `_grade_gsm8k` falls back to "last number anywhere in the response" when the extracted span has no digits; 3 of 44 correct answers in one run rest on that fallback. Comparisons *within* this harness hold; the margin over the paper's 82.41% is softer than it looks.
 
-Three conclusions from the full matrix:
+---
 
-1. **HF at steps=512 lands within 0.41pts of the paper's 82.41%** — which validates this project's eval harness end-to-end (chat-template prompting, answer extraction, grading): the reference model plus a sufficient step budget reproduces the published number almost exactly, resolving the earlier "our methodology may not be paper-comparable" caveat for GSM8K.
-2. **The fixed-schedule gap vs HF is a consistent −6pts at both step budgets** (68 vs 74 at steps=256; 76 vs 82 at steps=512) — a second, independent confirmation of the Correctness Verification finding that this offset is a stable, inherent numerical property, not noise.
-3. **The recommended config — `confidence_threshold=0.9, low_confidence_threshold=0.4`, with `steps_per_block >= block_length / 2`** (here steps=512 at block_length=64/max_tokens=1024) — beats HF's best fixed-schedule result by **+6.0pts at 24.7x the speed** (8.6 vs 212.2 s/q), and exceeds the paper's 82.41% by +5.6pts. The +12pt decoding-layer win (76%→88%) more than recovers the −6pt kernel-layer loss. It is fast *because* of the accuracy mechanism, not despite it: the step budget is a ceiling, not a floor — hierarchy decoding early-exits each block once every position is confidently revealed, so it uses far fewer forward passes than the fixed schedule, which always spends its full budget by construction. The 88.0% (44/50) reproduced exactly (same questions right and wrong) across two separate runs — deterministic on a given machine, not a lucky sample.
+## Multi-GPU
 
-Decomposition: more steps alone moved the fixed schedule 68%→76% (+8pts, at 2x the time, and similarly 74%→82% for HF); the hierarchy-threshold algorithm on top adds 76%→88% (+12pts) while *cutting* time 4x. The ~25x end-to-end speed ratio vs HF decomposes into three separately-measured factors: engine implementation (~2x: Triton fused MoE + lean loop vs HF eager), block-wise KV caching (~3.3x: the ~1500-token prompt is computed once, not on every one of 512 steps), and early exit (~3.9x: roughly a quarter of the step budget actually used). Also tested and rejected: dInfer's own eval-script threshold values (`threshold=0.76, low_threshold=0.62`, from `eval_llada_moe.sh`) — 12 points worse than 0.9/0.4 here at near-identical speed; their tuning is for their own engine (dual cache, different iteration mechanics) and does not transfer to this stack.
-
-**Usage:**
+**Use data parallelism, not tensor parallelism, for throughput.** `src/server.py` disables request batching whenever `tp_size > 1` — above one rank every request serializes through `request_lock`, so TP=8 delivers roughly an eighth of what the hardware can do. The model is ~14 GiB against an 80 GiB H100, so there is no capacity reason to shard it either.
 
 ```bash
-# Benchmark: compare with/without threshold decoding directly
-python eval/check_time_inference.py --mode optimized --gen-length 128 --steps 128 --block-length 32
-python eval/check_time_inference.py --mode optimized --gen-length 128 --steps 128 --block-length 32 --confidence-threshold 0.9
-
-# Accuracy check (the one that matters -- always re-run this after touching decoding logic)
-python -m eval.correctness.run_correctness --task mmlu_pro --seed 42 --limit 50
-python -m eval.correctness.run_correctness --task mmlu_pro --seed 42 --limit 50 --confidence-threshold 0.9
-
-# Via the API server (fast_dense/single-GPU path only; opt-in per request)
-curl http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model": "inclusionAI/LLaDA-MoE-7B-A1B-Instruct", "messages": [{"role": "user", "content": "..."}], "confidence_threshold": 0.9}'
+bash start_dp.sh --gpus 8 --weight-dir weights          # one replica per GPU + router
+bash start_dp.sh --gpus 8 --quantize int8
 ```
+
+`src/router.py` routes **least-outstanding**, not round-robin: a replica runs a whole batch to completion, so one that just accepted 32 requests is busy for ~35 s while an idle one answers immediately. Unhealthy replicas leave rotation and are retried in the background. `GET /v1/replicas` shows live per-replica load.
+
+TP+EP remains available (`start.sh --tp-size N`) and is the right choice for **single-request latency** only: 2× A6000 measured 6.15× vs a single-GPU baseline at 128 tokens.
 
 ---
 
 ## Getting Started
 
-### Prerequisites
-
-- Python 3.10+
-- CUDA-capable GPU (for Triton fused MoE; CPU fallback available)
-- ~15 GB disk space for model weights
-
-### Installation
-
 ```bash
-# Option 1: Automated setup (creates venv, installs deps, downloads weights)
-bash setup.sh
-
-# Option 2: Manual setup
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-python download_weights.py --dest weights
+bash setup.sh                                        # venv + torch 2.5.1 + ~15 GB weights
+python tuning_fused_moe_triton.py --model FULL_CFG   # do not skip
+bash start.sh --backend fast_dense --weight-dir weights
 ```
 
-### Quick Start
+Requires an NVIDIA GPU with Triton, ≥24 GB VRAM (bf16), CUDA 12.x, `transformers==4.53.2` (5.x removed `ROPE_INIT_FUNCTIONS['default']`, which this model needs).
 
 ```bash
-# 1. (Optional but recommended) Tune the Triton kernel for your GPU
-python tuning_fused_moe_triton.py --model FULL_CFG
+# benchmark
+python -m eval.check_time_inference --weight-dir weights --mode both
 
-# 2. Run the inference time benchmark
-python eval/check_time_inference.py --weight-dir weights
+# throughput
+python -m eval.throughput.run_throughput --base-url http://localhost:8000 \
+    --concurrency 32 --n-requests 96 --max-tokens 128 --steps 128 --block-length 32
 
-# 3. Start the OpenAI-compatible API server
-bash start.sh --weight-dir ./weights
+# accuracy
+python -m eval.correctness.run_math_reasoning_code --task gsm8k \
+    --limit 50 --seed 42 --max-tokens 1024 --steps 512 --block-length 64 \
+    --confidence-threshold 0.9 --low-confidence-threshold 0.4
 ```
 
----
-
-## Usage
-
-### Inference Time Benchmark
-
-Compare baseline vs optimized model (both run the model's native static top-8 routing):
-
-```bash
-python eval/check_time_inference.py --weight-dir weights                  # both models
-python eval/check_time_inference.py --weight-dir weights --mode optimized  # skip baseline
-```
-
-**Options:**
-
-| Flag | Default | Description |
-|---|---|---|
-| `--weight-dir` | `weights` | Path to model weight files |
-| `--gen-length` | `32` | Number of tokens to generate |
-| `--steps` | `32` | Number of denoising steps |
-| `--block-length` | `16` | Block size for KV caching |
-| `--num-warmup` | `1` | Warmup iterations (excluded from timing) |
-| `--num-runs` | `3` | Timed benchmark iterations |
-| `--device` | `cuda:0` | Device (falls back to `cpu` if CUDA unavailable) |
-| `--mode` | `both` | `both`, `baseline`, or `optimized` |
-
-### API Server
-
-```bash
-bash start.sh --weight-dir ./weights --port 8000
-```
-
-Compatible with OpenAI chat completions API:
-
-```bash
-curl http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "inclusionAI/LLaDA-MoE-7B-A1B-Instruct",
-    "messages": [{"role": "user", "content": "What is 2+2?"}],
-    "max_tokens": 128,
-    "temperature": 0.0
-  }'
-```
-
-### Evaluation Suite
-
-```bash
-python diagnose_speedup.py                          # GPU/config/kernel diagnostic
-python eval/check_time_inference.py --weight-dir ./weights  # end-to-end benchmark
-python compare_models.py --weight-dir ./weights     # logit comparison vs HF reference
-python -m eval.check_server                         # server smoke test
-python -m eval.correctness.run_correctness          # MMLU accuracy (200 problems)
-python -m eval.throughput.run_throughput            # concurrent request throughput
-```
+The server is OpenAI-compatible (`/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/v1/quantization`).
 
 ---
 
 ## Project Structure
 
 ```
-.
-├── src/                                    ← Baseline implementation
-│   ├── model.py                            Dense model (unfused MoE, no KV cache, top-8)
-│   ├── model_small.py                      ~195M scaled-down variant (same architecture)
-│   ├── generate.py                         Masked diffusion decode loop
-│   └── server.py                           OpenAI-compatible API server
-│
-├── model_update/                           ← Optimized implementation
-│   ├── model.py                            KV-cached model, static top-8 routing
-│   ├── generate.py                         Block-wise KV-cached generation loop
-│   ├── fused_moe_triton.py                 Triton grouped-GEMM kernel + dynamic config loader
-│   └── distributed.py                      Distributed process group helpers + TP-aware weight loader
-│
-├── eval/                                   ← Evaluation & benchmarks
-│   ├── check_time_inference.py             Baseline vs optimized speedup benchmark (--batch-size, --mode, ...)
-│   ├── benchmark_compare.sh                Wraps check_time_inference.py for the baseline-vs-TP/EP comparison
-│   ├── time_fraction.py                    Attention vs MoE FFN timing breakdown
-│   ├── check_server.py                     Server health check + smoke test
-│   ├── diagnose_cache_vs_dense.py          Correctness: cached vs dense generation, side by side, on known-collapse questions
-│   ├── diagnose_step_divergence.py         Step-by-step cached-vs-dense divergence tracer (follow-up to the above)
-│   ├── profile_kv_concat.py                Isolates KV-cache torch.cat cost vs attention math cost
-│   ├── profile_kernel_occupancy.sh         Nsight Compute (ncu) wrapper: occupancy/memory-bandwidth/warp-stall profiling
-│   ├── test_moe_align_block_size.py        Regression test: vectorized MoE token-alignment vs a frozen reference
-│   ├── test_num_logits_slice.py            Regression test: narrowed lm_head vs a frozen copy of the pre-change loop
-│   ├── test_fused_silu_epilogue.py         Regression test + benchmark: fused SiLU epilogue vs the unfused path
-│   ├── test_select_transfer_indices.py     Regression test: vectorized per-row top-k selection vs a frozen reference
-│   ├── correctness/
-│   │   ├── run_correctness.py              MMLU / MMLU-Pro accuracy evaluation
-│   │   ├── run_math_reasoning_code.py      GSM8K / BBH / CRUX-O evaluation (aligned to inclusionAI/dInfer's config)
-│   │   ├── diagnose_humaneval.py           One-off diagnostic for a HumanEval pass@1=0 root cause
-│   │   └── analyze_length_vs_gap.py        Tests the block-commit-staleness hypothesis for the residual HF accuracy gap
-│   └── throughput/
-│       └── run_throughput.py               Concurrent request throughput benchmark
-│
-├── tuning_fused_moe_triton.py              End-to-end aware Triton MoE autotuner
-├── moe_tune_config.json                    GPU-specific tuned kernel configs (generated)
-├── diagnose_speedup.py                     GPU environment + config + kernel diagnostic
-├── compare_models.py                       Logit + generation comparison vs HF reference
-├── benchmark_fused_moe.py                  Fused vs unfused MoE speedup benchmark
-├── download_weights.py                     Download weights from HuggingFace Hub
-├── requirements.txt                        Python dependencies (torch, triton, transformers, ...)
-├── setup.sh                                One-shot environment setup script
-├── start.sh                                Start inference server
-├── run_all_benchmarks.sh                   Runs the full benchmark suite in one pass
-├── INVESTIGATION_LOG.md                    Full record of correctness/accuracy investigations (see Correctness Verification)
-└── README.md
+src/                        reference implementation + server + DP router
+  model.py  generate.py     unoptimized baseline (batch dimension hardcoded to 1)
+  server.py                 OpenAI-compatible API, request batching, --quantize
+  router.py                 data-parallel router (least-outstanding)
+model_update/               the optimized engine
+  model.py                  KV cache, RoPE, attention, fused MoE block
+  generate.py               block-wise cached diffusion decoding
+  fused_moe_triton.py       grouped-GEMM MoE kernel + SiLU epilogue + autotune loader
+  fused_ops.py              fused RMSNorm and decode tail
+  distributed.py            TP/EP helpers and weight loading
+eval/                       benchmarks, regression tests, diagnostics
+  correctness/              GSM8K / BBH / CRUX-O / MMLU-Pro harnesses
+  throughput/               concurrent-request benchmark
+tuning_fused_moe_triton.py  end-to-end-aware MoE autotuner
+start.sh  start_dp.sh       single-GPU and data-parallel launchers
 ```
-
-Not shown above: a handful of one-off dev-utility scripts (`fused_moe_triton_raw.py`, `download_vllm.py`, `patch_nvtx.py`) that exist for reference/diffing rather than as part of the maintained workflow.
 
 ---
 
 ## Dependencies
 
-Key dependencies (see `requirements.txt` for full list):
-
-| Package | Version | Purpose |
-|---|---|---|
-| `torch` | ≥ 2.0.0 | Core deep learning framework |
-| `triton` | ≥ 2.1.0 | Fused MoE Triton kernel |
-| `transformers` | == 4.53.2 | Tokenizer & config loading |
-| `safetensors` | latest | Weight file format |
-| `fastapi` + `uvicorn` | latest | API server |
-
-> ⚠️ **transformers 5.x is not supported** — it removed `ROPE_INIT_FUNCTIONS['default']` which this model relies on.
+`torch>=2.0` (tested 2.5.1), `triton>=2.1`, `transformers==4.53.2`, `safetensors`, `fastapi`, `uvicorn`, `aiohttp`, `lm-eval[api]>=0.4.4`. Full list in `requirements.txt`. `LLaDA_Quant` is optional and deliberately not listed.
