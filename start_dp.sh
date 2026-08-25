@@ -129,4 +129,11 @@ done
 echo ""
 echo "All replicas up. Starting router..."
 echo ""
-exec "$PY" -m src.router --backends "$BACKENDS" --port "$PORT" --host 0.0.0.0
+# NOT exec: exec would replace this shell and discard the EXIT/INT trap above,
+# so killing the router would orphan every replica -- N processes still holding
+# N GPUs, with nothing left to explain why they are busy. Running it as a child
+# keeps the trap, so Ctrl-C really does take the whole deployment down.
+"$PY" -m src.router --backends "$BACKENDS" --port "$PORT" --host 0.0.0.0 &
+ROUTER_PID=$!
+PIDS+=("$ROUTER_PID")
+wait "$ROUTER_PID"
