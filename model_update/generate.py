@@ -257,13 +257,28 @@ def _generate_block_cached(
             attn_mask=None if pad_mask is None else pad_mask[..., :x.shape[1]],
         )
 
-        logits_with_noise = add_gumbel_noise(logits, temperature)
-        x0_raw = logits_with_noise.argmax(dim=-1)  # the model's own top pick at EVERY position, unmodified
+        # Fused tail: one pass over the bf16 logits yields both the argmax and
+        # its softmax probability, replacing a full fp32 copy, a
+        # 157k-wide softmax and a gather. Only valid at temperature 0, where
+        # add_gumbel_noise is the identity -- with noise the argmax is taken
+        # over perturbed logits and the two are no longer the same quantity.
+        _fused_tail = False
+        if remasking == "low_confidence" and temperature == 0 and logits.is_cuda:
+            from .fused_ops import FUSE_DECODE, HAS_TRITON, fused_decode_tail
+            if FUSE_DECODE and HAS_TRITON:
+                x0_raw, x0_p = fused_decode_tail(logits)
+                _fused_tail = True
 
-        if remasking == "low_confidence":
+        if _fused_tail:
+            pass
+        elif remasking == "low_confidence":
+            logits_with_noise = add_gumbel_noise(logits, temperature)
+            x0_raw = logits_with_noise.argmax(dim=-1)
             p = F.softmax(logits.float(), dim=-1)
             x0_p = p.gather(-1, x0_raw.unsqueeze(-1)).squeeze(-1)  # confidence of x0_raw at EVERY position
         elif remasking == "random":
+            logits_with_noise = add_gumbel_noise(logits, temperature)
+            x0_raw = logits_with_noise.argmax(dim=-1)  # the model's own top pick at EVERY position, unmodified
             x0_p = torch.rand(x0_raw.shape, device=device)
         else:
             raise ValueError(f"Unknown remasking: {remasking}")

@@ -166,6 +166,17 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
+        # Flattened to 2-D so the layer norms ([B, T, H]) fuse too, not just
+        # q_norm/k_norm which callers already reshape. Normalisation is
+        # per-row over the last axis, so flattening the leading dims changes
+        # nothing about what is computed.
+        if x.is_cuda and x.shape[-1] == self.weight.shape[0]:
+            from .fused_ops import FUSE_RMSNORM, HAS_TRITON, fused_rmsnorm
+            if FUSE_RMSNORM and HAS_TRITON:
+                shape = x.shape
+                out = fused_rmsnorm(x.reshape(-1, shape[-1]).contiguous(),
+                                    self.weight, self.eps)
+                return out.view(shape)
         dtype = x.dtype
         x = x.float()
         x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
@@ -240,6 +251,29 @@ class Attention(nn.Module):
         self.o_proj = nn.Linear(self.NH_local * HD, H, bias=False)
         self.q_norm = RMSNorm(HD, cfg.EPS)
         self.k_norm = RMSNorm(HD, cfg.EPS)
+    def _project_qkv(self, x):
+        """Three separate GEMMs, deliberately.
+
+        Concatenating q/k/v into one projection was implemented and MEASURED,
+        then dropped. On an A6000 at FULL_CFG, one GEMM vs three:
+
+            M=32    1.62x faster    (not bit-exact, rel 8.3e-05)
+            M=256   0.99x           (not bit-exact, rel 2.7e-03)
+            M=1024  0.96x SLOWER    (bit-exact)
+            M=2048  1.17x faster    (bit-exact)
+
+        This engine runs at M = batch x suffix_length, so batch 32 with
+        block_length 32 sits at M~1024 -- exactly where fusing is a slowdown.
+        The only clear win is M=32, below the range it operates in, and M=256
+        pays a 2.7e-03 relative difference for nothing. cuBLAS evidently picks
+        a better kernel for the three narrower shapes than for the wide one at
+        these sizes.
+
+        See eval/test_fusions.py, which still measures this if the question
+        comes up again on different hardware -- the answer is shape- and
+        cuBLAS-dependent, not universal.
+        """
+        return self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
     def forward(
         self, x, cos, sin,
@@ -263,9 +297,10 @@ class Attention(nn.Module):
         cfg = self.cfg
         B, Ta, _ = x.shape
 
-        q = self.q_proj(x).view(B, Ta, self.NH_local, cfg.HD)
-        k = self.k_proj(x).view(B, Ta, self.KVH_local, cfg.HD)
-        v = self.v_proj(x).view(B, Ta, self.KVH_local, cfg.HD)
+        q, k, v = self._project_qkv(x)
+        q = q.reshape(B, Ta, self.NH_local, cfg.HD)
+        k = k.reshape(B, Ta, self.KVH_local, cfg.HD)
+        v = v.reshape(B, Ta, self.KVH_local, cfg.HD)
 
         q = self.q_norm(q.reshape(-1, cfg.HD)).reshape(B, Ta, self.NH_local, cfg.HD)
         k = self.k_norm(k.reshape(-1, cfg.HD)).reshape(B, Ta, self.KVH_local, cfg.HD)
