@@ -28,7 +28,7 @@ It is masked-diffusion decoding drawn literally, which is what this engine does.
 | File | Use |
 |---|---|
 | `dminfr-mark.svg` | Primary. Full lattice, all states. Dark backgrounds, ≥48px |
-| `dminfr-mark-inline.svg` | Primary, padded below so it optically centres beside `<h1>` type. `height="60"` |
+| `dminfr-mark-inline.svg` | Compact, padded below so it optically centres beside `<h1>` type. `height="58"` |
 | `dminfr-mark-compact.svg` | Solid silhouette, two flow tokens. 48px → 28px |
 | `dminfr-mark-micro.svg` | 4×5 closed bowl, one flow token. Favicon, paper headers, <28px |
 | `dminfr-mark-mono.svg` | Monochrome primary — papers, single-colour print |
@@ -39,8 +39,12 @@ It is masked-diffusion decoding drawn literally, which is what this engine does.
 `valign`, so an `<img>` inside a heading can only sit on the text baseline —
 which lines the mark's bottom edge up with the type's bottom edge and makes the
 wordmark look like it is hanging off the corner. The `-inline` cut carries empty
-space below the lattice instead, so the mark centres against the cap height. It
-is the same 47 tokens as the primary; only the viewBox differs.
+space below the lattice instead, so the mark centres against the cap height.
+
+It is cut from `compact`, not `primary`, for the reason the size ladder gives: a
+README header renders the mark at roughly 46px, and at that size the full
+lattice's masked field — 26%-opacity outlines — reads as grey static instead of
+a letter. The solid silhouette reads as a **D** instantly.
 
 The `-mono` files paint with `currentColor`, so inlined in HTML they inherit
 the surrounding text colour. Referenced through `<img src>` they fall back to

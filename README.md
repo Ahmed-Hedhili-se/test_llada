@@ -1,4 +1,4 @@
-<h1 align="center"><img src="assets/logo/dminfr-mark-inline.svg" alt="" height="60" hspace="8">DMInfr</h1>
+<h1 align="center"><img src="assets/logo/dminfr-mark-inline.svg" alt="" height="58" hspace="14">DMInfr</h1>
 
 Self-contained PyTorch reimplementation of [inclusionAI/LLaDA-MoE-7B-A1B-Instruct](https://huggingface.co/inclusionAI/LLaDA-MoE-7B-A1B-Instruct), a masked-diffusion LLM. Triton fused MoE, block-wise KV caching, fused RMSNorm/decode kernels, variable-length batching, an OpenAI-compatible server, a data-parallel router, and an end-to-end-aware autotuner.
 

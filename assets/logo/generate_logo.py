@@ -221,14 +221,18 @@ def build_inline(source: str, visible_px: float, cap_px: float = H1_CAP_PX):
                          'viewBox="0 0 %s %s"' % (vb.group(1), total))
     out = re.sub(r'width="[\d.]+" height="[\d.]+"',
                  'width="%s" height="%s"' % (w, total), out, count=1)
-    out = out.replace("(primary)", "(inline)")
+    out = out.replace("(compact)", "(inline)")
     return out, round(visible_px + below_px, 1)
 
 
 def main() -> int:
     here = os.path.dirname(os.path.abspath(__file__))
     primary = build_full()
-    inline, inline_h = build_inline(primary, visible_px=48.0)
+    # The inline cut is built from `compact`, not `primary`. At the ~48px a
+    # README header gives it, the full lattice's masked field (26% outlines)
+    # reads as grey static rather than a letter -- which is the whole reason
+    # the compact silhouette exists. See the size ladder in README.md.
+    inline, inline_h = build_inline(build_full(solid=True), visible_px=46.0)
     files = {
         "dminfr-mark.svg": primary,
         "dminfr-mark-inline.svg": inline,
