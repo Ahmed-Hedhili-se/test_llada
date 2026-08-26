@@ -1,11 +1,6 @@
-<img src="assets/logo/dminfr-mark.svg" alt="DMInfr" width="82" align="left" hspace="20" vspace="4">
+<img src="assets/logo/dminfr-mark.svg" alt="DMInfr" width="76" vspace="6">
 
 # DMInfr
-
-**Optimized inference for LLaDA-MoE-7B-A1B-Instruct.**
-DM — diffusion model · Infr — infrastructure.
-
-<br clear="left">
 
 Self-contained PyTorch reimplementation of [inclusionAI/LLaDA-MoE-7B-A1B-Instruct](https://huggingface.co/inclusionAI/LLaDA-MoE-7B-A1B-Instruct), a masked-diffusion LLM. Triton fused MoE, block-wise KV caching, fused RMSNorm/decode kernels, variable-length batching, an OpenAI-compatible server, a data-parallel router, and an end-to-end-aware autotuner.
 
