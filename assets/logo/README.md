@@ -28,11 +28,19 @@ It is masked-diffusion decoding drawn literally, which is what this engine does.
 | File | Use |
 |---|---|
 | `dminfr-mark.svg` | Primary. Full lattice, all states. Dark backgrounds, ≥48px |
+| `dminfr-mark-inline.svg` | Primary, padded below so it optically centres beside `<h1>` type. `height="60"` |
 | `dminfr-mark-compact.svg` | Solid silhouette, two flow tokens. 48px → 28px |
 | `dminfr-mark-micro.svg` | 4×5 closed bowl, one flow token. Favicon, paper headers, <28px |
 | `dminfr-mark-mono.svg` | Monochrome primary — papers, single-colour print |
 | `dminfr-mark-micro-mono.svg` | Monochrome micro |
 | `generate_logo.py` | Regenerates all of the above |
+
+`-inline` exists because GitHub's markdown sanitizer strips `style` and
+`valign`, so an `<img>` inside a heading can only sit on the text baseline —
+which lines the mark's bottom edge up with the type's bottom edge and makes the
+wordmark look like it is hanging off the corner. The `-inline` cut carries empty
+space below the lattice instead, so the mark centres against the cap height. It
+is the same 47 tokens as the primary; only the viewBox differs.
 
 The `-mono` files paint with `currentColor`, so inlined in HTML they inherit
 the surrounding text colour. Referenced through `<img src>` they fall back to

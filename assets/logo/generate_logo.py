@@ -23,6 +23,7 @@ Run:  python assets/logo/generate_logo.py
 from __future__ import annotations
 
 import os
+import re
 
 # --- the lattice, verbatim from DMInfrMark.dc.html -------------------------
 
@@ -189,10 +190,48 @@ def _svg(w: float, h: float, body: list, title: str) -> str:
     )
 
 
+# --- inline lockup ---------------------------------------------------------
+# GitHub's markdown sanitizer strips `style` and `valign`, so an <img> placed
+# inside an <h1> can only sit on the text baseline: the mark's bottom edge and
+# the wordmark's bottom edge line up, and the type appears to hang off the
+# lower corner of the logo. No attribute GitHub allows will fix that.
+#
+# So bake the offset into the file. The `-inline` cut carries empty space below
+# the lattice, sized so that when rendered at the height this script prints,
+# the mark's optical centre lands on the wordmark's cap centre.
+#
+#   GitHub's h1 is 2em = 32px, cap height ~= 0.72em ~= 23px above the baseline.
+#   For a mark V px tall, (V - cap)/2 of it has to fall *below* the baseline --
+#   which is exactly how much empty space the file needs at its bottom edge.
+
+#: Cap height of GitHub's <h1>, in px. See above.
+H1_CAP_PX = 23.0
+
+
+def build_inline(source: str, visible_px: float, cap_px: float = H1_CAP_PX):
+    """Baseline-compensate `source`. Returns (svg, render_height_px)."""
+    vb = re.search(r'viewBox="0 0 ([\d.]+) ([\d.]+)"', source)
+    w, h = float(vb.group(1)), float(vb.group(2))
+
+    below_px = (visible_px - cap_px) / 2   # mark height that must sit below the baseline
+    pad = below_px * (h / visible_px)      # the same distance, in viewBox units
+    total = round(h + pad, 2)
+
+    out = source.replace('viewBox="0 0 %s %s"' % (vb.group(1), vb.group(2)),
+                         'viewBox="0 0 %s %s"' % (vb.group(1), total))
+    out = re.sub(r'width="[\d.]+" height="[\d.]+"',
+                 'width="%s" height="%s"' % (w, total), out, count=1)
+    out = out.replace("(primary)", "(inline)")
+    return out, round(visible_px + below_px, 1)
+
+
 def main() -> int:
     here = os.path.dirname(os.path.abspath(__file__))
+    primary = build_full()
+    inline, inline_h = build_inline(primary, visible_px=48.0)
     files = {
-        "dminfr-mark.svg": build_full(),
+        "dminfr-mark.svg": primary,
+        "dminfr-mark-inline.svg": inline,
         "dminfr-mark-mono.svg": build_full(mono=True),
         "dminfr-mark-compact.svg": build_full(solid=True),
         "dminfr-mark-micro.svg": build_micro(),
@@ -203,6 +242,8 @@ def main() -> int:
         with open(path, "w", encoding="utf-8", newline="\n") as f:
             f.write(svg)
         print(f"  wrote {name:30s} {len(svg):5d} bytes")
+    print()
+    print(f'  dminfr-mark-inline.svg -> height="{inline_h:.0f}" inside a GitHub <h1>')
     return 0
 
 
