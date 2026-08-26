@@ -1,0 +1,79 @@
+# DMInfr — identity
+
+**DM** — diffusion model · **Infr** — infrastructure.
+
+The mark is an 8×10 token lattice shaped as a **D**. Density rises along the
+diagonal: the upper-left field stays masked — three tokens are deliberately
+absent — while the lower-right silhouette commits to full ink. Inside the
+counter, four tokens step from a small violet seed to a full blue block: a
+sequence being unmasked, not an arrow.
+
+It is masked-diffusion decoding drawn literally, which is what this engine does.
+
+```
+   .  _  .  .  -              .   masked      outline only, undecided
+   .  .  .  _  -  -           -   transitioning   violet, prediction in flight
+   .  _        +  +           +   resolving   blue-leaning white
+   .  .  1        +  #        #   resolved    committed token, full ink
+   .  -     2     +  #        _   absent      still masked
+   -  -        3  #  #      1-4   flow        violet -> blue, growing
+   -  -           4  #  #
+   -  -        #  #
+   -  +  +  +  #  #
+   -  +  +  +  #
+```
+
+## Files
+
+| File | Use |
+|---|---|
+| `dminfr-mark.svg` | Primary. Full lattice, all states. Dark backgrounds, ≥48px |
+| `dminfr-mark-compact.svg` | Solid silhouette, two flow tokens. 48px → 28px |
+| `dminfr-mark-micro.svg` | 4×5 closed bowl, one flow token. Favicon, paper headers, <28px |
+| `dminfr-mark-mono.svg` | Monochrome primary — papers, single-colour print |
+| `dminfr-mark-micro-mono.svg` | Monochrome micro |
+| `generate_logo.py` | Regenerates all of the above |
+
+The `-mono` files paint with `currentColor`, so inlined in HTML they inherit
+the surrounding text colour. Referenced through `<img src>` they fall back to
+black, which is the intended behaviour for print.
+
+## Rules
+
+- **Clearspace** — two token units on every side.
+- **Never recolour the wordmark.** Type is monochrome; colour lives only in the
+  flow path.
+- **Never rotate the lattice.** The diagonal carries the meaning.
+- Below 28px use the micro cut. The 8×10 lattice turns to mush.
+
+## Typography
+
+IBM Plex Sans. **DM** at 600, *Infr* at 300, tracking −3.5%. IBM Plex Mono for
+labels, code and terminal output at +20% tracking.
+
+## Palette
+
+| | Hex | Role |
+|---|---|---|
+| near-black | `#0B0C0E` | background |
+| graphite | `#22252B` | masked |
+| violet | `#8B5CF6` | transitioning |
+| deep blue | `#1D4ED8` | flow end |
+| ink white | `#F5F6F8` | resolved |
+
+## Regenerating
+
+```bash
+python assets/logo/generate_logo.py
+```
+
+Source of truth is the Claude Design project *DMInfr Logo Design*
+(`DMInfrMark.dc.html`), which renders through a React runtime. `generate_logo.py`
+reproduces the same lattice as static SVG so the repo carries no runtime
+dependency — the lattice, flow path, drop set and density ramp are copied
+verbatim from the canvas component. If the canvas mark changes, update the
+constants at the top of the script.
+
+One deliberate difference: the canvas mixes colours in oklab, the script
+interpolates in sRGB. Across four discrete flow steps the difference is not
+visible, and it keeps the generator dependency-free.

@@ -1,8 +1,17 @@
-# LLaDA-MoE-7B-A1B-Instruct — Optimized Inference Engine
+<img src="assets/logo/dminfr-mark.svg" alt="DMInfr" width="82" align="left" hspace="20" vspace="4">
+
+# DMInfr
+
+**Optimized inference for LLaDA-MoE-7B-A1B-Instruct.**
+DM — diffusion model · Infr — infrastructure.
+
+<br clear="left">
 
 Self-contained PyTorch reimplementation of [inclusionAI/LLaDA-MoE-7B-A1B-Instruct](https://huggingface.co/inclusionAI/LLaDA-MoE-7B-A1B-Instruct), a masked-diffusion LLM. Triton fused MoE, block-wise KV caching, fused RMSNorm/decode kernels, variable-length batching, an OpenAI-compatible server, a data-parallel router, and an end-to-end-aware autotuner.
 
 **8.70× single-request and 103× total-pipeline throughput vs the unoptimized baseline** (single RTX A6000).
+
+> The mark is an 8×10 token lattice shaped as a **D**: masked in the upper left, resolved in the lower right, with four tokens stepping violet→blue through the counter — this engine's own decoding process, drawn. Full identity in [`assets/logo/`](assets/logo/README.md).
 
 ---
 
