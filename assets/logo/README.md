@@ -25,30 +25,49 @@ It is masked-diffusion decoding drawn literally, which is what this engine does.
 
 ## Files
 
+Every cut ships in a dark-ground and a light-ground version. **Resolved means
+maximum contrast against the page** — ink white on dark, near-black on light —
+so the two are separate files, not one file with its opacity turned down. The
+accent path is byte-identical in both: colour is the one thing that must not
+change between themes, or it stops being the same mark.
+
 | File | Use |
 |---|---|
-| `dminfr-mark.svg` | Primary. Full lattice, all states. Dark backgrounds, ≥48px |
-| `dminfr-mark-inline.svg` | Compact, padded below so it optically centres beside `<h1>` type. `height="58"` |
-| `dminfr-mark-compact.svg` | Solid silhouette, two flow tokens. 48px → 28px |
-| `dminfr-mark-micro.svg` | 4×5 closed bowl, one flow token. Favicon, paper headers, <28px |
-| `dminfr-mark-mono.svg` | Monochrome primary — papers, single-colour print |
+| `dminfr-lockup.svg` · `-light` | **Mark + wordmark.** What a README, slide, or paper header should use |
+| `dminfr-mark.svg` · `-light` | Primary. Full lattice, all four states. ≥64px |
+| `dminfr-mark-compact.svg` · `-light` | Solid silhouette, two flow tokens. 64px → 28px |
+| `dminfr-mark-micro.svg` · `-light` | 4×5 closed bowl, one flow token. Favicon, <28px |
+| `dminfr-mark-mono.svg` | Monochrome primary — single-colour print |
 | `dminfr-mark-micro-mono.svg` | Monochrome micro |
 | `generate_logo.py` | Regenerates all of the above |
 
-`-inline` exists because GitHub's markdown sanitizer strips `style` and
-`valign`, so an `<img>` inside a heading can only sit on the text baseline —
-which lines the mark's bottom edge up with the type's bottom edge and makes the
-wordmark look like it is hanging off the corner. The `-inline` cut carries empty
-space below the lattice instead, so the mark centres against the cap height.
+Pick per theme with `<picture>`, which GitHub honours in Markdown:
 
-It is cut from `compact`, not `primary`, for the reason the size ladder gives: a
-README header renders the mark at roughly 46px, and at that size the full
-lattice's masked field — 26%-opacity outlines — reads as grey static instead of
-a letter. The solid silhouette reads as a **D** instantly.
+```html
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo/dminfr-lockup.svg">
+    <img src="assets/logo/dminfr-lockup-light.svg" alt="DMInfr" width="340">
+  </picture>
+</p>
+```
 
 The `-mono` files paint with `currentColor`, so inlined in HTML they inherit
 the surrounding text colour. Referenced through `<img src>` they fall back to
 black, which is the intended behaviour for print.
+
+### The wordmark is live text, not outlines
+
+Converting IBM Plex to paths needs the font binary and `fontTools`, and pinning
+a font subset into every consumer of this repo is a worse trade than a fallback
+stack. So the lockup's wordmark is SVG `<text>`. To stop a missing Plex from
+reflowing the lockup, each word carries an explicit `textLength` with
+`lengthAdjust="spacing"`: glyph shapes are untouched and only the tracking
+absorbs the difference, so the lockup occupies the same box in every renderer.
+
+If you need a guaranteed-identical wordmark — a printed paper, a conference
+slide template — export the lockup to outlines once and commit that file
+alongside these.
 
 ## Rules
 
@@ -56,7 +75,12 @@ black, which is the intended behaviour for print.
 - **Never recolour the wordmark.** Type is monochrome; colour lives only in the
   flow path.
 - **Never rotate the lattice.** The diagonal carries the meaning.
-- Below 28px use the micro cut. The 8×10 lattice turns to mush.
+- **Never put a dark-ground cut on a light page.** Resolved tokens are ink white;
+  they vanish. Use the `-light` file or `<picture>`.
+- **Size ladder** — primary at 64px and up, compact from 64px down to 28px, micro
+  below 28px. The floor on the primary was 48px until it was tried at 48px: the
+  masked field is drawn as 26%-opacity outlines, and those degrade into grey
+  static well before the silhouette does.
 
 ## Typography
 
@@ -65,13 +89,18 @@ labels, code and terminal output at +20% tracking.
 
 ## Palette
 
+The accent path is shared. Only the ends of the ramp swap.
+
 | | Hex | Role |
 |---|---|---|
-| near-black | `#0B0C0E` | background |
-| graphite | `#22252B` | masked |
-| violet | `#8B5CF6` | transitioning |
-| deep blue | `#1D4ED8` | flow end |
-| ink white | `#F5F6F8` | resolved |
+| violet | `#8B5CF6` | transitioning — **both grounds** |
+| deep blue | `#1D4ED8` | flow end — **both grounds** |
+| ink white | `#F5F6F8` | resolved, on dark |
+| pale slate | `#CED7F0` | resolving, on dark |
+| near-black | `#16181D` | resolved, on light |
+| slate | `#2F3648` | resolving, on light |
+| near-black | `#0B0C0E` | dark ground |
+| graphite | `#22252B` | rules, panels |
 
 ## Regenerating
 

@@ -1,4 +1,4 @@
-"""Generate the DMInfr mark as dependency-free SVG.
+"""Generate the DMInfr mark and lockup as dependency-free SVG.
 
 The mark is authored in Claude Design as `DMInfrMark.dc.html`, which renders
 through a React runtime (`support.js`, ~70 KB). That is fine for a design
@@ -17,13 +17,16 @@ The spec, from the design:
 Which is masked-diffusion decoding drawn literally: masked tokens, tokens in
 flight, tokens resolved.
 
+Every cut ships in a dark-ground and a light-ground version. "Resolved" means
+maximum contrast against the page, so it is ink white on dark and near-black on
+light -- not one file with its opacity turned down.
+
 Run:  python assets/logo/generate_logo.py
 """
 
 from __future__ import annotations
 
 import os
-import re
 
 # --- the lattice, verbatim from DMInfrMark.dc.html -------------------------
 
@@ -48,13 +51,33 @@ SCALES = [0.32, 0.52, 0.74, 1.0]
 #: Deliberately absent tokens -- the "masked" field in the upper left.
 DROPS = {(0, 1), (1, 3), (2, 1)}
 
-# --- palette ---------------------------------------------------------------
+# --- palettes --------------------------------------------------------------
+# The accent path is identical on both grounds: colour is the one thing that
+# should not change between themes, or the mark stops being the same mark.
 
-INK = "#F5F6F8"        # resolved   -- committed token, full ink
-RESOLVING = "#CED7F0"  # blue-leaning white, drawn at 74% alpha
 ACCENT_A = "#8B5CF6"   # violet -- transitioning, prediction in flight
 ACCENT_B = "#1D4ED8"   # deep blue -- flow end
-BG = "#0B0C0E"
+
+#: On a dark ground, "resolved" is ink white and the ramp brightens toward it.
+DARK = dict(
+    ink="#F5F6F8",         # resolved -- committed token
+    resolving="#CED7F0",   # blue-leaning white
+    resolving_op="0.74",
+    trans_op="0.42",       # violet, still translucent
+    masked_op="0.26",      # outline only
+    text="#F5F6F8",
+)
+
+#: On a light ground the ramp darkens instead. Violet at 45% reads as the same
+#: lavender the dark cut reads as at 42% -- the accent survives the inversion.
+LIGHT = dict(
+    ink="#16181D",
+    resolving="#2F3648",
+    resolving_op="0.80",
+    trans_op="0.45",
+    masked_op="0.20",
+    text="#16181D",
+)
 
 # --- geometry --------------------------------------------------------------
 # Cell and gap sizes are derived from the design's percentage gaps so the
@@ -84,7 +107,7 @@ def _rect(x, y, size, radius, **attrs):
              f'rx="{radius:.2f}"']
     for k, v in attrs.items():
         parts.append(f'{k.replace("_", "-")}="{v}"')
-    return "  " + " ".join(parts) + "/>"
+    return " ".join(parts) + "/>"
 
 
 def _token_level(r: int, c: int) -> int:
@@ -96,23 +119,24 @@ def _token_level(r: int, c: int) -> int:
     return 0 if p < 0.24 else 1 if p < 0.46 else 2 if p < 0.7 else 3
 
 
-def build_full(mono: bool = False, solid: bool = False) -> str:
-    """Primary (8x10) mark.
+def lattice_full(pal=DARK, mono: bool = False, solid: bool = False,
+                 dx: float = 0.0, dy: float = 0.0) -> list:
+    """The 8x10 lattice as a list of <rect> strings, offset by (dx, dy).
 
+    pal   -- DARK or LIGHT. Decides what "resolved" means.
     mono  -- every token uses currentColor at varying alpha, for papers and
              single-colour printing.
     solid -- the `compact` variant: full silhouette, no masked field, only the
              two largest flow tokens. Legible down to ~28px.
     """
     geo = FULL
-    w, h = _canvas(geo)
     cell, gx, gy = geo["cell"], geo["gap_x"], geo["gap_y"]
     radius = cell * geo["radius_pct"]
     out = []
 
     for r in range(geo["rows"]):
         for c in range(geo["cols"]):
-            x, y = c * (cell + gx), r * (cell + gy)
+            x, y = dx + c * (cell + gx), dy + r * (cell + gy)
             fi = FLOW.index((r, c)) if (r, c) in FLOW else -1
 
             # Flow tokens first: they sit inside the counter, where MAP is
@@ -137,23 +161,31 @@ def build_full(mono: bool = False, solid: bool = False) -> str:
             if level == 0:
                 # Masked: outline only. Present but undecided.
                 out.append(_rect(x + 0.5, y + 0.5, cell - 1, radius, fill="none",
-                                 stroke="currentColor" if mono else INK,
-                                 stroke_width="1", opacity="0.26"))
+                                 stroke="currentColor" if mono else pal["ink"],
+                                 stroke_width="1", opacity=pal["masked_op"]))
             elif mono:
                 out.append(_rect(x, y, cell, radius, fill="currentColor",
-                                 opacity=["0", "0.26", "0.58", "1"][level]))
+                                 opacity=["0", pal["masked_op"],
+                                          pal["resolving_op"], "1"][level]))
             elif level == 1:
-                out.append(_rect(x, y, cell, radius, fill=ACCENT_A, opacity="0.42"))
+                out.append(_rect(x, y, cell, radius, fill=ACCENT_A,
+                                 opacity=pal["trans_op"]))
             elif level == 2:
-                out.append(_rect(x, y, cell, radius, fill=RESOLVING, opacity="0.74"))
+                out.append(_rect(x, y, cell, radius, fill=pal["resolving"],
+                                 opacity=pal["resolving_op"]))
             else:
-                out.append(_rect(x, y, cell, radius, fill=INK))
+                out.append(_rect(x, y, cell, radius, fill=pal["ink"]))
 
+    return out
+
+
+def build_full(pal=DARK, mono: bool = False, solid: bool = False) -> str:
+    w, h = _canvas(FULL)
     label = "monochrome" if mono else ("compact" if solid else "primary")
-    return _svg(w, h, out, f"DMInfr mark ({label})")
+    return _svg(w, h, lattice_full(pal, mono, solid), f"DMInfr mark ({label})")
 
 
-def build_micro(mono: bool = False) -> str:
+def build_micro(pal=DARK, mono: bool = False) -> str:
     """4x5 lattice: closed bowl, tight gaps, one resolved flow token.
 
     Below ~28px the 8x10 lattice turns to mush, so the micro cut drops to a
@@ -175,9 +207,51 @@ def build_micro(mono: bool = False) -> str:
                 out.append(_rect(x, y, cell, radius, fill=colour))
             elif MICRO[r][c] == "#":
                 out.append(_rect(x, y, cell, radius,
-                                 fill="currentColor" if mono else INK))
+                                 fill="currentColor" if mono else pal["ink"]))
 
     return _svg(w, h, out, "DMInfr mark (micro)")
+
+
+# --- lockup ----------------------------------------------------------------
+# Mark and wordmark on one optical centre line.
+#
+# The wordmark is SVG <text>, not outlines: converting IBM Plex to paths needs
+# the font binary and fontTools, and pinning a 40 KB font subset into every
+# consumer of this repo is a worse trade than a fallback stack. To stop the
+# lockup's geometry from moving when a viewer lacks Plex, each word is given an
+# explicit `textLength` with `lengthAdjust="spacing"` -- glyph shapes are left
+# alone and only the tracking absorbs the difference, so the lockup occupies
+# the same box in every renderer.
+
+MARK_W, MARK_H = _canvas(FULL)
+#: Gap between mark and wordmark. The identity's clearspace unit is one cell.
+LOCKUP_GAP = FULL["cell"] * 2.6
+FONT_PX = 54.0
+#: Locked advance widths, so a fallback face cannot reflow the lockup.
+DM_LEN, INFR_LEN = 88.0, 92.0
+FONT_STACK = ("'IBM Plex Sans','Segoe UI',-apple-system,BlinkMacSystemFont,"
+              "Helvetica,Arial,sans-serif")
+
+
+def build_lockup(pal=DARK) -> str:
+    text_x = MARK_W + LOCKUP_GAP
+    # Centre the cap height on the mark's centre. Cap height is ~0.72em for
+    # every face in the stack, so the baseline sits half a cap below centre.
+    baseline = MARK_H / 2 + (FONT_PX * 0.72) / 2
+    width = round(text_x + DM_LEN + INFR_LEN, 2)
+
+    body = lattice_full(pal)
+    body.append(
+        f'<text x="{text_x:.2f}" y="{baseline:.2f}" fill="{pal["text"]}"'
+        f' font-family="{FONT_STACK}" font-size="{FONT_PX:.0f}"'
+        f' letter-spacing="-1.9">'
+        f'<tspan font-weight="600" textLength="{DM_LEN:.0f}" '
+        f'lengthAdjust="spacing">DM</tspan>'
+        f'<tspan font-weight="300" textLength="{INFR_LEN:.0f}" '
+        f'lengthAdjust="spacing">Infr</tspan>'
+        f'</text>'
+    )
+    return _svg(width, MARK_H, body, "DMInfr")
 
 
 def _svg(w: float, h: float, body: list, title: str) -> str:
@@ -186,68 +260,32 @@ def _svg(w: float, h: float, body: list, title: str) -> str:
         f'     width="{w}" height="{h}" role="img" aria-label="{title}"\n'
         f'     fill="none">\n'
         f'  <title>{title}</title>\n'
-        + "\n".join(body) + "\n</svg>\n"
+        + "\n".join("  " + line for line in body) + "\n</svg>\n"
     )
-
-
-# --- inline lockup ---------------------------------------------------------
-# GitHub's markdown sanitizer strips `style` and `valign`, so an <img> placed
-# inside an <h1> can only sit on the text baseline: the mark's bottom edge and
-# the wordmark's bottom edge line up, and the type appears to hang off the
-# lower corner of the logo. No attribute GitHub allows will fix that.
-#
-# So bake the offset into the file. The `-inline` cut carries empty space below
-# the lattice, sized so that when rendered at the height this script prints,
-# the mark's optical centre lands on the wordmark's cap centre.
-#
-#   GitHub's h1 is 2em = 32px, cap height ~= 0.72em ~= 23px above the baseline.
-#   For a mark V px tall, (V - cap)/2 of it has to fall *below* the baseline --
-#   which is exactly how much empty space the file needs at its bottom edge.
-
-#: Cap height of GitHub's <h1>, in px. See above.
-H1_CAP_PX = 23.0
-
-
-def build_inline(source: str, visible_px: float, cap_px: float = H1_CAP_PX):
-    """Baseline-compensate `source`. Returns (svg, render_height_px)."""
-    vb = re.search(r'viewBox="0 0 ([\d.]+) ([\d.]+)"', source)
-    w, h = float(vb.group(1)), float(vb.group(2))
-
-    below_px = (visible_px - cap_px) / 2   # mark height that must sit below the baseline
-    pad = below_px * (h / visible_px)      # the same distance, in viewBox units
-    total = round(h + pad, 2)
-
-    out = source.replace('viewBox="0 0 %s %s"' % (vb.group(1), vb.group(2)),
-                         'viewBox="0 0 %s %s"' % (vb.group(1), total))
-    out = re.sub(r'width="[\d.]+" height="[\d.]+"',
-                 'width="%s" height="%s"' % (w, total), out, count=1)
-    out = out.replace("(compact)", "(inline)")
-    return out, round(visible_px + below_px, 1)
 
 
 def main() -> int:
     here = os.path.dirname(os.path.abspath(__file__))
-    primary = build_full()
-    # The inline cut is built from `compact`, not `primary`. At the ~48px a
-    # README header gives it, the full lattice's masked field (26% outlines)
-    # reads as grey static rather than a letter -- which is the whole reason
-    # the compact silhouette exists. See the size ladder in README.md.
-    inline, inline_h = build_inline(build_full(solid=True), visible_px=46.0)
     files = {
-        "dminfr-mark.svg": primary,
-        "dminfr-mark-inline.svg": inline,
-        "dminfr-mark-mono.svg": build_full(mono=True),
-        "dminfr-mark-compact.svg": build_full(solid=True),
-        "dminfr-mark-micro.svg": build_micro(),
-        "dminfr-mark-micro-mono.svg": build_micro(mono=True),
+        # lockups -- what a README or a slide should use
+        "dminfr-lockup.svg": build_lockup(DARK),
+        "dminfr-lockup-light.svg": build_lockup(LIGHT),
+        # marks
+        "dminfr-mark.svg": build_full(DARK),
+        "dminfr-mark-light.svg": build_full(LIGHT),
+        "dminfr-mark-compact.svg": build_full(DARK, solid=True),
+        "dminfr-mark-compact-light.svg": build_full(LIGHT, solid=True),
+        "dminfr-mark-micro.svg": build_micro(DARK),
+        "dminfr-mark-micro-light.svg": build_micro(LIGHT),
+        # monochrome -- currentColor, so the ground is the caller's problem
+        "dminfr-mark-mono.svg": build_full(DARK, mono=True),
+        "dminfr-mark-micro-mono.svg": build_micro(DARK, mono=True),
     }
     for name, svg in files.items():
         path = os.path.join(here, name)
         with open(path, "w", encoding="utf-8", newline="\n") as f:
             f.write(svg)
-        print(f"  wrote {name:30s} {len(svg):5d} bytes")
-    print()
-    print(f'  dminfr-mark-inline.svg -> height="{inline_h:.0f}" inside a GitHub <h1>')
+        print(f"  wrote {name:34s} {len(svg):5d} bytes")
     return 0
 
 
