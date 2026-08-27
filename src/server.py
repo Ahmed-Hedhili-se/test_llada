@@ -798,7 +798,8 @@ QUANTIZATION: Optional[dict] = None
 
 
 def apply_quantization(bits: int = 8, group_size: int = 128,
-                       mode: str = "packed", fused: bool = True) -> dict:
+                       mode: str = "packed", fused: bool = True,
+                       dtype: str = "int") -> dict:
     """Quantize the loaded model's MoE experts using the LLaDA_Quant toolkit.
 
     LLaDA_Quant is an **optional** dependency -- deliberately not in
@@ -832,18 +833,20 @@ def apply_quantization(bits: int = 8, group_size: int = 128,
             f"(import failed: {exc})"
         ) from exc
 
-    print(f"Quantizing MoE experts: INT{bits} g{group_size} {mode}...")
+    label = "FP8-E4M3" if dtype == "fp8_e4m3" else f"INT{bits}"
+    print(f"Quantizing MoE experts: {label} g{group_size} {mode}...")
     config = QuantConfig(
         bits=bits,
         group_size=group_size,
         targets=("expert",),
         execution_mode=mode,
         expect_expert_blocks=MODEL.cfg.NL,
+        dtype=dtype,
     )
     result = quantize_model(MODEL, config)
 
     fused_blocks = []
-    if fused and mode == "packed" and bits == 8:
+    if fused and mode == "packed" and bits == 8 and dtype == "int":
         from LLaDA_Quant.runtime import fused_block
 
         # strict: a run that quietly fell back to dequantize-per-access would
@@ -851,10 +854,14 @@ def apply_quantization(bits: int = 8, group_size: int = 128,
         fused_blocks = fused_block.install(MODEL, strict=True)
     elif fused and bits == 4:
         print("  note: INT4 has no fused kernel; using dequantize-per-access.")
+    elif fused and dtype == "fp8_e4m3":
+        print("  note: FP8 has no fused kernel yet; using dequantize-per-access "
+              "(same tier INT4 ships at -- see LLaDA_Quant/algorithms/fp8.py).")
 
     QUANTIZATION = {
         "quantized": True,
         "bits": bits,
+        "dtype": dtype,
         "group_size": group_size,
         "execution_mode": mode,
         "fused_kernel": bool(fused_blocks),
@@ -927,11 +934,12 @@ def main():
     # In distributed mode, we override device with local rank
     ap.add_argument("--device", default=f"cuda:{get_tp_rank()}" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--backend", choices=["ours", "ours_kv", "fast_dense", "hf"], default="ours")
-    ap.add_argument("--quantize", choices=["int8", "int4"], default=None,
+    ap.add_argument("--quantize", choices=["int8", "int4", "fp8"], default=None,
                     help="Quantize the MoE experts via the LLaDA_Quant toolkit "
                          "(optional dependency, not installed by requirements.txt). "
                          "Requires --backend fast_dense. int8 gets the fused W8A16 "
-                         "kernel; int4 has none and runs dequantize-per-access.")
+                         "kernel; int4 and fp8 have none and run dequantize-per-access. "
+                         "fp8 uses E4M3 (float8_e4m3fn), sm_90+ only in practice.")
     ap.add_argument("--quant-group-size", type=int, default=128)
     ap.add_argument("--quant-mode", choices=["packed", "reference"], default="packed",
                     help="packed: real memory reduction (deploy). reference: same "
@@ -950,10 +958,11 @@ def main():
 
     if args.quantize:
         apply_quantization(
-            bits=8 if args.quantize == "int8" else 4,
+            bits=4 if args.quantize == "int4" else 8,
             group_size=args.quant_group_size,
             mode=args.quant_mode,
             fused=not args.no_fused_quant,
+            dtype="fp8_e4m3" if args.quantize == "fp8" else "int",
         )
 
     if get_tp_size() > 1 and get_tp_rank() != 0:
