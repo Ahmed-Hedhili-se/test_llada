@@ -51,10 +51,20 @@ CUDA_VER=$(nvidia-smi 2>/dev/null | grep -oP 'CUDA Version: \K[0-9]+\.[0-9]+' \
 
 echo "  Detected CUDA driver: $CUDA_VER"
 
-# Use cu121 for every CUDA 12.x system.
-# Only CUDA 13.x uses cu130.
+# Wheel line for the pinned torch 2.5.1.
+#
+# NOT simply "newest index the driver supports": torch 2.5.1 predates CUDA 13
+# and has *no* cu130 wheels, so a CUDA 13 driver (H100 boxes ship them) sent us
+# to an index where the pinned version does not exist and the install died.
+# CUDA drivers are backward compatible with older runtimes, so a 13.x driver
+# runs the cu124 build fine -- that is the newest line 2.5.1 actually ships.
+#
+# If the torch pin is ever raised past 2.9, revisit: cu130 becomes real then.
 if [[ "$CUDA_VER" =~ ^13\. ]]; then
-    WHL_IDX="cu130"
+    WHL_IDX="cu124"
+    echo "  CUDA 13 driver: using cu124 (torch 2.5.1 has no cu130 build)"
+elif [[ "$CUDA_VER" =~ ^12\.[4-9] ]]; then
+    WHL_IDX="cu124"
 else
     WHL_IDX="cu121"
 fi
