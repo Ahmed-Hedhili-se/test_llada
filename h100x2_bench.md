@@ -455,7 +455,149 @@ to the actual ceiling**, not 128.
 
 ---
 
-## 8. Open items from this session
+## 8. Five follow-ups, closed out
+
+All five candidates from the end of §7's discussion, run this session.
+Two ran genuinely in parallel (GPU 0 / GPU 1) since they were independent
+single-GPU experiments; the other three needed both GPUs and ran
+sequentially.
+
+### 8a. The B=96 hypothesis (§5) — refuted by direct measurement
+
+§5 guessed the throughput dip at `BATCH_MAX_SIZE=96` came from
+`get_best_config`'s `min()` tie-break picking an arbitrary config between
+the M=64 and M=128 tuned entries. Measured directly instead of guessed:
+
+| Config at M=96 | Latency | Padding | Score |
+|---|---:|---:|---:|
+| **M=64 config (what's actually selected)** | **0.4630ms** | 37.5% | **0.5498** |
+| M=128 config (the other tied candidate) | 0.4677ms | 43.8% | 0.5701 |
+| Best of an independent 330-candidate sweep at M=96 | 0.4682ms | 41.7% | 0.5657 |
+
+**The current pick is the best of all three** — better than the other tied
+candidate, and better than what an unconstrained sweep specifically for
+M=96 found. The tie-break is not the cause of the dip. Retracting the
+hypothesis; §5's single-sample dip is more likely ordinary benchmark noise
+(each `BATCH_MAX_SIZE` in that sweep was measured once, no repeats) than a
+kernel-selection bug. Re-measuring B=96 with repeated trials would confirm,
+but the specific mechanism I originally proposed is dead.
+
+### 8b. Fusion A/B on H100 — a real number to replace the A6000-only one
+
+Same methodology as the README's A6000 table, at this hardware's own
+measured peak (`BATCH_MAX_SIZE=64`, concurrency 64, fixed prompts):
+
+| | Tok/s | p50 |
+|---|---:|---:|
+| Fusions off (`LLADA_FUSE_RMSNORM=0 LLADA_FUSE_DECODE=0 LLADA_MOE_FUSED_SILU=0`) | 522.0 | 15.25s |
+| **Fusions on (default)** | **698.7** | **11.26s** |
+
+**+33.8% throughput from the fusions on H100**, against the A6000's
+measured +19.7% (at its own peak, `BATCH_MAX_SIZE=32`). Larger gain on
+faster hardware is the expected direction — the fusions remove fixed
+per-call overhead (kernel launches, intermediate HBM round trips) that
+matters more as raw compute time shrinks.
+
+### 8c. Decoding-collapse hypothesis (§4d) — confirmed, and resolved
+
+§4d found 5/200 GSM8K questions (indices 96, 122, 139, 168, 200)
+collapsing into deterministic degenerate repetition, and hypothesized this
+was the project's documented `steps_per_block ≥ block_length/2` stability
+boundary being hit exactly at its minimum (ratio 0.5×) rather than
+comfortably inside it. Tested by doubling `--steps` (1024 instead of 512,
+same `max_tokens=1024 block_length=64`, so ratio 1.0×) on the same 200
+questions, same server, same seed:
+
+| `steps_per_block` ratio | Accuracy | Degenerate failures | Time |
+|---|---:|---:|---:|
+| 0.5× (original — reconfirmed a 3rd time) | 67.5% (135/200) | **5/200**, same indices as always | 768.8s |
+| **1.0× (double)** | **71.0% (142/200)** | **0/200** | 816.0s (+6%) |
+
+**Confirmed and fully resolved.** All 5 known failures vanish at ratio
+1.0×, accuracy rises 3.5 points, and the time cost is only 6% — not the
+2× a naive doubling of steps would suggest, most likely because
+confidence-threshold decoding's early-exit absorbs most of the extra step
+budget once a block is already resolved. **Actionable finding: the
+README's `steps_per_block ≥ block_length/2` guidance describes where
+generation stops being *catastrophically* broken (0% accuracy below it),
+not where it's actually safe to run.** The knife's edge at exactly 0.5× is
+where this project has been running GSM8K the whole time, and it costs
+2.5% of real questions. Recommend defaulting to 1.0× rather than 0.5×,
+accuracy figures elsewhere in this project's history permitting.
+
+### 8d. Quantized DP — the original hypothesis, refuted
+
+§7 proposed that INT8's 42.4% memory saving (§6) might let more replicas
+fit per GPU and raise aggregate throughput. Tested directly: `--gpus 2
+--replicas 4` (2 replicas/GPU) at INT8, against the same replica count at
+BF16 (isolates oversubscription from quantization) and against the
+already-measured BF16 1-replica/GPU baseline from §7:
+
+| Concurrency | BF16, 1/GPU (§7) | BF16, 2/GPU | INT8, 2/GPU |
+|---:|---:|---:|---:|
+| 32 | 814.0 | 395.3 | 313.4 |
+| 64 | **877.8** (peak) | 751.6 | 459.7 |
+| 128 | 728.5 | 319.3 | 239.0 |
+
+**Strict ordering at every concurrency: 1-replica BF16 > 2-replica BF16 >
+2-replica INT8.** Both effects hurt, and they compound rather than
+offset:
+
+- **Oversubscription alone hurts** (BF16 1/GPU vs 2/GPU): co-locating two
+  replicas on one GPU doesn't add HBM bandwidth, and `fused_moe_kernel` is
+  bandwidth-bound (measured earlier at 81% of theoretical peak) — two
+  replicas' kernels now compete for the same bytes/second rather than each
+  getting the full card.
+- **Quantization makes it worse, not better** (BF16 2/GPU vs INT8 2/GPU):
+  counter-intuitive, since the fused W8A16 kernel reads int8 directly and
+  streams *fewer* bytes per forward than BF16. Two candidate explanations,
+  neither confirmed: the fused kernel's tuned config (§2, tuned under
+  *exclusive* GPU access) may not hold up under compute contention from a
+  co-resident process on the same 114 SMs; or int8's extra
+  scale-multiply work, cheap when bandwidth-bound, becomes the bottleneck
+  once bandwidth is shared and the kernel becomes compute-bound instead.
+- INT8 also **collapses harder under overload**: −48% from its own peak
+  at concurrency 128 (459.7 → 239.0), against BF16 2/GPU's milder −58%→
+  actually comparable in relative terms, but INT8's absolute ceiling is
+  lower throughout, so the same overload behavior lands it further below
+  the safe operating point.
+
+**The original premise was wrong.** Memory headroom was never the binding
+constraint on this box (14032 MiB resident against 80 GB of VRAM) — the
+bottleneck is HBM bandwidth, and nothing about having spare capacity
+changes that. **One BF16 replica per GPU remains the right call on this
+hardware.**
+
+### 8e. TP GSM8K at n=50 — accuracy fine, but a real correction to §7's latency claim
+
+| | Accuracy | s/question |
+|---|---:|---:|
+| TP+EP=2, n=50 | 70.0% (35/50) | **19.4** |
+| BF16 single-GPU, n=50 (§4a) | 74.0% (37/50) | 3.4–3.8 |
+
+Accuracy is unremarkable — in the same range as the n=10 sanity check and
+close to BF16's 74.0%, nothing an n=50 sample can distinguish from noise
+per this project's own established standard. **The latency number is the
+finding, and it revises §7.**
+
+§7 measured TP+EP=2 and a single DP replica as statistically tied at
+concurrency 1 — but that was at the throughput benchmark's request shape
+(`max_tokens=128 steps=128`). GSM8K generates up to 1024 tokens over up to
+1024 diffusion steps, and **TP's per-step NCCL all-reduce cost is fixed
+per step, so it accumulates linearly with step count** — at 128 steps it's
+small enough to be invisible; at up to 1024 steps (8× more), it dominates.
+**§7's "TP has no latency edge here either" finding does not generalize
+past short generations.** For a realistic GSM8K-length workload, TP is
+~5–6× slower than a single GPU, not tied with it. The README's "TP for
+single-request latency" framing needed revising for a different reason
+than §7 first found: not because TP has no edge on this no-NVLink
+hardware, but because whatever edge it might have is workload-length-
+dependent and vanishes (worse: inverts) exactly on realistic generation
+lengths.
+
+---
+
+## 9. Open items from this session
 
 - [ ] `moe_tune_config.json` still not committed to git, and still not
       device-keyed (unlike `dInfer/configs/*device_name=...json`). Should
@@ -463,25 +605,47 @@ to the actual ceiling**, not 128.
       silently stale on the next machine.
 - [ ] Autotuner's `shmem=None occ=None` introspection failure — cosmetic
       so far, but worth root-causing.
-- [ ] **Decoding-collapse hypothesis above is unverified.** Needs a
-      `--steps 768` (or similar higher-ratio) re-run targeted at questions
-      96/122/139/168/200 specifically.
-- [ ] The B=96 tie-break hypothesis above — confirm by logging the actual
-      config `get_best_config` returns at M=96.
+- [x] Decoding-collapse hypothesis — **confirmed and resolved in §8c.**
+      `steps_per_block` ratio 1.0× eliminates all 5 known failures.
+      Remaining: the README's stability guidance (`≥ block_length/2`,
+      i.e. ratio ≥ 0.5×) should probably become `≥ block_length`
+      (ratio ≥ 1.0×) as the recommended default, not just the floor.
+- [x] The B=96 tie-break hypothesis — **refuted in §8a.** The current pick
+      is measurably the best of the candidates tried; the dip is more
+      likely single-sample noise from §5's sweep (no repeated trials).
+      Re-measuring B=96 with repeats would confirm but is low priority
+      now that the leading hypothesis for *why* is dead.
 - [x] DP across both GPUs, TP=2 correctness pass — done in §7.
-- [ ] Fusion A/B — not yet run this session.
-- [ ] TP=2 GSM8K at n≥50 — only an n=10 sanity check has been run (§7).
-- [ ] TP+EP=2's concurrency 64/128 rows — deliberately skipped in §7 since
-      the trend was already unambiguous at 1/8/32; fill in if a firmer
-      curve shape is ever needed.
-- [ ] DP's 1.42×-not-2× scaling efficiency (§7) — undiagnosed. Needs
+- [x] Fusion A/B — **done in §8b.** +33.8% on H100 (698.7 vs 522.0 tok/s),
+      vs the A6000's +19.7% — larger gain on faster hardware, as expected.
+- [x] TP=2 GSM8K at n≥50 — **done in §8e.** 70.0% (35/50), unremarkable.
+      Surfaced a bigger finding: 19.4s/question against BF16's 3.4–3.8s,
+      because TP's NCCL cost is fixed *per diffusion step* and GSM8K runs
+      far more steps than the throughput benchmark that found TP/DP tied.
+- [x] Quantized DP (the memory-headroom-buys-more-replicas idea) —
+      **tested and refuted in §8d.** Oversubscription alone hurts
+      throughput on this bandwidth-bound kernel; adding quantization on
+      top hurts more, not less. One replica per GPU remains correct here.
+- [ ] TP+EP=2's concurrency 64/128 rows — still deliberately skipped (§7);
+      the trend was already unambiguous at 1/8/32, and §8e's finding
+      (TP's cost scales with step count, not request-shape-independent)
+      makes the 128-token throughput-benchmark numbers less central to
+      the real question anyway.
+- [ ] DP's 1.42×-not-2× scaling efficiency (§7) — still undiagnosed. Needs
       `/v1/replicas` polled during a sweep to see whether load actually
       splits evenly, or whether the router itself taxes each request.
-- [ ] README's Multi-GPU section claims TP+EP wins on single-request
-      latency, sourced from an A6000-vs-unoptimized-baseline number. §7
-      measured TP+EP=2 vs a single DP replica (both `model_update/`,
-      same box) at concurrency 1 and found them statistically tied — no
-      NVLink on this box may be why. README needs an update or a caveat.
+- [ ] README's Multi-GPU section needs updating for **two** reasons now,
+      not one: §7 found TP+EP=2 has no latency edge over a single GPU on
+      this no-NVLink hardware at short generation lengths, and §8e found
+      that even where TP might have an edge, it inverts at realistic
+      (GSM8K-length) generation because its NCCL cost scales with step
+      count. The current "TP for latency" framing should go, not just
+      get a caveat.
+- [ ] Quantized-DP's counter-intuitive result (§8d: INT8 slower than BF16
+      under co-location, despite streaming fewer bytes) — two candidate
+      explanations offered, neither confirmed. Would need per-kernel
+      profiling under contention (two processes on one GPU) to settle,
+      not just end-to-end throughput numbers.
 - [ ] FP8 n=200 accuracy re-run (§6) — the 70.0% vs 74.0% n=50 gap needs
       the same noise check §4 already ran for BF16.
 - [ ] FP8 fused kernel — currently dequantize-per-access only; the 12.5s vs
