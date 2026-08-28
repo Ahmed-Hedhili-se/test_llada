@@ -548,12 +548,12 @@ def set_config(config: dict):
     """Switch generation config at runtime (for testing only)."""
     global BACKEND
     new_backend = config.get("backend")
-    if new_backend in ["ours", "ours_kv", "fast_dense", "hf"]:
+    if new_backend in ["ours", "fast_dense", "hf"]:
         BACKEND = new_backend
         return {"status": "ok", "backend": BACKEND}
     return JSONResponse(
         status_code=400,
-        content={"error": f"Unknown backend: {new_backend}. Valid: ours, ours_kv, fast_dense, hf"}
+        content={"error": f"Unknown backend: {new_backend}. Valid: ours, fast_dense, hf"}
     )
 
 
