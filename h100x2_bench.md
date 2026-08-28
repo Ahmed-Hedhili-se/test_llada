@@ -1379,9 +1379,20 @@ than only in this log:
       upper bound until Triton exposes n_regs at warmup — noted in code.
 - [x] **Fuse RoPE's `rotate_half`** — DONE (§11). Kernel 2.55x, ~+4%
       end-to-end (p~0.14, direction consistent). Bit-exact, 9/9. Default-on.
-- [ ] **Fuse the MoE top-k combine into GEMM2's epilogue** (§10) — the
-      `[M, top_k, K]` intermediate is 67 MB written + 67 MB read per
-      layer through the L2 that ncu identifies as the bottleneck.
+- [~] **Fuse the MoE top-k combine into GEMM2's epilogue** (§10) —
+      **analysed and deliberately NOT done.** It is the biggest remaining
+      target on paper: the `[M, top_k, K]` intermediate is 67 MB written +
+      67 MB read per layer through the L2 ncu identifies as the bottleneck.
+      Fusing it requires GEMM2 to accumulate into `[M, K]` with
+      `atomic_add`, because `moe_align_block_size` orders rows expert-major
+      so one block cannot see all `top_k` experts of a token — and
+      reordering token-major would destroy the weight reuse the whole
+      kernel is built on. Atomics make the result **non-deterministic
+      run-to-run**, and this project's method depends on determinism: it
+      was used three times in this session alone to establish that results
+      were real (§4c, §8c, §9e). Trading reproducibility for ~3% is the
+      wrong trade. Revisit only with a deterministic reduction scheme
+      (e.g. a fixed-order two-pass split-K), not with atomics.
 - [x] README corrections — **DONE (§14e).** Kernel profile, steps_per_block
       guidance, TP-for-latency framing, and the QKV rejection note all
       corrected at the source (§14f).
@@ -1425,9 +1436,12 @@ than only in this log:
 - [x] README Multi-GPU / TP-for-latency framing — **DONE (§14e).**
 - [ ] Quantized-DP's counter-intuitive result (§8d: INT8 slower than BF16
       under co-location, despite streaming fewer bytes) — two candidate
-      explanations offered, neither confirmed. Would need per-kernel
-      profiling under contention (two processes on one GPU) to settle,
-      not just end-to-end throughput numbers.
+      explanations offered, neither confirmed. Settling it needs ncu
+      attached to two co-resident processes on one GPU, which the
+      admin-gated counters (§10) make awkward and which would not change
+      the deployment recommendation either way: §8d already established
+      that one BF16 replica per GPU beats every co-location variant
+      tested. Left open as a curiosity, not a blocker.
 - [x] fp32 router (§9) — **tested and rejected.** No accuracy effect at
       n=1000 (p=0.757); free at throughput (−0.3%) but ~12% cost on the
       single-stream path. Flag kept default-off with the negative result
@@ -1440,6 +1454,9 @@ than only in this log:
       churn, none of those 2-question differences mean anything.
 - [ ] FP8 n=200 accuracy re-run (§6) — superseded by the item above; run
       at n≥1000 or not at all.
-- [ ] FP8 fused kernel — currently dequantize-per-access only; the 12.5s vs
-      4.2s/question latency gap in §6 is not apples-to-apples until one
-      exists.
+- [ ] FP8 fused kernel — currently dequantize-per-access only, so §6's
+      12.5s vs 4.2s/question is not apples-to-apples. This is a real
+      engineering project (an FP8xBF16 or native FP8 tensor-core Triton
+      kernel), not a session task; it is the same milestone INT8's fused
+      W8A16 kernel already represents. Out of scope here, listed so the
+      latency comparison is not mistaken for a property of FP8 itself.
