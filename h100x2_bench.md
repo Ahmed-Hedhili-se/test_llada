@@ -1154,7 +1154,65 @@ scaling noted in §7 stands and remains undiagnosed.
 
 ---
 
-## 13. Open items from this session
+## 13. Speedup, current
+
+Re-measured after the RoPE fusion, 5 runs (§3's figures predate it).
+
+### Engine, single request, same GPU
+
+| | Time | Tok/s | Speedup |
+|---|---:|---:|---:|
+| Baseline (`src/`, unfused, no cache) | 34.92 s | 3.67 | 1.00× |
+| **Optimized** (`model_update/`) | **3.43 s** | **37.29** | **10.17×** |
+
+**Token divergence 0/128** — still character-identical to the baseline,
+which the bit-exact RoPE fusion guarantees rather than merely suggests.
+
+Read this carefully against §3's 9.00×: **both sides moved.** The
+optimized arm went 3.60 s → 3.43 s (−4.7%, consistent with §11's ~+4%
+RoPE result), but the baseline also went 32.38 s → 34.92 s (+7.8%).
+`src/` loops 64 experts in Python and is CPU-dispatch-bound, so it drifts
+with host load. **The honest statement is "the optimized path got ~5%
+faster"; the ratio moving 9.00× → 10.17× overstates that**, because a
+slower baseline inflates it for free.
+
+### Total pipeline
+
+Decomposed from separately-measured components, using the in-process
+baseline (3.67 tok/s) rather than the README's over-HTTP one (2.7 tok/s on
+A6000) — the in-process number is the more conservative comparison because
+it does not charge the baseline for HTTP overhead:
+
+| | Tok/s | vs baseline |
+|---|---:|---:|
+| Baseline, `src/`, single request | 3.67 | 1.00× |
+| Optimized, single request (B=1) | 37.29 | **10.2×** |
+| Optimized, 1 GPU batched (`BATCH_MAX_SIZE=32`) | 656.9 | **179×** |
+| Optimized, 2 GPUs (DP=2, concurrency 64) | 897.9 | **245×** |
+
+The decomposition is self-consistent: 10.16× engine × 17.62× batching =
+179.0×, and 10.16 × 24.08 = 244.7× for the DP arm — matching the direct
+ratios to within rounding, which is the check that makes the headline
+figure trustworthy rather than a stacked guess.
+
+**Caveat on precision.** The baseline drifted 7.8% between two
+measurements of identical code, so these ratios carry at least that much
+uncertainty. Using §3's baseline instead (3.95 tok/s) gives **166×** and
+**227×**. Quote the range — ~165–180× on one GPU, ~225–245× on two — not
+a single digit.
+
+**And the DP figure spends twice the hardware.** 245× is a
+deployment-to-deployment number against a single-GPU baseline; the
+like-for-like engine comparison is the 10.2×, and the single-GPU pipeline
+figure is 179×.
+
+For context, the README's A6000 headline is 103× (8.70× engine × 11.67×
+batching). The H100 single-GPU figure is higher on both factors: a
+slightly better engine ratio, and considerably more batching headroom.
+
+---
+
+## 14. Open items from this session
 
 - [ ] `moe_tune_config.json` still not committed to git, and still not
       device-keyed (unlike `dInfer/configs/*device_name=...json`). Should
