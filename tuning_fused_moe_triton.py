@@ -278,15 +278,19 @@ def profile_config(config, K, N):
         # prevent N blocks", not as achieved occupancy. If a future Triton
         # exposes n_regs the register term below starts applying and the two
         # converge.
-        limits = []
+        # Every limiter, including the two that are easy to forget:
+        #   - warps: an SM holds max_warps_per_sm warps, so at num_warps per
+        #     block it can never hold more than max_warps//num_warps blocks.
+        #     Omitting this produced occ=400% for a small-shmem config, which
+        #     is how the bug announced itself.
+        #   - the hardware cap on resident blocks per SM (32 on sm_90).
+        limits = [max_warps_per_sm // max(num_warps, 1), 32]
         if shared_bytes:
             limits.append(shmem_per_sm // shared_bytes)
         if n_regs:
             limits.append(regs_per_sm // max(n_regs * threads_per_block, 1))
-        occupancy_pct = None
-        if limits:
-            blocks_per_sm = max(min(min(limits), 32), 0)
-            occupancy_pct = round(blocks_per_sm * num_warps / max_warps_per_sm * 100)
+        blocks_per_sm = max(min(limits), 0)
+        occupancy_pct = round(blocks_per_sm * num_warps / max_warps_per_sm * 100)
 
         return {
             "shared_bytes":   shared_bytes,
@@ -494,8 +498,9 @@ def main():
     print(f"  Tuning complete. Saved to: {args.output}")
     print("  To apply: keep this file in the repo root; fused_moe_triton.py")
     print("            loads the device-keyed name matching the GPU it runs on.")
-    print(f"  All ranks read this one file at import time — tuning on a single")
-    print(f"  GPU is sufficient; do NOT re-run it per GPU.")
+    print("  All ranks on the same GPU model read this file at import time, so")
+    print("  tuning once per machine is enough -- but the name is device-keyed,")
+    print("  and a different GPU model needs its own run.")
     print(f"{'='*70}\n")
 
 

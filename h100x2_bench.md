@@ -1305,6 +1305,13 @@ count. It now divides by `n_regs × threads_per_block`.
 
 Now reports `shmem=24576B occ=25%` where it reported nothing.
 
+Enabling it immediately exposed a third bug it had been hiding: a
+small-shmem config printed **`occ=400%`**. The block-count cap ignored
+the warps-per-SM limit — an SM holds 64 warps, so at 8 warps/block it
+can never hold more than 8 blocks regardless of how little shared memory
+each uses. Both that limit and the hardware 32-blocks/SM cap are now
+applied; the same config reports 100%.
+
 **With a caveat recorded in the code**: Triton 3.1's warmup metadata does
 not expose `n_regs`, so only the shared-memory limit applies and the
 number is an **upper bound**. Against ncu on the same config it reports
