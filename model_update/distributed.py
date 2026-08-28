@@ -2,40 +2,45 @@ import os
 import torch
 import torch.distributed as dist
 
-_TP_GROUP = None
-
 def init_distributed():
     """
     Initializes the distributed process group if not already initialized.
     Reads RANK and WORLD_SIZE from environment variables (standard torchrun setup).
+
+    Note for multi-replica launches: MASTER_PORT defaults to 29500 for every
+    process, so N replicas on one host all try to bind the same rendezvous port
+    and all but the first die with EADDRINUSE. start_dp.sh sets a distinct port
+    per replica -- along with MASTER_ADDR/RANK/WORLD_SIZE, since the block below
+    fills those in only when MASTER_ADDR is absent.
     """
-    global _TP_GROUP
     if not dist.is_initialized():
         world_size = int(os.environ.get("WORLD_SIZE", 1))
-        
+
         if world_size == 1 and "MASTER_ADDR" not in os.environ:
             os.environ["MASTER_ADDR"] = "localhost"
             os.environ["MASTER_PORT"] = "29500"
             os.environ["RANK"] = "0"
             os.environ["WORLD_SIZE"] = "1"
-            
-        dist.init_process_group(backend="nccl", init_method="env://")
-        
-        _TP_GROUP = None
 
-def get_tp_group():
-    global _TP_GROUP
-    return _TP_GROUP
+        dist.init_process_group(backend="nccl", init_method="env://")
+
+
+# TP uses the default process group. There was a _TP_GROUP global threaded
+# through every call as `group=`, but it was initialised to None, only ever
+# reassigned to None, and `group=None` is exactly "the default group" -- so the
+# indirection existed as a hook for a sub-group TP layout that was never built.
+# Removed; reintroduce it here if TP ever needs to span a subset of ranks.
 
 def get_tp_size():
     if not dist.is_initialized():
         return 1
-    return dist.get_world_size(group=get_tp_group())
+    return dist.get_world_size()
+
 
 def get_tp_rank():
     if not dist.is_initialized():
         return 0
-    return dist.get_rank(group=get_tp_group())
+    return dist.get_rank()
 
 
 def tp_all_reduce_(tensor: torch.Tensor) -> torch.Tensor:
@@ -43,7 +48,7 @@ def tp_all_reduce_(tensor: torch.Tensor) -> torch.Tensor:
     tp_size == 1. Shared by Attention/TritonFusedMoEBlock/MoEBlock.forward,
     which all combine per-rank-partial outputs the same way."""
     if get_tp_size() > 1:
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=get_tp_group())
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
     return tensor
 
 

@@ -85,17 +85,15 @@ def get_best_config(M: int, E: int, silu_epilogue: bool = False) -> Dict[str, An
 @triton.jit
 def fused_moe_kernel(
         a_ptr, b_ptr, c_ptr,
-        a_scale_ptr, b_scale_ptr,
         topk_weights_ptr, sorted_token_ids_ptr, expert_ids_ptr,
         num_tokens_post_padded_ptr,
         N, K, EM, num_valid_tokens,
         stride_am, stride_ak,
         stride_be, stride_bk, stride_bn,
         stride_cm, stride_cn,
-        stride_bse, stride_bsn,
         BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
         GROUP_SIZE_M: tl.constexpr, MUL_ROUTED_WEIGHT: tl.constexpr, top_k: tl.constexpr,
-        compute_type: tl.constexpr, use_fp8_w8a8: tl.constexpr, use_int8_w8a16: tl.constexpr,
+        compute_type: tl.constexpr,
         is_first_gemm: tl.constexpr, SILU_EPILOGUE: tl.constexpr):
     """
     SILU_EPILOGUE (GEMM1 only): w1 packs [gate ; up] along N, so the unfused
@@ -281,15 +279,14 @@ def invoke_fused_moe_kernel(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor,
     num_stages = kernel_kwargs.pop('num_stages', 2)
 
     fused_moe_kernel[grid](
-        A, B, C, None, None,
+        A, B, C,
         topk_weights, sorted_token_ids, expert_ids, num_tokens_post_padded,
         n_out, B.shape[2], sorted_token_ids.shape[0], topk_ids.numel(),
         A.stride(0), A.stride(1),
         B.stride(0), B.stride(2), B.stride(1),
         stride_cm, stride_cn,
-        0, 0,
         MUL_ROUTED_WEIGHT=mul_routed_weight, top_k=top_k,
-        compute_type=compute_type, use_fp8_w8a8=False, use_int8_w8a16=False,
+        compute_type=compute_type,
         is_first_gemm=is_first_gemm, SILU_EPILOGUE=silu_epilogue,
         num_warps=num_warps, num_stages=num_stages,
         **kernel_kwargs,
