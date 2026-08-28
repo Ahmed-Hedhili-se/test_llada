@@ -19,6 +19,7 @@ Dims are passed via a Config so the exact same code can be correctness
 tested at small scale and then run at full 7B-MoE scale.
 """
 
+import os
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -28,6 +29,55 @@ import torch.nn.functional as F
 from .distributed import get_tp_size, get_tp_rank, tp_all_reduce_
 
 KVCache = List[Tuple[torch.Tensor, torch.Tensor]]
+
+#: Compute the MoE router's gate projection in fp32 rather than the model
+#: dtype. See _router_logits() for why this is not the no-op it looks like.
+FP32_ROUTER = os.environ.get("LLADA_FP32_ROUTER", "0") != "0"
+
+
+def _router_logits(gate: nn.Linear, x_flat: torch.Tensor) -> torch.Tensor:
+    """Router logits, optionally computed in fp32.
+
+    The reference implementation (`weights/modeling_lladamoe.py`) runs the
+    gate Linear in the model dtype and only upcasts inside the softmax:
+
+        router_logits  = self.gate(hidden_states)                 # bf16
+        routing_weights = F.softmax(router_logits, dtype=float)   # fp32
+
+    That upcast is cosmetic. `topk` runs on the softmax output, but softmax
+    is monotonic -- the ordering it ranks was already decided when the
+    logits were rounded to bf16, one line earlier.
+
+    Whether that rounding is harmless is checkpoint-specific, and for this
+    one there is reason to doubt it. INVESTIGATION_LOG.md 2.11 measured the
+    router as near-uniform: top-1 weight ~1.7-5%, against 1.56% for a flat
+    64-way distribution. A near-uniform softmax means the logits sit in a
+    narrow band, so the top-8/top-9 boundary is decided by differences of
+    roughly the same order as bf16's own resolution at that magnitude. The
+    same section measured top-8 membership differing from HF on 43-90% of
+    positions per layer, and closed the investigation attributing it to
+    unavoidable noise between two independent implementations.
+
+    That conclusion may have stopped one level short. It established that
+    the router is noise-sensitive; it never tested whether some of the
+    noise is self-inflicted by the gate's own precision -- the 2x2
+    kernel-isolation matrix varied the MoE kernel and the attention kernel,
+    never the router's dtype. This flag exists to answer that empirically.
+
+    Note this deliberately makes us *differ* from HF rather than match it.
+    Matching HF caps us at HF; the question here is whether fp32 routing is
+    better than bf16 routing in absolute terms, which is a separate and
+    more useful question than fidelity to a reference that shares the same
+    limitation.
+
+    Cost is negligible by construction: the gate is H x NE = 2048 x 64 =
+    131k parameters, against ~805 MB of expert weights streamed per layer.
+    It cannot meaningfully move a kernel that is bandwidth-bound on the
+    experts -- but that claim is measured, not assumed (see h100x2_bench.md).
+    """
+    if not FP32_ROUTER:
+        return gate(x_flat)
+    return F.linear(x_flat.float(), gate.weight.float())
 
 
 class KVCacheBuffer:
@@ -130,7 +180,7 @@ class TritonFusedMoEBlock(nn.Module):
 
         B, T, H = x.shape
         x_flat = x.view(B * T, H)
-        router_logits = self.gate(x_flat)
+        router_logits = _router_logits(self.gate, x_flat)
         routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float32)
 
         topk_weights, topk_ids = torch.topk(routing_weights, self.cfg.TOPK, dim=-1)
@@ -360,7 +410,9 @@ class MoEBlock(nn.Module):
         B, T, _ = x.shape
         x_flat = x.view(B * T, cfg.H)
 
-        routing_weights_full = F.softmax(self.gate(x_flat), dim=-1, dtype=torch.float32)
+        routing_weights_full = F.softmax(
+            _router_logits(self.gate, x_flat), dim=-1, dtype=torch.float32
+        )
         routing_weights, selected_experts = torch.topk(routing_weights_full, cfg.TOPK, dim=-1)
 
         expert_mask = F.one_hot(selected_experts, num_classes=cfg.NE).permute(2, 1, 0)

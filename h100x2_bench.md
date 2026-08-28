@@ -597,7 +597,218 @@ lengths.
 
 ---
 
-## 9. Open items from this session
+## 9. Chasing accuracy without paying throughput
+
+Goal: raise GSM8K accuracy from the §8c baseline (71.0%, n=200) without
+giving back the throughput from §5/§7. Two candidate mechanisms were
+tested and one methodological finding fell out that matters more than
+either.
+
+### 9a. Router precision — a gap the closed investigation never tested
+
+`INVESTIGATION_LOG.md` §2.11 closed the `model_update`-vs-HF accuracy gap
+as **inherent numerical noise**, on the strength of a 2×2 kernel-isolation
+matrix (Triton-vs-eager MoE × eager-vs-SDPA attention). That matrix varied
+the MoE kernel and the attention kernel. **It never varied the router's
+own precision.**
+
+Both implementations do the same thing — reference at
+`weights/modeling_lladamoe.py:676-678`, ours previously at `model.py:133`:
+
+```python
+router_logits  = self.gate(hidden_states)                 # bf16
+routing_weights = F.softmax(router_logits, dtype=float)   # fp32
+```
+
+The fp32 upcast is **cosmetic**: `topk` ranks the softmax output, but
+softmax is monotonic, so the ordering was already decided when the logits
+were rounded to bf16 one line earlier. And §2.11's own measurement says
+that ordering is fragile — top-1 routing weight of **1.7–5%**, against
+1.56% for a flat 64-way distribution, meaning the whole logit vector sits
+in a band narrow enough that the top-8/top-9 boundary is decided by
+differences comparable to bf16's own resolution.
+
+**Measured directly** (`_router_logits`, gated by `LLADA_FP32_ROUTER`;
+probe on a real 191-token chat-templated GSM8K prompt, all 16 MoE layers,
+comparing top-8 *sets* from bf16 vs fp32 logits on identical hidden
+states):
+
+| Layer | top-8 set differs | top-1 differs | mean top-1 weight |
+|---:|---:|---:|---:|
+| 0 | **94.2%** | 34.6% | 2.15% |
+| 1 | 58.6% | 9.4% | 2.71% |
+| 2 | 43.5% | 4.2% | 2.60% |
+| 7 | 10.5% | 1.6% | 4.74% |
+| 13 | 11.5% | 1.6% | 8.08% |
+| **overall** | **24.1%** | 4.5% | — |
+
+**bf16 rounding in the gate alone flips top-8 membership on 24.1% of
+positions**, against the 43–90% total divergence §2.11 measured versus HF.
+So a substantial share of what was closed as "unavoidable inter-
+implementation noise" is self-inflicted by our own gate precision. The
+per-layer correlation is exactly the predicted mechanism: layer 0 has the
+most uniform router (2.15% top-1) and the most divergence (94.2%); the
+deeper, sharper layers diverge least.
+
+### 9b. Does it help? +3.0 points, but **not** statistically significant
+
+n=200, seed 42, `steps=1024 block_length=64 threshold 0.9/0.4`, both arms
+run **simultaneously on separate GPUs** so questions/session/box are
+identical:
+
+| Arm | Accuracy |
+|---|---:|
+| fp32 router | **74.0% (148/200)** |
+| bf16 router (control) | 71.0% (142/200) |
+
+The control reproduced §8c's 71.0%/142 **exactly**, confirming the
+comparison is clean and the pipeline deterministic.
+
+A +3.0pt marginal at n=200 is inside one standard error, so the marginal
+alone proves nothing. These are *paired* runs, so the right test is
+McNemar on the discordant pairs:
+
+| | count |
+|---|---:|
+| both correct | 125 |
+| **fp32 only (gained)** | **23** |
+| **bf16 only (lost)** | **17** |
+| both wrong | 35 |
+| discordant | 40 (net **+6** for fp32) |
+| **exact McNemar, two-sided** | **p = 0.43** |
+
+**Not significant.** And the more important number is the churn: **40 of
+200 questions — 20% of the test set — flip outcome from a router-precision
+change alone.** That is the real result. This checkpoint's near-uniform
+router makes a fifth of GSM8K a near-coin-flip under *any* numerical
+perturbation.
+
+**Methodological consequence for this project:** every accuracy comparison
+at n=200 carries roughly ±3pt of intrinsic churn. Marginal comparisons at
+that scale cannot distinguish a real 3-point effect from noise — paired
+McNemar is required, and even that needs n≈1000 for the power to resolve
+an effect this size. This retroactively explains the n=50-vs-n=200
+instability in §4 and the historical numbers the project already retired.
+It also means **§8c's +3.5pt deserves the same scrutiny** — though ~5 of
+its 7 questions were the deterministic collapses, a mechanistic effect
+rather than churn.
+
+### 9c. Throughput cost: none
+
+The constraint was to not give back throughput. Measured at production
+scale (`BATCH_MAX_SIZE=64`, concurrency 64, fixed prompts, single GPU):
+
+| | Tok/s | p50 |
+|---|---:|---:|
+| fp32 router ON | 703.2 | 11.51s |
+| fp32 router OFF | 705.5 | 11.52s |
+
+**−0.3%, inside noise.** As predicted from the ratio: the gate is
+2048×64 = 131k parameters against ~805 MB of expert weights streamed per
+layer, so on a kernel that is bandwidth-bound on the experts it cannot
+register.
+
+One caveat worth recording, because it looks alarming in isolation: on the
+**single-stream** GSM8K path fp32 routing cost **+11.7%** (802.8s vs
+718.6s for n=200). That is not a contradiction — at concurrency 1 the gate
+sees only ~64 rows, the pipeline is kernel-launch-bound rather than
+bandwidth-bound, and the extra cast kernels are visible. The cost vanishes
+exactly where throughput is actually made.
+
+### 9d. Extraction failures — ruled out, no free accuracy there
+
+Hypothesis: some wrong answers are correct reasoning that the grader
+mis-extracts (the README flags a "last number anywhere" fallback). Tested
+against saved transcripts for all 200 questions:
+
+- **14 of 58** wrong answers *do* contain the expected value somewhere in
+  the response — but **0 of those have it as the final number.**
+- Inspecting them, they are genuine reasoning errors, not extraction
+  errors. Q108 is representative: expected 60,000 (hours), the model
+  computed 60,000 correctly and then converted to "2,500 days" — a
+  question-comprehension failure, graded correctly as wrong.
+
+**The grader is working.** There is no free accuracy hiding in extraction.
+
+Also measured, from the same transcripts: wrong answers are **longer**
+than correct ones (median 743 vs 542 chars; max 3,834 vs 1,362),
+consistent with §2.9's length-bucketed finding that failures concentrate
+in long responses. And **5 responses still exceed 2,000 characters** even
+at `steps_per_block` 1.0× — so §8c reduced degeneration rather than
+eliminating it entirely.
+
+### 9e. n=1000 settles it: no effect. And the headline number was wrong.
+
+Both arms re-run at **n=1000** — the scale McNemar needs to resolve a
+3-point effect — again simultaneously on separate GPUs:
+
+| Arm | Accuracy |
+|---|---:|
+| fp32 router | 75.7% (757/1000) |
+| bf16 router (control) | 75.2% (752/1000) |
+
+| | count |
+|---|---:|
+| both correct | 671 |
+| fp32 only (gained) | 86 |
+| bf16 only (lost) | 81 |
+| both wrong | 162 |
+| discordant | 167 (net **+5**), churn **16.7%** |
+| **exact McNemar, two-sided** | **p = 0.757** |
+
+**The fp32 router has no accuracy effect.** The +3.0pt at n=200 collapsed
+to +0.5pt at n=1000 — textbook regression to the mean, and exactly what
+the n=200 McNemar (p=0.43) was warning about. Had this been adopted on the
+n=200 point estimate, the project would have shipped a permanent latency
+cost on the single-stream path for nothing.
+
+**The more valuable result is incidental: accuracy is 75.2%, not 71.0%.**
+Every accuracy figure in §4/§8c/§9b came from the same 200-question
+subset, and that subset is simply harder than the full test set. At n=1000
+the same engine, same config, same code scores **75.2%**. Nothing changed
+but the sample.
+
+That reframes the whole accuracy picture in this log:
+
+| Measurement | Value | Status |
+|---|---:|---|
+| n=50 | 74.0% | unrepresentative (§4) |
+| n=200 | 71.0% | unrepresentative — pessimistic by ~4pt |
+| **n=1000** | **75.2%** | **the number to quote** |
+
+It also lands the engine much closer to the HF reference than the n=200
+figure implied. The documented same-harness reference points are HF 74% at
+steps=256 and 82% at steps=512 (n=50, pre-`_stable_subset`, so not
+directly comparable) — 75.2% sits inside that band rather than well below
+it.
+
+### 9f. Status and what this cost
+
+`LLADA_FP32_ROUTER` is committed **default-off**, kept deliberately rather
+than reverted. Two reasons: the probe result in §9a (bf16 gate rounding
+alone flips top-8 membership on 24.1% of positions) is a real and useful
+fact about this checkpoint that future work will want; and this is the
+obvious idea to have after reading §2.11's conclusion, so leaving the
+switch plus the negative result in place stops someone spending another
+two hours rediscovering it.
+
+**Net accuracy gained from this section: zero.** The one mechanism that
+looked promising was measured properly and rejected. What the section
+actually produced is three corrections:
+
+1. The engine's accuracy is **75.2%**, not 71.0% — the previously-quoted
+   figure came from an unrepresentative subset.
+2. **~17% of GSM8K flips under any numerical perturbation** on this
+   checkpoint, so n=200 comparisons carry ±3pt of intrinsic churn and
+   marginal comparison at that scale is not a valid method here.
+3. §2.11's "inherent noise" conclusion is **partly wrong** — 24.1% of the
+   divergence it attributed to unavoidable inter-implementation
+   differences is self-inflicted gate precision. It does not cost accuracy
+   (proven above), but the mechanism was misattributed.
+
+---
+
+## 10. Open items from this session
 
 - [ ] `moe_tune_config.json` still not committed to git, and still not
       device-keyed (unlike `dInfer/configs/*device_name=...json`). Should
@@ -646,8 +857,18 @@ lengths.
       explanations offered, neither confirmed. Would need per-kernel
       profiling under contention (two processes on one GPU) to settle,
       not just end-to-end throughput numbers.
-- [ ] FP8 n=200 accuracy re-run (§6) — the 70.0% vs 74.0% n=50 gap needs
-      the same noise check §4 already ran for BF16.
+- [x] fp32 router (§9) — **tested and rejected.** No accuracy effect at
+      n=1000 (p=0.757); free at throughput (−0.3%) but ~12% cost on the
+      single-stream path. Flag kept default-off with the negative result
+      documented so the idea isn't re-investigated from scratch.
+- [ ] **Every n=50/n=200 accuracy figure in this log is superseded by
+      §9e's n=1000 result (75.2%).** §6's quantization comparison
+      (BF16/INT8/FP8 at n=50) and §8e's TP figure inherit the same
+      sampling problem and should be re-run at n≥1000 before any of them
+      is used to choose between configurations. Given §9's measured 17%
+      churn, none of those 2-question differences mean anything.
+- [ ] FP8 n=200 accuracy re-run (§6) — superseded by the item above; run
+      at n≥1000 or not at all.
 - [ ] FP8 fused kernel — currently dequantize-per-access only; the 12.5s vs
       4.2s/question latency gap in §6 is not apples-to-apples until one
       exists.
