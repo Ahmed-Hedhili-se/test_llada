@@ -77,6 +77,31 @@ except ImportError:  # pragma: no cover - platform dependent
 FUSE_RMSNORM = os.environ.get("LLADA_FUSE_RMSNORM", "1") != "0"
 FUSE_DECODE = os.environ.get("LLADA_FUSE_DECODE", "1") != "0"
 
+# RoPE
+# ----
+# Unlike the two above, this one IS bit-exact, so it has no numerical reason
+# to be opt-in -- the switch exists only as a kill switch.
+#
+# `rotate_half` is `torch.cat([-x2, x1], dim=-1)`: it materialises a full
+# rotated copy of q and k, every layer, every denoising step, purely to
+# express a permutation of the head dimension. ncu attributed ~4% of GPU time
+# to the resulting `aten::cat` (3.04%) + `aten::neg` (0.90%) at the production
+# shape -- second only to the MoE kernel and the cuBLAS GEMMs. See
+# h100x2_bench.md section 10.
+#
+# The rotation is an index permutation, so a kernel can read the partner
+# element directly and never build the copy:
+#
+#     d <  HD/2 :  out[d] = x[d]*cos[d] + (-x[d + HD/2])*sin[d]
+#     d >= HD/2 :  out[d] = x[d]*cos[d] +   x[d - HD/2] *sin[d]
+#
+# Bit-exactness: cos/sin are cast to the model dtype before apply_rope (see
+# model.py), so the eager path is three bf16 ops, each computed in fp32 by
+# ATen's opmath and rounded back. The kernel reproduces that order exactly --
+# multiply, round, multiply, round, add, round -- rather than taking the more
+# accurate fully-fp32 route, for the same reason the SiLU epilogue does.
+FUSE_ROPE = os.environ.get("LLADA_FUSE_ROPE", "1") != "0"
+
 
 if HAS_TRITON:
 
@@ -94,6 +119,48 @@ if HAS_TRITON:
         w = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
         tl.store(out_ptr + row * stride + cols, (w * x_hat).to(out_ptr.dtype.element_ty),
                  mask=mask)
+
+    @triton.jit
+    def _rope_kernel(x_ptr, out_ptr, cos_ptr, sin_ptr,
+                     s_xb, s_xh, s_xt,
+                     s_cb, s_ct,
+                     H, T,
+                     HD: tl.constexpr, HALF: tl.constexpr, BLOCK: tl.constexpr):
+        # One program per (batch, head, token) row; the whole head dim fits in
+        # one block (HD=128 on FULL_CFG), so the partner element the rotation
+        # needs is already in registers-worth of the same contiguous load.
+        pid = tl.program_id(0)
+        t = pid % T
+        h = (pid // T) % H
+        b = pid // (T * H)
+
+        cols = tl.arange(0, BLOCK)
+        mask = cols < HD
+
+        x_row = x_ptr + b * s_xb + h * s_xh + t * s_xt
+        o_row = out_ptr + b * s_xb + h * s_xh + t * s_xt
+        # s_cb is 0 when cos/sin are shared across the batch ([T, HD]), which
+        # collapses the batch term without a second kernel or a broadcast copy.
+        c_row = cos_ptr + b * s_cb + t * s_ct
+        s_row = sin_ptr + b * s_cb + t * s_ct
+
+        x = tl.load(x_row + cols, mask=mask, other=0.0)
+        c = tl.load(c_row + cols, mask=mask, other=0.0)
+        s = tl.load(s_row + cols, mask=mask, other=0.0)
+
+        # rotate_half without materialising it: partner index, then sign.
+        partner = tl.where(cols < HALF, cols + HALF, cols - HALF)
+        xr = tl.load(x_row + partner, mask=mask, other=0.0)
+        xr = tl.where(cols < HALF, -xr, xr)
+
+        # Reproduce ATen's op order exactly: each bf16 op computes in fp32 and
+        # rounds. Doing the whole expression in fp32 and rounding once would be
+        # more accurate and would NOT match, which is the point.
+        ty = out_ptr.dtype.element_ty
+        t1 = (x.to(tl.float32) * c.to(tl.float32)).to(ty)
+        t2 = (xr.to(tl.float32) * s.to(tl.float32)).to(ty)
+        out = (t1.to(tl.float32) + t2.to(tl.float32)).to(ty)
+        tl.store(o_row + cols, out, mask=mask)
 
     @triton.jit
     def _decode_tail_kernel(logits_ptr, argmax_ptr, conf_ptr,
@@ -145,6 +212,41 @@ def fused_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Te
         x, weight, out, x.stride(0), N, eps, BLOCK=BLOCK, num_warps=num_warps
     )
     return out
+
+
+def _rope_one(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Apply RoPE to one [B, H, T, HD] tensor. cos/sin are [T, HD] or [B, T, HD]."""
+    B, H, T, HD = x.shape
+    assert HD % 2 == 0, f"RoPE needs an even head dim, got {HD}"
+    # The kernel indexes the head dim with a bare `cols`, so the last axis must
+    # be contiguous; the transpose(1, 2) upstream leaves it that way, but a
+    # future caller might not.
+    x = x.contiguous()
+    cos = cos.contiguous()
+    sin = sin.contiguous()
+    out = torch.empty_like(x)
+
+    if cos.dim() == 2:                       # [T, HD] shared across the batch
+        s_cb, s_ct = 0, cos.stride(0)
+    else:                                    # [B, T, HD] per-row, left-padded
+        s_cb, s_ct = cos.stride(0), cos.stride(1)
+
+    BLOCK = triton.next_power_of_2(HD)
+    _rope_kernel[(B * H * T,)](
+        x, out, cos, sin,
+        x.stride(0), x.stride(1), x.stride(2),
+        s_cb, s_ct,
+        H, T,
+        HD=HD, HALF=HD // 2, BLOCK=BLOCK,
+        num_warps=4,
+    )
+    return out
+
+
+def fused_rope(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor,
+               sin: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Drop-in for apply_rope. Bit-exact vs the eager path."""
+    return _rope_one(q, cos, sin), _rope_one(k, cos, sin)
 
 
 def fused_decode_tail(logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:

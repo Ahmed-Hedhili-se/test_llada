@@ -271,6 +271,15 @@ def apply_rope(q, k, cos, sin):
     # batch). q/k are [B, H, T, HD], so both need a head axis inserted; the
     # shared case additionally needs a batch axis. The 2-D branch is the
     # original code path, unchanged, so equal-length batches stay bit-identical.
+    #
+    # The fused kernel handles both layouts itself (it folds the batch stride
+    # to 0 for the shared case) and is bit-exact, so it takes cos/sin before
+    # the unsqueeze rather than after.
+    if q.is_cuda:
+        from .fused_ops import FUSE_ROPE, HAS_TRITON, fused_rope
+        if FUSE_ROPE and HAS_TRITON:
+            return fused_rope(q, k, cos, sin)
+
     if cos.dim() == 2:
         cos = cos.unsqueeze(0).unsqueeze(0)
         sin = sin.unsqueeze(0).unsqueeze(0)

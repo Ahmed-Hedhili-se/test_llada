@@ -953,7 +953,72 @@ Neither was implemented this session. Both are measured, not guessed.
 
 ---
 
-## 11. Open items from this session
+## 11. Implemented: fused RoPE (+4.2% throughput, bit-exact)
+
+§10's first identified opportunity, built and shipped.
+
+`rotate_half` was `torch.cat([-x2, x1], dim=-1)` — materialising a full
+rotated copy of q and k every layer, every denoising step, purely to
+express a permutation of the head dimension. The rotation is an index
+permutation, so a kernel reads the partner element directly and never
+builds the copy:
+
+```
+d <  HD/2 :  out[d] = x[d]*cos[d] + (-x[d + HD/2])*sin[d]
+d >= HD/2 :  out[d] = x[d]*cos[d] +   x[d - HD/2] *sin[d]
+```
+
+One program per (batch, head, token); the whole head dim (HD=128) fits in
+one block, so the partner element is already in the same contiguous load.
+`cos`/`sin` arrive as either `[T, HD]` (shared) or `[B, T, HD]` (per-row,
+left-padded) — the kernel folds the batch stride to 0 for the shared case
+rather than needing a second kernel or a broadcast copy.
+
+### Bit-exact, deliberately
+
+Unlike the RMSNorm and decode-tail fusions, this one reassociates nothing,
+so it can be — and therefore must be — bit-exact. `cos`/`sin` are cast to
+the model dtype before `apply_rope` (`model.py`), so the eager path is
+three bf16 ops, each computed in fp32 by ATen's opmath and rounded back.
+The kernel reproduces that order exactly (multiply, round, multiply,
+round, add, round) rather than taking the more accurate fully-fp32 route —
+the same discipline the SiLU epilogue applies, and for the same reason:
+being *more* accurate than the reference is still a behaviour change.
+
+`eval/test_fused_rope.py` asserts `torch.equal`, not a tolerance, across
+8 shape/layout combinations including GQA (`KVH != NH`), odd `T`, batch-1
+decode and the production `B=64, T=32`:
+
+| | Result |
+|---|---|
+| Bit-exactness, all 8 cases, q and k | **bit-exact** |
+| Kernel speed, B64 T32 shared | 0.1458 → 0.0679 ms (**2.15×**) |
+| Kernel speed, B64 T32 per-row | 0.1552 → 0.0679 ms (**2.29×**) |
+| Kernel speed, B1 T32 (decode) | 0.1055 → 0.0533 ms (1.98×) |
+
+Because it is bit-exact at the op level, q and k are identical downstream,
+so **accuracy is provably unchanged** — no GSM8K re-run was needed to
+establish that, which is exactly what bit-exactness is worth.
+
+### End-to-end
+
+| | Tok/s | p50 |
+|---|---:|---:|
+| `LLADA_FUSE_ROPE=0` | 700.9 | 11.54s |
+| **`LLADA_FUSE_ROPE=1` (new default)** | **730.3** | **11.10s** |
+
+**+4.2% throughput**, matching §10's ~4% estimate from the op profile.
+Regression suite 9/9. Re-profiling confirms `aten::cat` and `aten::neg`
+have left the profile entirely, replaced by `_rope_kernel` at 5.17% —
+which also absorbs the `mul` and `add` that were separate elementwise
+launches.
+
+Shipped default-on (`LLADA_FUSE_ROPE=1`); the switch is a kill switch, not
+a numerical hedge.
+
+---
+
+## 12. Open items from this session
 
 - [ ] `moe_tune_config.json` still not committed to git, and still not
       device-keyed (unlike `dInfer/configs/*device_name=...json`). Should
@@ -961,9 +1026,8 @@ Neither was implemented this session. Both are measured, not guessed.
       silently stale on the next machine.
 - [ ] Autotuner's `shmem=None occ=None` introspection failure — cosmetic
       so far, but worth root-causing.
-- [ ] **Fuse RoPE's `rotate_half`** (§10) — `cat` + `neg` are ~4% of GPU
-      time and exist only to express a permutation. Highest
-      value-per-risk item found this session.
+- [x] **Fuse RoPE's `rotate_half`** — DONE (§11). +4.2% throughput,
+      bit-exact, 9/9 regression. Ships default-on as `LLADA_FUSE_ROPE`.
 - [ ] **Fuse the MoE top-k combine into GEMM2's epilogue** (§10) — the
       `[M, top_k, K]` intermediate is 67 MB written + 67 MB read per
       layer through the L2 that ncu identifies as the bottleneck.
