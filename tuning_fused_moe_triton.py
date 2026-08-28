@@ -199,6 +199,10 @@ def benchmark_full_pipeline(M, E, N, K, top_k, config, penalty_weight=0.5):
 # ═══════════════════════════════════════════════════════════════════════════════
 # 4.  PROFILING: occupancy, register usage, shared memory
 # ═══════════════════════════════════════════════════════════════════════════════
+#: One-shot latch so an introspection failure prints once, not per line.
+_PROFILE_WARNED = False
+
+
 def profile_config(config, K, N):
     """
     Queries the Triton compiler metadata for the fused_moe_kernel compiled
@@ -207,13 +211,22 @@ def profile_config(config, K, N):
       - num_warps      : warps launched per block
       - occupancy_pct  : estimated occupancy (based on SM register limits)
     """
+    # The argument list below must track fused_moe_kernel's signature exactly.
+    # It silently did not, for two separate reasons, and the bare `except`
+    # below turned both into `shmem=None occ=None` on every line of tuner
+    # output rather than one loud failure:
+    #   - SILU_EPILOGUE was never passed, from the moment that fusion landed;
+    #   - a_scale_ptr/b_scale_ptr, stride_bse/stride_bsn and
+    #     use_fp8_w8a8/use_int8_w8a16 were still being passed after they were
+    #     removed from the kernel as dead vLLM inheritance.
+    # Either one raises TypeError, which was caught and discarded. The caller
+    # now surfaces the error once instead (see main()).
     try:
         compiled = fused_moe_kernel.warmup(
-            # We pass dummy pointers; warmup only compiles and inspects metadata
+            # Dummy pointers; warmup only compiles and inspects metadata.
             torch.empty(1, dtype=torch.bfloat16, device="cuda"),   # a_ptr
             torch.empty(1, dtype=torch.bfloat16, device="cuda"),   # b_ptr
             torch.empty(1, dtype=torch.bfloat16, device="cuda"),   # c_ptr
-            None, None,    # scale ptrs
             torch.empty(1, dtype=torch.float32, device="cuda"),    # topk_weights
             torch.empty(1, dtype=torch.int32,   device="cuda"),    # sorted_token_ids
             torch.empty(1, dtype=torch.int32,   device="cuda"),    # expert_ids
@@ -222,7 +235,6 @@ def profile_config(config, K, N):
             1, 1,          # stride_am, stride_ak
             1, 1, 1,       # stride_be, stride_bk, stride_bn
             1, 1,          # stride_cm, stride_cn
-            0, 0,          # stride_bse, stride_bsn
             BLOCK_SIZE_M   = config["BLOCK_SIZE_M"],
             BLOCK_SIZE_N   = config["BLOCK_SIZE_N"],
             BLOCK_SIZE_K   = config["BLOCK_SIZE_K"],
@@ -230,40 +242,63 @@ def profile_config(config, K, N):
             MUL_ROUTED_WEIGHT = False,
             top_k          = 1,
             compute_type   = tl.bfloat16,
-            use_fp8_w8a8   = False,
-            use_int8_w8a16 = False,
             is_first_gemm  = True,
+            SILU_EPILOGUE  = FUSE_SILU,
             num_warps      = config["num_warps"],
             num_stages     = config["num_stages"],
             grid           = (1,),
         )
         meta = compiled.metadata
         shared_bytes = getattr(meta, "shared", None)
-        # Occupancy estimate. The constants below were hardcoded to Ampere/A40
-        # (100KB shmem per SM, 48 max warps per SM); on H100 the per-SM shmem is
-        # ~228KB and max warps is 64, so the old figures under-reported occupancy
-        # by ~25% and over-penalised large tiles. Query the device instead.
+        n_regs = getattr(meta, "n_regs", None)
+        n_spills = getattr(meta, "n_spills", None)
+
+        # Device-queried, not hardcoded: the previous constants were Ampere/A40
+        # (100KB shmem/SM, 48 warps/SM) and under-report H100 by ~25%.
         props = torch.cuda.get_device_properties(torch.cuda.current_device())
         shmem_per_sm = getattr(props, "shared_memory_per_multiprocessor", 102400)
         max_threads_per_sm = getattr(props, "max_threads_per_multi_processor", 1536)
         max_warps_per_sm = max(max_threads_per_sm // 32, 1)
         regs_per_sm = getattr(props, "regs_per_multiprocessor", 65536)
 
+        num_warps = getattr(meta, "num_warps", config["num_warps"])
+        threads_per_block = num_warps * 32
+
+        # Registers are per THREAD, so the block's register footprint is
+        # n_regs * threads_per_block. The old formula divided the SM's register
+        # file by the thread count alone, which is a register-per-thread budget,
+        # not a block count -- it produced a number ~n_regs times too large and
+        # so never actually bound.
+        # NOTE: Triton 3.1's warmup metadata does not expose n_regs (it is
+        # populated after a real launch, not after compilation), so on that
+        # version only the shared-memory limit applies and this number is an
+        # UPPER BOUND. Measured against ncu on H100 at BM=64/BN=128: this
+        # reports 25%, ncu measures 12.4% -- because registers (234/thread)
+        # bind first and are invisible here. Treat it as "shmem does not
+        # prevent N blocks", not as achieved occupancy. If a future Triton
+        # exposes n_regs the register term below starts applying and the two
+        # converge.
+        limits = []
+        if shared_bytes:
+            limits.append(shmem_per_sm // shared_bytes)
+        if n_regs:
+            limits.append(regs_per_sm // max(n_regs * threads_per_block, 1))
         occupancy_pct = None
-        if shared_bytes is not None and shared_bytes > 0:
-            max_blocks_by_shmem = shmem_per_sm // shared_bytes
-            max_blocks_by_regs  = regs_per_sm // max(meta.num_warps * 32, 1)
-            blocks_per_sm       = min(max_blocks_by_shmem, max_blocks_by_regs, 16)
-            occupancy_pct       = round(
-                blocks_per_sm * meta.num_warps / max_warps_per_sm * 100
-            )
+        if limits:
+            blocks_per_sm = max(min(min(limits), 32), 0)
+            occupancy_pct = round(blocks_per_sm * num_warps / max_warps_per_sm * 100)
+
         return {
             "shared_bytes":   shared_bytes,
-            "num_warps":      getattr(meta, "num_warps", config["num_warps"]),
+            "num_warps":      num_warps,
+            "n_regs":         n_regs,
+            "n_spills":       n_spills,
             "occupancy_pct":  occupancy_pct,
         }
     except Exception as e:
-        return {"shared_bytes": None, "num_warps": config["num_warps"], "occupancy_pct": None, "error": str(e)}
+        return {"shared_bytes": None, "num_warps": config["num_warps"],
+                "n_regs": None, "n_spills": None,
+                "occupancy_pct": None, "error": f"{type(e).__name__}: {e}"}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -314,6 +349,7 @@ def verify_correctness(E, N, K, top_k, config_under_test, reference_config):
 # 6.  MAIN TUNING LOOP
 # ═══════════════════════════════════════════════════════════════════════════════
 def main():
+    global _PROFILE_WARNED
     import argparse
     import os
     ap = argparse.ArgumentParser(
@@ -337,14 +373,22 @@ def main():
     ap.add_argument("--top-configs",  type=int, default=3,
                     help="Print profiling for the top-N configs per M.")
     ap.add_argument("--output",       default=None,
-                    help="Output JSON path (default: <repo_root>/moe_tune_config.json).")
+                    help="Output JSON path (default: a device-keyed file in <repo_root>, "
+                         "e.g. moe_tune_config.device_name=NVIDIA_H100_PCIe.json).")
     ap.add_argument("--verify",       action="store_true", default=True)
     args = ap.parse_args()
 
     if args.output is None:
         # Default: save to repo root so fused_moe_triton.py picks it up automatically
         repo_root = os.path.dirname(os.path.abspath(__file__))
-        args.output = os.path.join(repo_root, "moe_tune_config.json")
+        # Device-keyed by default. Tile shapes are hardware-specific -- this
+        # file used to be one unkeyed moe_tune_config.json, so a config tuned
+        # on one GPU loaded silently on another with nothing in the filename
+        # to say so. fused_moe_triton.py prefers the keyed name and warns if
+        # it falls back to the legacy one.
+        from model_update.fused_moe_triton import _device_tag
+        args.output = os.path.join(
+            repo_root, f"moe_tune_config.device_name={_device_tag()}.json")
 
     if not torch.cuda.is_available():
         print("CUDA is required."); return
@@ -408,13 +452,24 @@ def main():
         print(f"\n  Top {args.top_configs} configs for M={M}:")
         for rank, (score, lat, pad, cfg) in enumerate(results[:args.top_configs]):
             prof = profile_config(cfg, K, N)
+            # Surface an introspection failure once, loudly, instead of
+            # printing shmem=None occ=None on every line forever. The whole
+            # point of this block is register/shared-mem pressure; silently
+            # reporting nothing is worse than not reporting.
+            if prof.get("error") and not _PROFILE_WARNED:
+                print(f"    [warn] kernel introspection unavailable: {prof['error']}")
+                print( "           shmem/occupancy/register columns will read '?'.")
+                _PROFILE_WARNED = True
             bm = cfg["BLOCK_SIZE_M"]
+            spill = prof.get("n_spills")
+            spill_s = f" spill={spill}" if spill else ""
             print(f"    [{rank+1}] BM={bm:3d} BN={cfg['BLOCK_SIZE_N']:3d} "
                   f"BK={cfg['BLOCK_SIZE_K']:3d} GM={cfg['GROUP_SIZE_M']} "
                   f"nw={cfg['num_warps']} ns={cfg['num_stages']}  "
                   f"lat={lat:.3f}ms  pad={pad:.1%}  score={score:.3f}  "
-                  f"shmem={prof.get('shared_bytes','?')}B  "
-                  f"occ={prof.get('occupancy_pct','?')}%")
+                  f"shmem={prof.get('shared_bytes') or '?'}B  "
+                  f"regs={prof.get('n_regs') or '?'}  "
+                  f"occ={prof.get('occupancy_pct') or '?'}%{spill_s}")
 
         # ── Correctness check on winner ───────────────────────────────────
         if args.verify:
@@ -437,7 +492,8 @@ def main():
 
     print(f"{'='*70}")
     print(f"  Tuning complete. Saved to: {args.output}")
-    print(f"  To apply: ensure moe_tune_config.json is in your repo root.")
+    print("  To apply: keep this file in the repo root; fused_moe_triton.py")
+    print("            loads the device-keyed name matching the GPU it runs on.")
     print(f"  All ranks read this one file at import time — tuning on a single")
     print(f"  GPU is sufficient; do NOT re-run it per GPU.")
     print(f"{'='*70}\n")

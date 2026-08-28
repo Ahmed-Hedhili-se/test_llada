@@ -44,15 +44,29 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import random
 import time
 from typing import Dict, List, Optional
 
 import aiohttp
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 app = FastAPI(title="LLaDA-MoE DP Router")
+
+#: Per-request dispatch logging. Default OFF.
+#:
+#: This was unconditional, and it is a blocking write to stdout executed from
+#: inside the asyncio event loop on the completion path of every request. At
+#: the concurrencies this router exists to serve it stalls the loop that is
+#: also proxying every other in-flight request. Measured on 2xH100: two
+#: replicas driven directly, without the router, reach 1190 tok/s; through the
+#: router the same pair reached 896 -- a 24.7% tax that is not GPU contention
+#: (running both replicas concurrently but unrouted costs only 7%).
+#:
+#: Set LLADA_ROUTER_LOG=1 to get it back for debugging.
+LOG_EACH = os.environ.get("LLADA_ROUTER_LOG", "0") != "0"
 
 #: Endpoints proxied verbatim to a chosen replica.
 PROXIED = ("/v1/chat/completions", "/v1/completions")
@@ -157,10 +171,20 @@ async def _forward(path: str, payload: dict) -> JSONResponse:
     try:
         s = await POOL.session()
         async with s.post(f"{replica.url}{path}", json=payload) as resp:
-            body = await resp.json()
+            # Pass the replica's bytes straight through. The previous version
+            # did `await resp.json()` then handed the dict to JSONResponse,
+            # which re-serialised it -- a full parse and a full re-encode of
+            # every completion body, on the event loop, per request, to
+            # reproduce bytes the replica had already produced. The router
+            # does not inspect the body, so there is nothing to parse it for.
+            raw = await resp.read()
             if resp.status != 200:
                 replica.failures += 1
-            return JSONResponse(status_code=resp.status, content=body)
+            return Response(
+                content=raw,
+                status_code=resp.status,
+                media_type=resp.headers.get("content-type", "application/json"),
+            )
     except Exception as exc:
         replica.failures += 1
         replica.last_error = str(exc)
@@ -171,9 +195,10 @@ async def _forward(path: str, payload: dict) -> JSONResponse:
     finally:
         replica.inflight -= 1
         replica.total += 1
-        print(f"[router] {path} -> {replica.url} "
-              f"({time.monotonic() - started:.2f}s, inflight now {replica.inflight})",
-              flush=True)
+        if LOG_EACH:
+            print(f"[router] {path} -> {replica.url} "
+                  f"({time.monotonic() - started:.2f}s, inflight now {replica.inflight})",
+                  flush=True)
 
 
 @app.post("/v1/chat/completions")

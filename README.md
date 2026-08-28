@@ -54,7 +54,7 @@ Each expert is a SwiGLU FFN: `W1 = [gate ; up]` (2048 → 2×1024), `SiLU(gate) 
 
 **6. Variable-length batching** — prompts of different lengths are left-padded to a common width, with per-row RoPE positions and an additive attention mask. Before this, requests could only batch if their prompts tokenized to *exactly* the same length.
 
-**Rejected: fused QKV.** One GEMM instead of three measured 1.62× at M=32, 0.99× at M=256, **0.96× at M=1024**, 1.17× at M=2048. This engine runs at M = batch × suffix_length, so batch 32 at block 32 sits near M=1024 — exactly where it loses. `eval/test_fusions.py` still measures it, since the answer is cuBLAS- and shape-dependent.
+**Rejected on A6000, flips on H100: fused QKV.** One GEMM instead of three measured 1.62× at M=32, 0.99× at M=256, **0.96× at M=1024**, 1.17× at M=2048 on A6000 — and this engine runs at M = batch × suffix_length, so batch 32 at block 32 sits near M=1024, exactly where it lost. On **H100 the same test measures 1.87× / 3.76× / 1.18× / 1.12×** — faster at every size, and bit-exact at M≥256. It remains unfused because `lm_head` dominates the cuBLAS time, so the end-to-end gain is ~0.5%, below the measurement noise floor, and enabling it would need a shape-dependent bit-exactness rule. `eval/test_fusions.py` measures it on whatever card you run: the answer is cuBLAS- and shape-dependent, not universal.
 
 ---
 
@@ -112,7 +112,11 @@ Throughput is past its knee by 32: 4× the batch buys 1.62× the throughput. The
 
 ### Kernel profile
 
-`fused_moe_kernel` is **58.75% of GPU time** at **81% of theoretical weight-streaming bandwidth** — the expert weights (805 MB/layer) stream every forward regardless of token count. There is no kernel headroom left there; the levers are batching, quantization, or faster memory.
+`fused_moe_kernel` is the dominant kernel — **58.75% of GPU time on A6000, 55.3% on H100**. Where the bottleneck sits is **hardware-dependent**, so the levers differ per card.
+
+On A6000 it is close to a weight-streaming wall: the expert weights (805 MB/layer) stream every forward regardless of token count.
+
+On H100 it is **not**. Nsight Compute at the production shape measures **DRAM throughput 14.5%, L2 79.7%, compute 49.6%** — ncu names the L2 as the bottleneck outright, and DRAM is nowhere near saturated. An earlier revision of this section claimed "81% of theoretical weight-streaming bandwidth" and "no kernel headroom left"; that is an A6000 figure and does not transfer. See `h100x2_bench.md` §10.
 
 > Nsight's "Memory Throughput ~96%" is **L2**, not DRAM (DRAM sits at 66–68%). Read as a DRAM ceiling it says "nothing to gain"; read as an L2 ceiling it says "remove intermediate traffic" — which is what produced optimization 3.
 
@@ -195,7 +199,7 @@ Same 50 questions, same box — the first genuinely comparable accuracy pair in 
 
 > `HISTORICAL, NOT REPRODUCIBLE AS STATED` — earlier runs reported 88.0% (threshold 0.9/0.4) against an HF reference at 82.0%, and 76.0% for the fixed schedule. Those predate the `_stable_subset` fix, so `--seed 42` selected a *different* 50 questions on a different machine. They are not wrong for the set they saw, and they are not comparable to the table above. Re-run before quoting.
 
-> **`steps_per_block >= block_length / 2` is mandatory when a threshold is set.** At ratio 0.25 generation collapses into degenerate repetition (0% accuracy); at 0.5 it recovers fully. A runtime warning fires below the guideline. A `remask_threshold` mechanism was tried for the residual repetition and made things categorically worse (0%) — reverted.
+> **`steps_per_block >= block_length / 2` is the floor, not the recommended setting.** At ratio 0.25 generation collapses into degenerate repetition (0% accuracy); at 0.5 it recovers fully and a runtime warning fires below that. But **0.5 is still on the edge**: measured at n=200 on H100, ratio 0.5 produced 5 deterministic degenerate-repetition failures (2.5% of questions) that **ratio 1.0 eliminates entirely**, worth +3.5pt accuracy for +6% time — the step budget is a ceiling, not a floor, so early exit absorbs most of the extra. **Prefer `steps_per_block >= block_length`.** See `h100x2_bench.md` §8c. A `remask_threshold` mechanism was tried for the residual repetition and made things categorically worse (0%) — reverted.
 
 > `_grade_gsm8k` falls back to "last number anywhere in the response" when the extracted span has no digits; 3 of 44 correct answers in one run rest on that fallback. Comparisons *within* this harness hold; the margin over the paper's 82.41% is softer than it looks.
 
@@ -212,7 +216,12 @@ bash start_dp.sh --gpus 8 --quantize int8
 
 `src/router.py` routes **least-outstanding**, not round-robin: a replica runs a whole batch to completion, so one that just accepted 32 requests is busy for ~35 s while an idle one answers immediately. Unhealthy replicas leave rotation and are retried in the background. `GET /v1/replicas` shows live per-replica load.
 
-TP+EP remains available (`start.sh --tp-size N`) and is the right choice for **single-request latency** only: 2× A6000 measured 6.15× vs a single-GPU baseline at 128 tokens.
+TP+EP remains available (`start.sh --tp-size N`), but **do not reach for it on latency grounds without measuring on your own hardware.** The 6.15× figure previously quoted here was 2× A6000 against the *unoptimized* baseline, not against `model_update/` on one GPU. Measured on 2× H100 PCIe (no NVLink):
+
+- At concurrency 1 with 128-token generation, TP+EP=2 and a single replica are **statistically tied** (24.8 vs 23.3 tok/s).
+- At realistic GSM8K length it **inverts**: 19.4 s/question against a single GPU's 3.4–3.8 s, because TP's per-layer NCCL all-reduce cost is paid *per diffusion step* and GSM8K runs far more steps than the throughput benchmark does.
+
+On an NVLink'd node the picture may differ; on PCIe it does not favour TP. See `h100x2_bench.md` §7, §8e.
 
 ---
 

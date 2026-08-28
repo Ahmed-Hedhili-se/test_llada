@@ -1212,27 +1212,160 @@ slightly better engine ratio, and considerably more batching headroom.
 
 ---
 
-## 14. Open items from this session
+## 14. Closing out the backlog
 
-- [ ] `moe_tune_config.json` still not committed to git, and still not
-      device-keyed (unlike `dInfer/configs/*device_name=...json`). Should
-      be renamed/keyed and committed so it isn't silently regenerated or
-      silently stale on the next machine.
-- [ ] Autotuner's `shmem=None occ=None` introspection failure — cosmetic
-      so far, but worth root-causing.
+### 14a. Why DP scales sub-linearly — and a measurement of mine that was wrong
+
+§12 measured DP=2 at 1.30–1.37× a single GPU. To separate the candidates —
+router overhead, uneven load balancing, or plain GPU/host contention — one
+replica was driven **directly on its own port with no router in the path**,
+then both together, then through the router.
+
+| | tok/s | |
+|---|---:|---|
+| Replica 0 alone, direct | 642.6 ± 2.7 | |
+| Replica 1 alone, direct | 625.0 ± 0.5 | |
+| Both directly, simultaneously | 1190.2 ± 111.7 | **0.93×** of perfect 2× |
+| Through the router | 895.8 ± 46.2 | |
+
+Read naively that says the router costs 24.7% while contention costs only
+7%. **That reading is wrong, and the error was mine.** The routed arm had a
+`curl` poll loop running against `/v1/replicas` every second to check load
+balance — ~80 short-lived `curl`+`python3` processes spawned during a 30 s
+benchmark, on the same host as both the client and the router. The direct
+arm had no such instrumentation. **The measurement designed to test the
+router handicapped only the router.**
+
+Re-measured without polling, the routed number is 1087–1149 tok/s, i.e.
+**level with the unrouted 1146–1190**. The router is not the bottleneck;
+the earlier −24.7% is retracted.
+
+The load-balance question it was meant to answer resolves cleanly anyway:
+per-round completed counts were `[97, 96]` and `[91, 102]` after warmup.
+Least-outstanding balances fine. (The first round's `[65, 128]` is
+warm-up, and the `inflight` samples that looked lopsided were `sort -u`
+output — lexicographic, not chronological. Both were misreads on my part.)
+
+### 14b. Two real router inefficiencies, fixed
+
+Found by reading `_forward` rather than by the benchmark:
+
+- **A blocking `print(..., flush=True)` on every request**, executed from
+  inside the asyncio event loop on the completion path — stalling the loop
+  that is concurrently proxying every other in-flight request. Now behind
+  `LLADA_ROUTER_LOG` (default off).
+- **A full JSON parse and re-encode of every response body.** `_forward`
+  did `await resp.json()` and handed the dict to `JSONResponse`, which
+  re-serialised it — reproducing bytes the replica had already produced,
+  on the event loop, per request. The router never inspects the body.
+  Now passed through as raw bytes with the upstream content-type.
+
+Both are correct independent of measurement: removing a redundant
+serialise/deserialise pair and a synchronous write from an async hot path
+is right whether or not a noisy harness resolves it.
+
+**Measured effect, cleanest comparison** (§12 vs a fresh single-server,
+3-rep, no-polling sweep — same protocol, differing only in router code):
+
+| Concurrency | old router (§12) | fixed router | Δ |
+|---:|---:|---:|---:|
+| 32 | 855.4 ± 16.2 | **871.6 ± 23.9** | +1.9% |
+| **64** | 897.9 ± 55.3 | **954.5 ± 52.8** | **+6.3%** |
+| 128 | 601.4 ± 80.2 | 599.3 ± 129.3 | −0.3% |
+
+Directionally positive, largest where the router works hardest, but the
+spreads overlap — **not significant**, same as §11's RoPE result. An
+isolated A/B of the logging flag alone (6 reps/arm, interleaved) gave
+log-off 1149.3 ± 141.3 vs log-on 1087.2 ± 126.7: **+5.7%, also inside
+noise**. The honest summary is "principled fixes, ~2–6%, not separable
+from a ±15% harness".
+
+**Updated DP peak: 954.5 tok/s at concurrency 64**, giving 954.5 / 656.9 =
+**1.45×** a single GPU — up from §12's 1.37×, still short of 2×, and the
+residual is now attributable to the 0.93× host/GPU contention measured
+above rather than to the router.
+
+### 14c. Autotuner introspection — root-caused and fixed
+
+Every tuner line printed `shmem=NoneB occ=None%` (§2). Two independent
+breakages, both swallowed by a bare `except Exception` that discarded the
+error and returned all-`None`:
+
+- `profile_config` never passed `SILU_EPILOGUE`, from the moment that
+  fusion landed;
+- it was still passing `a_scale_ptr`/`b_scale_ptr`, `stride_bse`/
+  `stride_bsn` and `use_fp8_w8a8`/`use_int8_w8a16` after `80a7c38`
+  removed them from the kernel as dead vLLM inheritance.
+
+Either raises `TypeError`. Fixed both, and the caller now surfaces an
+introspection failure **once, loudly**, instead of printing `None` forever.
+The occupancy formula was also wrong: it divided the SM register file by
+the *thread* count, which is a registers-per-thread budget, not a block
+count. It now divides by `n_regs × threads_per_block`.
+
+Now reports `shmem=24576B occ=25%` where it reported nothing.
+
+**With a caveat recorded in the code**: Triton 3.1's warmup metadata does
+not expose `n_regs`, so only the shared-memory limit applies and the
+number is an **upper bound**. Against ncu on the same config it reports
+25% where ncu measures 12.4% — because registers (234/thread) bind first
+and are invisible here. It is "shared memory does not prevent N blocks",
+not achieved occupancy.
+
+### 14d. Device-keyed tuning configs
+
+Tile shapes are hardware-specific — the tuner's own docstring says to run
+it per GPU, and the H100 and A6000 winners differ at every M — but the
+output was a single unkeyed `moe_tune_config.json`, so a config tuned on
+one card loaded silently on another with nothing in the filename to say
+so. `dInfer/configs/` already keys by `device_name=`; this now does the
+same:
+
+1. `moe_tune_config.device_name=<GPU>.json` — preferred
+2. `moe_tune_config.json` — legacy, still honoured, but **warns** that it
+   cannot be verified against the running GPU
+
+The H100 config is committed under its keyed name.
+
+### 14e. README corrections
+
+Four claims the H100 data contradicts, all now fixed at the source rather
+than only in this log:
+
+- **Kernel profile** — "81% of theoretical weight-streaming bandwidth /
+  no kernel headroom left" replaced with the per-hardware split (A6000
+  near a streaming wall; H100 at DRAM 14.5%, L2 79.7%, compute 49.6%).
+- **`steps_per_block`** — reframed from a mandate at `≥ block_length/2` to
+  a *floor*, with `≥ block_length` recommended, citing the 5 deterministic
+  collapses that ratio 0.5 produces and ratio 1.0 removes.
+- **Multi-GPU / TP latency** — the "6.15× vs single-GPU" claim was against
+  the *unoptimized* baseline. Replaced with the measured PCIe result: tied
+  at concurrency 1 / 128 tokens, and 5–6× *worse* at GSM8K length.
+- **Fused QKV** — the A6000 rejection now notes the H100 numbers flip it
+  (faster at every size, bit-exact at M≥256), and states why it still is
+  not enabled: `lm_head` dominates the cuBLAS time so the end-to-end gain
+  is ~0.5%, below the noise floor.
+
+---
+
+## 15. Open items from this session
+
+- [x] `moe_tune_config.json` — **DONE (§14d).** Device-keyed lookup added
+      (`moe_tune_config.device_name=<GPU>.json`), legacy name still honoured
+      with a warning, H100 config committed under its keyed name.
+- [x] Autotuner `shmem=None occ=None` — **DONE (§14c).** Two breakages
+      (missing SILU_EPILOGUE; stale removed kernel params) both hidden by a
+      bare except. Fixed; failures now surface once, loudly. Occupancy is an
+      upper bound until Triton exposes n_regs at warmup — noted in code.
 - [x] **Fuse RoPE's `rotate_half`** — DONE (§11). Kernel 2.55x, ~+4%
       end-to-end (p~0.14, direction consistent). Bit-exact, 9/9. Default-on.
 - [ ] **Fuse the MoE top-k combine into GEMM2's epilogue** (§10) — the
       `[M, top_k, K]` intermediate is 67 MB written + 67 MB read per
       layer through the L2 that ncu identifies as the bottleneck.
-- [ ] **README correction required**: the Kernel-profile section claims
-      `fused_moe_kernel` runs at "81% of theoretical weight-streaming
-      bandwidth" and that "there is no kernel headroom left there."
-      Measured on H100: DRAM 14.5%, L2 79.7%, compute 49.6%. The claim is
-      an A6000 artifact and reads as "stop optimising" on hardware where
-      that is not true.
-- [ ] `~/venv_new` (torch 2.11/Triton 3.6) left on the box for future
-      Hopper-codegen testing; delete if the disk is ever wanted.
+- [x] README corrections — **DONE (§14e).** Kernel profile, steps_per_block
+      guidance, TP-for-latency framing, and the QKV rejection note all
+      corrected at the source.
+- [x] `~/venv_new` — removed from the box.
 - [x] Decoding-collapse hypothesis — **confirmed and resolved in §8c.**
       `steps_per_block` ratio 1.0× eliminates all 5 known failures.
       Remaining: the README's stability guidance (`≥ block_length/2`,
@@ -1262,17 +1395,14 @@ slightly better engine ratio, and considerably more batching headroom.
 - [ ] High-batch instability (§12) — measurement sd grows from 3.5 tok/s at
       B=32 to 54.4 at B=128, and DP p50 swings 15.8-20.8 s between identical
       runs. Less predictable, not just slower. Undiagnosed.
-- [ ] DP's sub-linear scaling (§12 remeasures it at 1.30-1.37×, §7 said
-      1.42×) — still undiagnosed. Needs
-      `/v1/replicas` polled during a sweep to see whether load actually
-      splits evenly, or whether the router itself taxes each request.
-- [ ] README's Multi-GPU section needs updating for **two** reasons now,
-      not one: §7 found TP+EP=2 has no latency edge over a single GPU on
-      this no-NVLink hardware at short generation lengths, and §8e found
-      that even where TP might have an edge, it inverts at realistic
-      (GSM8K-length) generation because its NCCL cost scales with step
-      count. The current "TP for latency" framing should go, not just
-      get a caveat.
+- [x] DP sub-linear scaling — **DIAGNOSED (§14a/b).** Not the router and
+      not load balancing (both measured). Two real router inefficiencies
+      fixed anyway (blocking print, redundant JSON re-encode) for +2-6%,
+      taking DP to 1.45x. The residual is host/GPU contention: two replicas
+      running concurrently WITHOUT any router reach only 0.93x of perfect.
+      Also retracts a -24.7% 'router cost' figure that was an artifact of
+      my own polling instrumentation.
+- [x] README Multi-GPU / TP-for-latency framing — **DONE (§14e).**
 - [ ] Quantized-DP's counter-intuitive result (§8d: INT8 slower than BF16
       under co-location, despite streaming fewer bytes) — two candidate
       explanations offered, neither confirmed. Would need per-kernel

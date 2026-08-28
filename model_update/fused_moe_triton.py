@@ -5,14 +5,53 @@ import triton
 import triton.language as tl
 from typing import Any, Dict, Optional, Tuple
 
-TUNED_CONFIGS = {}
-config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "moe_tune_config.json")
-try:
-    if os.path.exists(config_path):
-        with open(config_path, "r") as f:
-            TUNED_CONFIGS = json.load(f)
-except Exception as e:
-    print(f"Warning: Failed to load {config_path}: {e}")
+def _device_tag() -> str:
+    """Filesystem-safe GPU name, e.g. 'NVIDIA_H100_PCIe'."""
+    try:
+        return torch.cuda.get_device_name(0).replace(" ", "_").replace("/", "_")
+    except Exception:
+        return "unknown"
+
+
+def _load_tuned_configs():
+    """Load the autotuner's output, preferring a config tuned for THIS GPU.
+
+    Tile shapes are hardware-specific -- the tuner's own docstring says to run
+    it on every new GPU, and the H100-vs-A6000 winners differ at every M. But
+    the output was a single unkeyed `moe_tune_config.json`, so a config tuned
+    on one card loaded silently on another and there was no way to tell from
+    the file which card it came from. `dInfer/configs/` already keys by
+    `device_name=`; this does the same.
+
+    Lookup order:
+      1. moe_tune_config.device_name=<this GPU>.json   (preferred)
+      2. moe_tune_config.json                          (legacy, unkeyed)
+
+    A legacy file is still honoured so existing checkouts do not silently
+    lose their tuning, but it warns, because it cannot be verified against
+    the GPU actually running.
+    """
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    keyed = os.path.join(root, f"moe_tune_config.device_name={_device_tag()}.json")
+    legacy = os.path.join(root, "moe_tune_config.json")
+
+    for path, is_keyed in ((keyed, True), (legacy, False)):
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r") as f:
+                cfg = json.load(f)
+            if not is_keyed and torch.cuda.is_available():
+                print(f"Warning: using unkeyed {os.path.basename(path)}; it may have "
+                      f"been tuned on a different GPU than {_device_tag()}. "
+                      f"Re-run tuning_fused_moe_triton.py to produce a device-keyed file.")
+            return cfg
+        except Exception as e:
+            print(f"Warning: Failed to load {path}: {e}")
+    return {}
+
+
+TUNED_CONFIGS = _load_tuned_configs()
 
 def _shared_mem_limit() -> int:
     if not torch.cuda.is_available():
