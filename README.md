@@ -201,17 +201,33 @@ quantization look like it *grew* the model):
 
 Identical, as they must be — both are 1 byte/weight over the same shapes.
 
-Accuracy, **paired against BF16 on identical questions** with McNemar:
+Accuracy, each arm **paired against BF16 on its own identical questions**,
+McNemar:
 
-| Arm | n | BF16 | quantized | Δ | McNemar p |
+| Arm | n | BF16 on *those* n | quantized | **Δ vs own BF16** | McNemar p |
 |---|---:|---:|---:|---:|---:|
-| INT8 (packed + fused W8A16) | 200 | 71.0% | 68.5% | −2.5 pt | **0.50** |
-| FP8-E4M3 (packed, no fused kernel) | 100 | 73.0% | 70.0% | −3.0 pt | **0.61** |
+| INT8 (packed + fused W8A16) | 200 | 71.0% | 68.5% | **−2.5 pt** | 0.50 |
+| FP8-E4M3 (packed, no fused kernel) | 100 | 73.0% | 70.0% | **−3.0 pt** | 0.61 |
 
-**Neither is significant**, and this does *not* establish that quantization is
+> ⚠️ **Do not compare the two `quantized` percentages to each other.** The rows
+> use *different question sets* — INT8 was scored on the first 200 of the seeded
+> subset, FP8 on the first 100, and the first 100 are easier (visible in the
+> BF16 column: 73.0% vs 71.0%). FP8's 70.0% is **not** "better than" INT8's
+> 68.5%. Only the Δ column, each row against its own BF16 baseline, is
+> meaningful — and by that measure FP8 is marginally *worse*, not better.
+>
+> FP8's arm stops at n=100 because without a fused kernel it runs ~3× slower per
+> question; n=1000 would be ~3.5 h. A direct INT8-vs-FP8 pairing on one shared
+> question set has not been run.
+
+**Neither Δ is significant**, so the two formats are indistinguishable on
+accuracy at these sample sizes. This does *not* establish that quantization is
 free — both point estimates are negative, so a small real cost is not excluded.
-What it rules out is using small-n marginals to choose between modes. FP8 has no
-fused kernel yet, so it runs ~3× slower per question than INT8.
+What it rules out is using small-n marginals to choose between modes.
+
+**On speed the two are not close:** INT8 has a fused W8A16 kernel and runs at
+parity with BF16; FP8 has none and runs ~3× slower per question. **INT8 is the
+deployable format**; FP8 is a memory play only until it gets a kernel.
 
 ### Historical — one A6000, 128-token generation
 
