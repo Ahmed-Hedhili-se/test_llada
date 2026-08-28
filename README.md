@@ -43,7 +43,7 @@ Each expert is a SwiGLU FFN: `W1 = [gate ; up]` (2048 → 2×1024), `SiLU(gate) 
 
 ## Optimizations
 
-`src/` is the unoptimized reference. `model_update/` is the optimized engine.
+`src/` is the unoptimized reference. `dminfr/engine/` is the optimized engine.
 
 **1. Triton fused MoE** — the baseline loops all 64 experts sequentially. One grouped-GEMM kernel replaces 64 launches: tokens are sorted by expert, padded to block boundaries, processed together. `moe_align_block_size` is fully vectorized (the original made 128 host-device syncs per call).
 
@@ -66,7 +66,7 @@ provably unchanged. Disable with `LLADA_FUSE_ROPE=0`.
 
 **7. Variable-length batching** — prompts of different lengths are left-padded to a common width, with per-row RoPE positions and an additive attention mask. Before this, requests could only batch if their prompts tokenized to *exactly* the same length.
 
-**Rejected on A6000, flips on H100: fused QKV.** One GEMM instead of three measured 1.62× at M=32, 0.99× at M=256, **0.96× at M=1024**, 1.17× at M=2048 on A6000 — and this engine runs at M = batch × suffix_length, so batch 32 at block 32 sits near M=1024, exactly where it lost. On **H100 the same test measures 1.87× / 3.76× / 1.18× / 1.12×** — faster at every size, and bit-exact at M≥256. It remains unfused because `lm_head` dominates the cuBLAS time, so the end-to-end gain is ~0.5%, below the measurement noise floor, and enabling it would need a shape-dependent bit-exactness rule. `eval/test_fusions.py` measures it on whatever card you run: the answer is cuBLAS- and shape-dependent, not universal.
+**Rejected on A6000, flips on H100: fused QKV.** One GEMM instead of three measured 1.62× at M=32, 0.99× at M=256, **0.96× at M=1024**, 1.17× at M=2048 on A6000 — and this engine runs at M = batch × suffix_length, so batch 32 at block 32 sits near M=1024, exactly where it lost. On **H100 the same test measures 1.87× / 3.76× / 1.18× / 1.12×** — faster at every size, and bit-exact at M≥256. It remains unfused because `lm_head` dominates the cuBLAS time, so the end-to-end gain is ~0.5%, below the measurement noise floor, and enabling it would need a shape-dependent bit-exactness rule. `tests/test_fusions.py` measures it on whatever card you run: the answer is cuBLAS- and shape-dependent, not universal.
 
 ---
 
@@ -114,7 +114,7 @@ on one GPU, ~225–260× on two**, not a single digit.
 ### Single request vs baseline — RTX A6000
 
 ```bash
-python -m eval.check_time_inference --weight-dir weights \
+python -m benchmarks.check_time_inference --weight-dir weights \
     --gen-length 128 --steps 128 --block-length 32 --mode both --num-runs 3
 ```
 
@@ -132,10 +132,10 @@ Both arms through the same HTTP client and load harness, so this is a deployment
 | Pipeline | Tok/s |
 |---|---:|
 | `src/` over HTTP, serialized | **2.7** |
-| `model_update/`, `BATCH_MAX_SIZE=32`, concurrency 32 | **278.3** |
+| `dminfr/engine/`, `BATCH_MAX_SIZE=32`, concurrency 32 | **278.3** |
 | | **103×** |
 
-It decomposes as **8.70× engine × 11.67× batching = 101.5**, within 1.5% of the direct ratio — the check that makes the figure trustworthy rather than a headline. The baseline is single-request by construction: `src/generate.py` hardcodes the batch dimension to 1.
+It decomposes as **8.70× engine × 11.67× batching = 101.5**, within 1.5% of the direct ratio — the check that makes the figure trustworthy rather than a headline. The baseline is single-request by construction: `dminfr/reference/generate.py` hardcodes the batch dimension to 1.
 
 ### Batched throughput — A6000, `BATCH_MAX_SIZE=32`, concurrency 32
 
@@ -175,7 +175,7 @@ On H100 it is **not**. Nsight Compute at the production shape measures **DRAM th
 
 ## Quantization (INT8 / FP8 experts)
 
-**This engine runs BF16.** Nothing in `model_update/` quantizes anything. (The
+**This engine runs BF16.** Nothing in `dminfr/engine/` quantizes anything. (The
 `use_fp8_w8a8` / `use_int8_w8a16` parameters that used to sit in
 `fused_moe_kernel` were inherited from vLLM, always `False`, never referenced —
 they have since been removed.)
@@ -282,11 +282,11 @@ throughput (`h100x2_bench.md` §8d).
 
 ## Triton Autotuner
 
-`tuning_fused_moe_triton.py` generates a hardware-specific `moe_tune_config.json`, loaded at import time. **Run it on every new GPU** — it was the single largest speed win found in this project (2.2× on the MoE pipeline at M=2048).
+`dminfr.tuning.autotune_moe.py` generates a hardware-specific `moe_tune_config.json`, loaded at import time. **Run it on every new GPU** — it was the single largest speed win found in this project (2.2× on the MoE pipeline at M=2048).
 
 ```bash
-python tuning_fused_moe_triton.py --model FULL_CFG          # single GPU
-python tuning_fused_moe_triton.py --model FULL_CFG --tp-size 8
+python dminfr.tuning.autotune_moe.py --model FULL_CFG          # single GPU
+python dminfr.tuning.autotune_moe.py --model FULL_CFG --tp-size 8
 ```
 
 It scores the *complete* pipeline (`GEMM1 → activation → GEMM2 → sum`, following `FUSE_SILU`), not one GEMM, and penalizes configs that inflate padding: `score = latency × (1 + penalty × padding_ratio)`. Shared-memory limits are queried from the device. The winner is validated at `cos_sim > 0.999` — **not** bit-exactness, so retuning can legitimately shift generated tokens.
@@ -314,7 +314,7 @@ Against the HuggingFace reference at the logit level: **3,219/3,219 weights mapp
 
 A residual ~6pt fixed-schedule gap vs HF was investigated and closed as **inherent, not a bug**: this checkpoint's router is near-uniform (top-1 weight ~1.7–5%), so bf16-level noise flips top-8 expert membership for 43–90% of positions per layer. A 2×2 kernel-isolation matrix exonerated the Triton MoE kernel entirely. See `INVESTIGATION_LOG.md` §2.9–2.11.
 
-Regression tests (`python -m eval.<name>`):
+Regression tests (`python -m tests.<name>`):
 
 | | |
 |---|---|
@@ -354,16 +354,16 @@ Same 50 questions, same box — the first genuinely comparable accuracy pair in 
 
 ## Multi-GPU
 
-**Use data parallelism, not tensor parallelism, for throughput.** `src/server.py` disables request batching whenever `tp_size > 1` — above one rank every request serializes through `request_lock`, so TP=8 delivers roughly an eighth of what the hardware can do. The model is ~14 GiB against an 80 GiB H100, so there is no capacity reason to shard it either.
+**Use data parallelism, not tensor parallelism, for throughput.** `dminfr/serving/server.py` disables request batching whenever `tp_size > 1` — above one rank every request serializes through `request_lock`, so TP=8 delivers roughly an eighth of what the hardware can do. The model is ~14 GiB against an 80 GiB H100, so there is no capacity reason to shard it either.
 
 ```bash
 bash start_dp.sh --gpus 8 --weight-dir weights          # one replica per GPU + router
 bash start_dp.sh --gpus 8 --quantize int8
 ```
 
-`src/router.py` routes **least-outstanding**, not round-robin: a replica runs a whole batch to completion, so one that just accepted 32 requests is busy for ~35 s while an idle one answers immediately. Unhealthy replicas leave rotation and are retried in the background. `GET /v1/replicas` shows live per-replica load.
+`dminfr/serving/router.py` routes **least-outstanding**, not round-robin: a replica runs a whole batch to completion, so one that just accepted 32 requests is busy for ~35 s while an idle one answers immediately. Unhealthy replicas leave rotation and are retried in the background. `GET /v1/replicas` shows live per-replica load.
 
-TP+EP remains available (`start.sh --tp-size N`), but **do not reach for it on latency grounds without measuring on your own hardware.** The 6.15× figure previously quoted here was 2× A6000 against the *unoptimized* baseline, not against `model_update/` on one GPU. Measured on 2× H100 PCIe (no NVLink):
+TP+EP remains available (`start.sh --tp-size N`), but **do not reach for it on latency grounds without measuring on your own hardware.** The 6.15× figure previously quoted here was 2× A6000 against the *unoptimized* baseline, not against `dminfr/engine/` on one GPU. Measured on 2× H100 PCIe (no NVLink):
 
 - At concurrency 1 with 128-token generation, TP+EP=2 and a single replica are **statistically tied** (24.8 vs 23.3 tok/s).
 - At realistic GSM8K length it **inverts**: 19.4 s/question against a single GPU's 3.4–3.8 s, because TP's per-layer NCCL all-reduce cost is paid *per diffusion step* and GSM8K runs far more steps than the throughput benchmark does.
@@ -376,7 +376,7 @@ On an NVLink'd node the picture may differ; on PCIe it does not favour TP. See `
 
 ```bash
 bash setup.sh                                        # venv + torch 2.5.1 + ~15 GB weights
-python tuning_fused_moe_triton.py --model FULL_CFG   # do not skip
+python dminfr.tuning.autotune_moe.py --model FULL_CFG   # do not skip
 bash start.sh --backend fast_dense --weight-dir weights
 ```
 
@@ -384,14 +384,14 @@ Requires an NVIDIA GPU with Triton, ≥24 GB VRAM (bf16), CUDA 12.x, `transforme
 
 ```bash
 # benchmark
-python -m eval.check_time_inference --weight-dir weights --mode both
+python -m benchmarks.check_time_inference --weight-dir weights --mode both
 
 # throughput
-python -m eval.throughput.run_throughput --base-url http://localhost:8000 \
+python -m benchmarks.throughput.run_throughput --base-url http://localhost:8000 \
     --concurrency 32 --n-requests 96 --max-tokens 128 --steps 128 --block-length 32
 
 # accuracy
-python -m eval.correctness.run_math_reasoning_code --task gsm8k \
+python -m benchmarks.correctness.run_math_reasoning_code --task gsm8k \
     --limit 50 --seed 42 --max-tokens 1024 --steps 512 --block-length 64 \
     --confidence-threshold 0.9 --low-confidence-threshold 0.4
 ```
@@ -403,22 +403,35 @@ The server is OpenAI-compatible (`/v1/chat/completions`, `/v1/completions`, `/v1
 ## Project Structure
 
 ```
-src/                        reference implementation + server + DP router
-  model.py  generate.py     unoptimized baseline (batch dimension hardcoded to 1)
-  server.py                 OpenAI-compatible API, request batching, --quantize
-  router.py                 data-parallel router (least-outstanding)
-model_update/               the optimized engine
-  model.py                  KV cache, RoPE, attention, fused MoE block
-  generate.py               block-wise cached diffusion decoding
-  fused_moe_triton.py       grouped-GEMM MoE kernel + SiLU epilogue + autotune loader
-  fused_ops.py              fused RMSNorm and decode tail
-  distributed.py            TP/EP helpers and weight loading
-eval/                       benchmarks, regression tests, diagnostics
-  correctness/              GSM8K / BBH / CRUX-O / MMLU-Pro harnesses
+dminfr/                     the package
+  engine/                   the optimized engine — what runs in production
+    model.py                KV cache, RoPE, attention, fused MoE block
+    generate.py             block-wise cached diffusion decoding
+    fused_moe_triton.py     grouped-GEMM MoE kernel + SiLU epilogue + autotune loader
+    fused_ops.py            fused RMSNorm, decode tail, RoPE
+    distributed.py          TP/EP helpers and weight loading
+  serving/                  how it is served
+    server.py               OpenAI-compatible API, request batching, --quantize
+    router.py               data-parallel router (least-outstanding)
+  reference/                the unoptimized baseline every speedup is measured
+    model.py  generate.py   against. Loops 64 experts in Python; not for deployment.
+  tuning/
+    autotune_moe.py         end-to-end-aware MoE autotuner
+
+tests/                      regression suite (python -m tests.<name>)
+benchmarks/                 latency, throughput and accuracy harnesses
+  correctness/              GSM8K / BBH / CRUX-O / MMLU-Pro
   throughput/               concurrent-request benchmark
-tuning_fused_moe_triton.py  end-to-end-aware MoE autotuner
-start.sh  start_dp.sh       single-GPU and data-parallel launchers
+scripts/                    setup.sh, start.sh, start_dp.sh
+tools/                      download_weights.py
+docs/                       INVESTIGATION_LOG.md, h100x2_bench.md
+archive/investigations/     one-off scripts behind INVESTIGATION_LOG's findings
 ```
+
+The `engine` / `reference` split was previously `model_update/` vs `src/` —
+which also left the production server sitting inside the directory named after
+the slow reference path. `dminfr.engine` is the engine; `dminfr.reference` is
+the thing it is faster *than*.
 
 ---
 

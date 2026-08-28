@@ -1,0 +1,563 @@
+"""
+LLaDA-MoE with block-wise KV caching.
+
+Key idea:
+  - "prefix" tokens (prompt + already-finalized blocks) have FIXED content,
+    so their K/V (post-RoPE) never change once computed. Cache them.
+  - "active" tokens (current block, still being denoised) get fresh Q/K/V
+    computed every step, and attend against [cached prefix K/V ; active K/V].
+  - MoE/MLP/norms are all per-token, so we only ever need to run them over
+    the active block, not the full sequence.
+  - Logits are only computed/returned for the active block, since
+    generate.py already discards logits past block_end anyway.
+
+Correctness-critical rule: a block's K/V may only be pushed into the
+permanent cache AFTER it is fully unmasked. Caching mid-denoising K/V
+would permanently bake in stale (masked-token) representations.
+
+Dims are passed via a Config so the exact same code can be correctness
+tested at small scale and then run at full 7B-MoE scale.
+"""
+
+import os
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from .distributed import get_tp_size, get_tp_rank, tp_all_reduce_
+
+KVCache = List[Tuple[torch.Tensor, torch.Tensor]]
+
+#: Compute the MoE router's gate projection in fp32 rather than the model
+#: dtype. See _router_logits() for why this is not the no-op it looks like.
+FP32_ROUTER = os.environ.get("LLADA_FP32_ROUTER", "0") != "0"
+
+
+def _router_logits(gate: nn.Linear, x_flat: torch.Tensor) -> torch.Tensor:
+    """Router logits, optionally computed in fp32.
+
+    The reference implementation (`weights/modeling_lladamoe.py`) runs the
+    gate Linear in the model dtype and only upcasts inside the softmax:
+
+        router_logits  = self.gate(hidden_states)                 # bf16
+        routing_weights = F.softmax(router_logits, dtype=float)   # fp32
+
+    That upcast is cosmetic. `topk` runs on the softmax output, but softmax
+    is monotonic -- the ordering it ranks was already decided when the
+    logits were rounded to bf16, one line earlier.
+
+    Whether that rounding is harmless is checkpoint-specific, and for this
+    one there is reason to doubt it. INVESTIGATION_LOG.md 2.11 measured the
+    router as near-uniform: top-1 weight ~1.7-5%, against 1.56% for a flat
+    64-way distribution. A near-uniform softmax means the logits sit in a
+    narrow band, so the top-8/top-9 boundary is decided by differences of
+    roughly the same order as bf16's own resolution at that magnitude. The
+    same section measured top-8 membership differing from HF on 43-90% of
+    positions per layer, and closed the investigation attributing it to
+    unavoidable noise between two independent implementations.
+
+    That conclusion may have stopped one level short. It established that
+    the router is noise-sensitive; it never tested whether some of the
+    noise is self-inflicted by the gate's own precision -- the 2x2
+    kernel-isolation matrix varied the MoE kernel and the attention kernel,
+    never the router's dtype. This flag exists to answer that empirically.
+
+    Note this deliberately makes us *differ* from HF rather than match it.
+    Matching HF caps us at HF; the question here is whether fp32 routing is
+    better than bf16 routing in absolute terms, which is a separate and
+    more useful question than fidelity to a reference that shares the same
+    limitation.
+
+    Cost is negligible by construction: the gate is H x NE = 2048 x 64 =
+    131k parameters, against ~805 MB of expert weights streamed per layer.
+    It cannot meaningfully move a kernel that is bandwidth-bound on the
+    experts -- but that claim is measured, not assumed (see h100x2_bench.md).
+    """
+    if not FP32_ROUTER:
+        return gate(x_flat)
+    return F.linear(x_flat.float(), gate.weight.float())
+
+
+class KVCacheBuffer:
+    """
+    Preallocated per-layer K/V buffer for block-wise generation.
+
+    Replaces torch.cat-ing a fresh [prefix; active] tensor on every
+    denoising step: profiling (benchmarks/profile_kv_concat.py) showed that cat
+    cost 45-68% of combined attend-time, exceeding the actual attention
+    math at every context length measured, because it recopies the whole
+    (unchanged) prefix just to append a few new tokens.
+
+    Instead, the full [B, KVH, max_len, HD] tensor is allocated once and
+    each step writes its K/V in place at `write_pos`; attention reads a
+    zero-copy view of the buffer up to that point.
+    """
+
+    def __init__(self, num_layers: int, batch_size: int, kvh_local: int,
+                 max_len: int, head_dim: int, dtype: torch.dtype, device):
+        self.max_len = max_len
+        self.committed_len = 0
+        self.k = [
+            torch.empty(batch_size, kvh_local, max_len, head_dim, dtype=dtype, device=device)
+            for _ in range(num_layers)
+        ]
+        self.v = [
+            torch.empty(batch_size, kvh_local, max_len, head_dim, dtype=dtype, device=device)
+            for _ in range(num_layers)
+        ]
+
+    def write_and_view(self, layer_idx: int, k_new: torch.Tensor, v_new: torch.Tensor, start_pos: int):
+        end_pos = start_pos + k_new.shape[2]
+        if end_pos > self.max_len:
+            raise ValueError(f"KV cache overflow: write to {end_pos} exceeds buffer of {self.max_len}")
+        self.k[layer_idx][:, :, start_pos:end_pos, :] = k_new
+        self.v[layer_idx][:, :, start_pos:end_pos, :] = v_new
+        return self.k[layer_idx][:, :, :end_pos, :], self.v[layer_idx][:, :, :end_pos, :]
+
+    def commit(self, new_committed_len: int):
+        """Mark [0:new_committed_len] as permanent (already-finalized) prefix."""
+        self.committed_len = new_committed_len
+
+
+@dataclass
+class Cfg:
+    H: int
+    NH: int
+    KVH: int
+    NL: int
+    NE: int
+    TOPK: int
+    EI: int
+    VS: int
+    EPS: float = 1e-5
+    THETA: float = 50000.0
+    MASK_ID: int = 156895
+
+    @property
+    def HD(self):
+        return self.H // self.NH
+
+
+def _local_expert_range(num_experts: int, tp_rank: int, tp_size: int) -> Tuple[int, int]:
+    """This rank's contiguous shard of the expert pool: (num_local_experts,
+    local_expert_start). Shared by TritonFusedMoEBlock/MoEBlock, which
+    otherwise duplicated this exact computation."""
+    num_local_experts = num_experts // tp_size
+    return num_local_experts, tp_rank * num_local_experts
+
+
+from .fused_moe_triton import fused_moe
+
+class TritonFusedMoEBlock(nn.Module):
+    def __init__(self, cfg: Cfg):
+        super().__init__()
+        self.cfg = cfg
+        self.tp_size = get_tp_size()
+        self.tp_rank = get_tp_rank()
+        self.num_local_experts, self.local_expert_start = _local_expert_range(
+            cfg.NE, self.tp_rank, self.tp_size
+        )
+
+        self.gate = nn.Linear(cfg.H, cfg.NE, bias=False)
+        self.w1 = nn.Parameter(torch.empty(self.num_local_experts, 2 * cfg.EI, cfg.H))
+        self.w2 = nn.Parameter(torch.empty(self.num_local_experts, cfg.H, cfg.EI))
+
+    def load_state_dict_from_unfused(self, unfused_block: nn.Module):
+        with torch.no_grad():
+            self.gate.weight.copy_(unfused_block.gate.weight)
+            for i in range(self.num_local_experts):
+                expert = unfused_block.experts[i]  # already sliced in MoEBlock
+                w_gate = expert.gate_proj.weight
+                w_up = expert.up_proj.weight
+                self.w1[i].copy_(torch.cat([w_gate, w_up], dim=0))
+                self.w2[i].copy_(expert.down_proj.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.device.type == "cpu":
+            raise NotImplementedError("Triton Fused MoE requires a CUDA GPU.")
+
+        B, T, H = x.shape
+        x_flat = x.view(B * T, H)
+        router_logits = _router_logits(self.gate, x_flat)
+        routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float32)
+
+        topk_weights, topk_ids = torch.topk(routing_weights, self.cfg.TOPK, dim=-1)
+
+        if self.tp_size > 1:
+            local_expert_end = self.local_expert_start + self.num_local_experts
+            mask = (topk_ids >= self.local_expert_start) & (topk_ids < local_expert_end)
+            topk_ids = (topk_ids - self.local_expert_start).clamp(min=0, max=self.num_local_experts - 1)
+            topk_weights = topk_weights * mask.float()
+
+        out = fused_moe(
+            hidden_states=x_flat,
+            w1=self.w1,
+            w2=self.w2,
+            gating_output=topk_weights.to(x.dtype),
+            topk_ids=topk_ids.to(torch.int32),
+        )
+        
+        out = out.view(B, T, H)
+        tp_all_reduce_(out)
+        return out
+
+
+
+FULL_CFG = Cfg(H=2048, NH=16, KVH=16, NL=16, NE=64, TOPK=8, EI=1024, VS=157184)
+SMALL_CFG = Cfg(H=512, NH=8, KVH=8, NL=4, NE=16, TOPK=4, EI=256, VS=157184)
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        # Flattened to 2-D so the layer norms ([B, T, H]) fuse too, not just
+        # q_norm/k_norm which callers already reshape. Normalisation is
+        # per-row over the last axis, so flattening the leading dims changes
+        # nothing about what is computed.
+        if x.is_cuda and x.shape[-1] == self.weight.shape[0]:
+            from .fused_ops import FUSE_RMSNORM, HAS_TRITON, fused_rmsnorm
+            if FUSE_RMSNORM and HAS_TRITON:
+                shape = x.shape
+                out = fused_rmsnorm(x.reshape(-1, shape[-1]).contiguous(),
+                                    self.weight, self.eps)
+                return out.view(shape)
+        dtype = x.dtype
+        x = x.float()
+        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return (self.weight * x).to(dtype)
+
+
+def build_rope_freqs(start_pos: int, end_pos: int, head_dim: int, theta: float, device):
+    inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
+    pos = torch.arange(start_pos, end_pos, device=device).float()
+    freqs = torch.outer(pos, inv_freq)
+    emb = torch.cat([freqs, freqs], dim=-1)
+    return emb.cos(), emb.sin()
+
+
+def build_rope_freqs_from_positions(positions: torch.Tensor, head_dim: int, theta: float):
+    """Per-row RoPE for a left-padded batch.
+
+    Batching prompts of different lengths means left-padding them to a common
+    width, which shifts every real token right by that row's pad count. Feeding
+    the resulting absolute offsets to RoPE would encode each prompt as if it
+    started partway into the sequence -- a different input, not a padded one.
+    So positions are supplied per row (pad slots collapse to 0 and are masked
+    out of attention anyway), and cos/sin come back [B, T, HD] instead of
+    [T, HD].
+
+    positions: [B, T] int64 -- the true position of each slot in its own
+               sequence, 0-based, ignoring padding.
+    """
+    inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, device=positions.device).float() / head_dim))
+    freqs = positions.float().unsqueeze(-1) * inv_freq            # [B, T, HD/2]
+    emb = torch.cat([freqs, freqs], dim=-1)                        # [B, T, HD]
+    return emb.cos(), emb.sin()
+
+
+def rotate_half(x):
+    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2:]
+    return torch.cat([-x2, x1], dim=-1)
+
+
+def apply_rope(q, k, cos, sin):
+    # [T, HD] (one shared position range) or [B, T, HD] (per-row, left-padded
+    # batch). q/k are [B, H, T, HD], so both need a head axis inserted; the
+    # shared case additionally needs a batch axis. The 2-D branch is the
+    # original code path, unchanged, so equal-length batches stay bit-identical.
+    #
+    # The fused kernel handles both layouts itself (it folds the batch stride
+    # to 0 for the shared case) and is bit-exact, so it takes cos/sin before
+    # the unsqueeze rather than after.
+    if q.is_cuda:
+        from .fused_ops import FUSE_ROPE, HAS_TRITON, fused_rope
+        if FUSE_ROPE and HAS_TRITON:
+            return fused_rope(q, k, cos, sin)
+
+    if cos.dim() == 2:
+        cos = cos.unsqueeze(0).unsqueeze(0)
+        sin = sin.unsqueeze(0).unsqueeze(0)
+    else:
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+    return q * cos + rotate_half(q) * sin, k * cos + rotate_half(k) * sin
+
+
+class Attention(nn.Module):
+    def __init__(self, cfg: Cfg):
+        super().__init__()
+        self.cfg = cfg
+        H, NH, KVH, HD = cfg.H, cfg.NH, cfg.KVH, cfg.HD
+        
+        tp_size = get_tp_size()
+        tp_rank = get_tp_rank()
+        
+        assert NH % tp_size == 0, f"NH ({NH}) must be divisible by tp_size ({tp_size})"
+        assert KVH % tp_size == 0, f"KVH ({KVH}) must be divisible by tp_size ({tp_size})"
+        
+        self.NH_local = NH // tp_size
+        self.KVH_local = KVH // tp_size
+        
+        self.q_proj = nn.Linear(H, self.NH_local * HD, bias=False)
+        self.k_proj = nn.Linear(H, self.KVH_local * HD, bias=False)
+        self.v_proj = nn.Linear(H, self.KVH_local * HD, bias=False)
+        self.o_proj = nn.Linear(self.NH_local * HD, H, bias=False)
+        self.q_norm = RMSNorm(HD, cfg.EPS)
+        self.k_norm = RMSNorm(HD, cfg.EPS)
+    def _project_qkv(self, x):
+        """Three separate GEMMs, deliberately.
+
+        Concatenating q/k/v into one projection was implemented and MEASURED,
+        then dropped. On an A6000 at FULL_CFG, one GEMM vs three:
+
+            M=32    1.62x faster    (not bit-exact, rel 8.3e-05)
+            M=256   0.99x           (not bit-exact, rel 2.7e-03)
+            M=1024  0.96x SLOWER    (bit-exact)
+            M=2048  1.17x faster    (bit-exact)
+
+        This engine runs at M = batch x suffix_length, so batch 32 with
+        block_length 32 sits at M~1024 -- exactly where fusing is a slowdown.
+        The only clear win is M=32, below the range it operates in, and M=256
+        pays a 2.7e-03 relative difference for nothing. cuBLAS evidently picks
+        a better kernel for the three narrower shapes than for the wide one at
+        these sizes.
+
+        See tests/test_fusions.py, which still measures this if the question
+        comes up again on different hardware -- the answer is shape- and
+        cuBLAS-dependent, not universal.
+        """
+        return self.q_proj(x), self.k_proj(x), self.v_proj(x)
+
+    def forward(
+        self, x, cos, sin,
+        past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        cache_buffer: Optional["KVCacheBuffer"] = None,
+        layer_idx: Optional[int] = None,
+        write_pos: Optional[int] = None,
+        attn_mask: Optional[torch.Tensor] = None,
+    ):
+        """
+        x: [B, Ta, H] active-block hidden states
+        cos/sin: [Ta, HD] rope freqs for the ACTIVE positions (absolute offset already applied)
+        past_kv: optional (k_prefix, v_prefix) each [B, KVH, Tp, HD], already RoPE'd —
+                 cat'd with this call's K/V to build the attend-over tensor.
+        cache_buffer/layer_idx/write_pos: alternative to past_kv. K/V are written
+                 in place into cache_buffer at write_pos and attention reads a
+                 zero-copy view of the buffer, instead of cat-ing a fresh tensor.
+                 Mutually exclusive with past_kv.
+        Returns: out [B, Ta, H], (k_active, v_active) each [B, KVH, Ta, HD] (RoPE'd, for caching)
+        """
+        cfg = self.cfg
+        B, Ta, _ = x.shape
+
+        q, k, v = self._project_qkv(x)
+        q = q.reshape(B, Ta, self.NH_local, cfg.HD)
+        k = k.reshape(B, Ta, self.KVH_local, cfg.HD)
+        v = v.reshape(B, Ta, self.KVH_local, cfg.HD)
+
+        q = self.q_norm(q.reshape(-1, cfg.HD)).reshape(B, Ta, self.NH_local, cfg.HD)
+        k = self.k_norm(k.reshape(-1, cfg.HD)).reshape(B, Ta, self.KVH_local, cfg.HD)
+
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        q, k = apply_rope(q, k, cos, sin)
+
+        if cache_buffer is not None:
+            k_full, v_full = cache_buffer.write_and_view(layer_idx, k, v, write_pos)
+        elif past_kv is not None:
+            k_prefix, v_prefix = past_kv
+            k_full = torch.cat([k_prefix, k], dim=2)
+            v_full = torch.cat([v_prefix, v], dim=2)
+        else:
+            k_full, v_full = k, v
+
+        # attn_mask is [B, 1, 1, Tk] and marks left-padding slots unattendable.
+        # None (equal-length batch, or B=1) keeps the original call exactly.
+        out = F.scaled_dot_product_attention(q, k_full, v_full, attn_mask=attn_mask, is_causal=False)
+        out = out.transpose(1, 2).reshape(B, Ta, self.NH_local * cfg.HD)
+        
+        attn_out = self.o_proj(out)
+        tp_all_reduce_(attn_out)
+        return attn_out, (k, v)
+
+
+class ExpertMLP(nn.Module):
+    def __init__(self, cfg: Cfg):
+        super().__init__()
+        self.gate_proj = nn.Linear(cfg.H, cfg.EI, bias=False)
+        self.up_proj = nn.Linear(cfg.H, cfg.EI, bias=False)
+        self.down_proj = nn.Linear(cfg.EI, cfg.H, bias=False)
+
+    def forward(self, x):
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
+class MoEBlock(nn.Module):
+    def __init__(self, cfg: Cfg):
+        super().__init__()
+        self.cfg = cfg
+        self.tp_size = get_tp_size()
+        self.tp_rank = get_tp_rank()
+        assert cfg.NE % self.tp_size == 0
+        self.num_local_experts, self.local_expert_start = _local_expert_range(
+            cfg.NE, self.tp_rank, self.tp_size
+        )
+
+        self.gate = nn.Linear(cfg.H, cfg.NE, bias=False)
+        self.experts = nn.ModuleList([ExpertMLP(cfg) for _ in range(self.num_local_experts)])
+
+    def forward(self, x):
+        cfg = self.cfg
+        B, T, _ = x.shape
+        x_flat = x.view(B * T, cfg.H)
+
+        routing_weights_full = F.softmax(
+            _router_logits(self.gate, x_flat), dim=-1, dtype=torch.float32
+        )
+        routing_weights, selected_experts = torch.topk(routing_weights_full, cfg.TOPK, dim=-1)
+
+        expert_mask = F.one_hot(selected_experts, num_classes=cfg.NE).permute(2, 1, 0)
+
+        routing_weights = routing_weights.to(x.dtype)
+
+        out = torch.zeros_like(x_flat)
+
+        for local_expert_idx in range(self.num_local_experts):
+            global_expert_idx = self.local_expert_start + local_expert_idx
+            idx, top_x = torch.where(expert_mask[global_expert_idx])
+            if top_x.numel() == 0:
+                continue
+            tokens = x_flat[top_x]
+            h = self.experts[local_expert_idx](tokens) * routing_weights[top_x, idx, None]
+            out.index_add_(0, top_x, h.to(x.dtype))
+
+        out = out.view(B, T, cfg.H)
+        tp_all_reduce_(out)
+        return out
+
+
+class Layer(nn.Module):
+    def __init__(self, cfg: Cfg, use_fused_moe: bool = False):
+        super().__init__()
+        self.input_layernorm = RMSNorm(cfg.H, cfg.EPS)
+        self.self_attn = Attention(cfg)
+        self.post_attention_layernorm = RMSNorm(cfg.H, cfg.EPS)
+        self.mlp = TritonFusedMoEBlock(cfg) if use_fused_moe else MoEBlock(cfg)
+
+    def forward(
+        self, x, cos, sin, past_kv=None,
+        cache_buffer: Optional["KVCacheBuffer"] = None,
+        layer_idx: Optional[int] = None,
+        write_pos: Optional[int] = None,
+        attn_mask: Optional[torch.Tensor] = None,
+    ):
+        attn_out, kv_new = self.self_attn(
+            self.input_layernorm(x), cos, sin, past_kv,
+            cache_buffer=cache_buffer, layer_idx=layer_idx, write_pos=write_pos,
+            attn_mask=attn_mask,
+        )
+        x = x + attn_out
+        x = x + self.mlp(self.post_attention_layernorm(x))
+        return x, kv_new
+
+
+class LLaDAMoEKV(nn.Module):
+    def __init__(self, cfg: Cfg = FULL_CFG, use_fused_moe: bool = False):
+        super().__init__()
+        self.cfg = cfg
+        self.embed_tokens = nn.Embedding(cfg.VS, cfg.H)
+        self.layers = nn.ModuleList([Layer(cfg, use_fused_moe=use_fused_moe) for _ in range(cfg.NL)])
+        self.norm = RMSNorm(cfg.H, cfg.EPS)
+        self.lm_head = nn.Linear(cfg.H, cfg.VS, bias=False)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        position_offset: int = 0,
+        past_kv: Optional[KVCache] = None,
+        cache_buffer: Optional[KVCacheBuffer] = None,
+        write_pos: Optional[int] = None,
+        num_logits: Optional[int] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        attn_mask: Optional[torch.Tensor] = None,
+    ):
+        """
+        input_ids: [B, T] — either the full sequence (past_kv=None, e.g. prefix
+                   priming) or just the active block (past_kv=cache).
+        position_offset: absolute starting position of input_ids in the full
+                   sequence, for correct RoPE.
+        past_kv: list of (k,v) per layer for the prefix, or None.
+        cache_buffer/write_pos: preallocated in-place KV cache (see
+                   KVCacheBuffer). Mutually exclusive with past_kv — when
+                   given, K/V for input_ids are written into the buffer at
+                   write_pos and attention reads a view of it, instead of
+                   cat-ing a fresh tensor from past_kv every call.
+        num_logits: run the final norm + lm_head over only the FIRST
+                   num_logits positions of input_ids. None (default) keeps
+                   the original behavior (all T positions); 0 skips the head
+                   entirely and returns None for logits.
+
+                   Every transformer layer still runs over the full T — the
+                   K/V written to the cache, and the mask-placeholder context
+                   the model was trained to see, both depend on it (see
+                   _generate_block_cached / generate_cached in generate.py).
+                   Only the vocabulary projection is narrowed, and callers
+                   already discard everything past their own slice: the cache
+                   prime and block finalize calls discard the logits outright,
+                   and each denoising step uses only [:, :block_length] of a
+                   suffix that can be 16x longer. lm_head is the widest GEMM
+                   in the model (H=2048 -> VS=157184, ~644MB of weights), so
+                   this is both the dominant discarded compute and an ~800MB
+                   peak allocation that never needed to exist.
+
+                   Exact, not approximate: GEMM rows are independent, so the
+                   surviving rows compute identical dot products, and RMSNorm
+                   reduces along the feature axis so each token's
+                   normalization is independent of the others. Slicing before
+                   self.norm rather than after is therefore also exact.
+        Returns: logits [B, num_logits or T, VS] (None when num_logits == 0),
+                 and new_kv: list of (k,v) per layer for input_ids' own tokens
+                 (caller decides whether/when to append these to the cache).
+        """
+        cfg = self.cfg
+        B, T = input_ids.shape
+        device = input_ids.device
+
+        x = self.embed_tokens(input_ids)
+
+        if position_ids is None:
+            cos, sin = build_rope_freqs(position_offset, position_offset + T, cfg.HD, cfg.THETA, device)
+        else:
+            # Left-padded batch: every row carries its own offsets, so the pad
+            # slots cannot shift a shorter prompt's encoding (see
+            # build_rope_freqs_from_positions).
+            cos, sin = build_rope_freqs_from_positions(position_ids, cfg.HD, cfg.THETA)
+        cos = cos.to(x.dtype)
+        sin = sin.to(x.dtype)
+
+        new_kv: KVCache = []
+        for i, layer in enumerate(self.layers):
+            layer_past = past_kv[i] if past_kv is not None else None
+            x, kv_i = layer(
+                x, cos, sin, layer_past,
+                cache_buffer=cache_buffer, layer_idx=i, write_pos=write_pos,
+                attn_mask=attn_mask,
+            )
+            new_kv.append(kv_i)
+
+        if num_logits == 0:
+            return None, new_kv
+        if num_logits is not None:
+            x = x[:, :num_logits]
+
+        x = self.norm(x)
+        logits = self.lm_head(x)
+        return logits, new_kv
