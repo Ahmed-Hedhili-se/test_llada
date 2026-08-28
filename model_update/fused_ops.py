@@ -123,6 +123,7 @@ if HAS_TRITON:
     @triton.jit
     def _rope_kernel(x_ptr, out_ptr, cos_ptr, sin_ptr,
                      s_xb, s_xh, s_xt,
+                     s_ob, s_oh, s_ot,
                      s_cb, s_ct,
                      H, T,
                      HD: tl.constexpr, HALF: tl.constexpr, BLOCK: tl.constexpr):
@@ -138,7 +139,7 @@ if HAS_TRITON:
         mask = cols < HD
 
         x_row = x_ptr + b * s_xb + h * s_xh + t * s_xt
-        o_row = out_ptr + b * s_xb + h * s_xh + t * s_xt
+        o_row = out_ptr + b * s_ob + h * s_oh + t * s_ot
         # s_cb is 0 when cos/sin are shared across the batch ([T, HD]), which
         # collapses the batch term without a second kernel or a broadcast copy.
         c_row = cos_ptr + b * s_cb + t * s_ct
@@ -218,12 +219,20 @@ def _rope_one(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Te
     """Apply RoPE to one [B, H, T, HD] tensor. cos/sin are [T, HD] or [B, T, HD]."""
     B, H, T, HD = x.shape
     assert HD % 2 == 0, f"RoPE needs an even head dim, got {HD}"
-    # The kernel indexes the head dim with a bare `cols`, so the last axis must
-    # be contiguous; the transpose(1, 2) upstream leaves it that way, but a
-    # future caller might not.
-    x = x.contiguous()
-    cos = cos.contiguous()
-    sin = sin.contiguous()
+    # q/k arrive as transpose(1, 2) VIEWS -- [B, T, NH, HD] permuted to
+    # [B, NH, T, HD], so strides are (T*NH*HD, HD, NH*HD, 1) and the tensor is
+    # not contiguous. Calling .contiguous() here would copy both q and k in
+    # full, every layer, every step -- reintroducing most of the traffic this
+    # fusion exists to remove. The kernel takes explicit strides instead and
+    # only needs the head axis to be unit-stride, which a transpose of the
+    # last two-of-four axes preserves. empty_like keeps the input's strides
+    # (preserve_format), but the output strides are passed separately rather
+    # than assumed equal.
+    assert x.stride(-1) == 1, "RoPE needs a unit-stride head dim"
+    if cos.stride(-1) != 1:
+        cos = cos.contiguous()
+    if sin.stride(-1) != 1:
+        sin = sin.contiguous()
     out = torch.empty_like(x)
 
     if cos.dim() == 2:                       # [T, HD] shared across the batch
@@ -235,6 +244,7 @@ def _rope_one(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Te
     _rope_kernel[(B * H * T,)](
         x, out, cos, sin,
         x.stride(0), x.stride(1), x.stride(2),
+        out.stride(0), out.stride(1), out.stride(2),
         s_cb, s_ct,
         H, T,
         HD=HD, HALF=HD // 2, BLOCK=BLOCK,

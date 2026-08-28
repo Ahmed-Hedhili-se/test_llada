@@ -1000,21 +1000,89 @@ Because it is bit-exact at the op level, q and k are identical downstream,
 so **accuracy is provably unchanged** — no GSM8K re-run was needed to
 establish that, which is exactly what bit-exactness is worth.
 
-### End-to-end
+### A hidden copy, found by reviewing my own kernel
 
-| | Tok/s | p50 |
-|---|---:|---:|
-| `LLADA_FUSE_ROPE=0` | 700.9 | 11.54s |
-| **`LLADA_FUSE_ROPE=1` (new default)** | **730.3** | **11.10s** |
+The first version called `.contiguous()` on q/k. `Attention.forward` passes
+`transpose(1, 2)` **views** of `[B, T, NH, HD]` — strides
+`(T*NH*HD, HD, NH*HD, 1)`, not contiguous — so that call was silently
+copying both tensors in full, every layer, every step, reintroducing most
+of the traffic the fusion exists to remove.
 
-**+4.2% throughput**, matching §10's ~4% estimate from the op profile.
-Regression suite 9/9. Re-profiling confirms `aten::cat` and `aten::neg`
-have left the profile entirely, replaced by `_rope_kernel` at 5.17% —
-which also absorbs the `mul` and `add` that were separate elementwise
-launches.
+The kernel already takes explicit strides and only needs the head axis to
+be unit-stride, which a transpose of the last-two-of-four axes preserves.
+Dropping the copy (and passing input and output strides separately rather
+than assuming they match) took the kernel from 2.15× to **2.55×**. The
+test now covers non-contiguous inputs explicitly, since that is the layout
+production actually uses.
 
-Shipped default-on (`LLADA_FUSE_ROPE=1`); the switch is a kill switch, not
-a numerical hedge.
+| Case | eager | fused | speedup |
+|---|---:|---:|---:|
+| B64 T32 shared, transposed | 0.1763 ms | 0.0692 ms | **2.55×** |
+| B64 T32 per-row, transposed | 0.1776 ms | 0.0692 ms | **2.57×** |
+| B32 T64 per-row, transposed | 0.1784 ms | 0.0692 ms | **2.58×** |
+| B1 T32 (decode), transposed | 0.1066 ms | 0.0575 ms | 1.85× |
+
+All 11 bit-exactness cases pass, contiguous and transposed.
+
+### End-to-end: +4.2%, but the harness cannot resolve it
+
+The first A/B gave `on` 730.3 vs `off` 700.9 tok/s — **+4.2%**, matching
+§10's profile estimate. The next run of the *same script* gave `on` 705.1
+vs `off` 733.7, i.e. **−3.9%**, with the **unchanged `off` arm moving
+700.9 → 733.7 (4.7%)**. A single on/off pair proves nothing here.
+
+Re-measured properly: arms alternated across rounds (never all-of-one then
+all-of-the-other, which would confound the arm with thermal/clock drift),
+3 benchmark reps per server start, 3 rounds → 9 samples per arm.
+
+| Arm | n | mean tok/s | sd | min | max |
+|---|---:|---:|---:|---:|---:|
+| RoPE ON | 9 | **724.0** | 39.8 | 660.7 | 782.2 |
+| RoPE OFF | 9 | 695.2 | 29.8 | 648.1 | 725.9 |
+
+Difference **+28.9 tok/s (+4.15%)**. Pairing by round (the 3 reps inside
+one server start are correlated, so the honest n is 3, not 9) gives
+per-round deltas of **+44.5, +36.5, +5.6** — all three positive, mean
++28.9, **paired t p ≈ 0.14**.
+
+**So: consistent direction, stable ~+4% point estimate across two
+independent experiments, not separable from noise at p<0.05 with 3
+rounds.** The claim "+4.2% throughput" as a precise figure is not
+supported; "≈+4%, direction consistent, magnitude matches the profile
+prediction" is.
+
+What *is* solidly established, and is the reason this ships:
+
+- The kernel is **2.55× faster** on its own (200 timed iterations after
+  warmup — low variance, unlike the server harness).
+- `aten::cat` and `aten::neg` are **gone from the profile entirely**,
+  replaced by `_rope_kernel`, which also absorbs the `mul` and `add` that
+  were separate elementwise launches.
+- It is **bit-exact**, so it is strictly less work for identical output.
+
+Regression suite 9/9. Shipped default-on (`LLADA_FUSE_ROPE=1`); the switch
+is a kill switch, not a numerical hedge. Doing provably less work for
+provably identical results is correct regardless of whether a noisy
+end-to-end harness can resolve the gain.
+
+### Methodological note: this project's throughput A/Bs are under-powered
+
+The `off` arm moving 4.7% between runs of identical code sets the noise
+floor for every single-pair throughput comparison in this log and in the
+README. Two consequences:
+
+- **§8b's fusion A/B (+33.8%) and the README's A6000 figure (+19.7%) were
+  single pairs.** +33.8% is far outside a ±5% band so the conclusion
+  survives, but the precision does not — treat it as "large", not as
+  33.8%.
+- **§5's batch sweep and §7's concurrency sweep were one sample per
+  point.** The B=96 dip that §8a chased as a tuner tie-break artifact is
+  comfortably inside this noise band, which is the simpler explanation
+  §8a already landed on after the tie-break theory was refuted.
+
+Anything under ~10% needs interleaved repeats to be claimed at all. This
+is the throughput analogue of §9's accuracy-churn finding, and it has the
+same fix: repeat, interleave, and report the spread.
 
 ---
 
@@ -1026,8 +1094,8 @@ a numerical hedge.
       silently stale on the next machine.
 - [ ] Autotuner's `shmem=None occ=None` introspection failure — cosmetic
       so far, but worth root-causing.
-- [x] **Fuse RoPE's `rotate_half`** — DONE (§11). +4.2% throughput,
-      bit-exact, 9/9 regression. Ships default-on as `LLADA_FUSE_ROPE`.
+- [x] **Fuse RoPE's `rotate_half`** — DONE (§11). Kernel 2.55x, ~+4%
+      end-to-end (p~0.14, direction consistent). Bit-exact, 9/9. Default-on.
 - [ ] **Fuse the MoE top-k combine into GEMM2's epilogue** (§10) — the
       `[M, top_k, K]` intermediate is 67 MB written + 67 MB read per
       layer through the L2 that ncu identifies as the bottleneck.
