@@ -3,7 +3,6 @@ OpenAI-compatible chat completions server for LLaDA-MoE-7B-A1B-Instruct.
 
 Backends:
   - "ours"        : Dense baseline (src.generate)
-  - "ours_kv"     : Original sparse-dLLM + SparseD (src.generate_KVcache)
   - "fast_dense"  : Fast dense cached (Option A) — TP+EP, Triton fused MoE,
                     block-wise KV cache. Static top-8 experts (the model's
                     native routing config).
@@ -626,18 +625,6 @@ def chat_completions(req: ChatRequest):
                     cfg_scale=req.cfg_scale,
                     remasking=req.remasking,
                 )
-            elif BACKEND == "ours_kv":
-                from src.generate_KVcache import generate_cached as generate_kv
-                out_ids = generate_kv(
-                    MODEL,
-                    input_ids,
-                    gen_length=gen_length,
-                    steps=steps,
-                    block_length=block_length,
-                    temperature=req.temperature,
-                    cfg_scale=req.cfg_scale,
-                    remasking=req.remasking,
-                )
             elif BACKEND == "fast_dense":
                 # Only reached here when get_tp_size() > 1 (TP+EP) -- the
                 # single-GPU case is routed through the batched path above.
@@ -906,10 +893,6 @@ def load_model(weight_dir: str, device: str, backend: str):
             layer.mlp = fused_mlp
 
         MODEL = MODEL.to(device)
-    elif backend == "ours_kv":
-        from src.Model_KVcache import LLaDAMoEKV
-        MODEL = LLaDAMoEKV().to(torch.bfloat16).to(device).eval()
-        load_weights(MODEL, weight_dir, verbose=True)
     elif backend == "hf":
         from transformers import AutoModelForCausalLM
         MODEL = AutoModelForCausalLM.from_pretrained(
@@ -933,7 +916,7 @@ def main():
     ap.add_argument("--host", default="0.0.0.0")
     # In distributed mode, we override device with local rank
     ap.add_argument("--device", default=f"cuda:{get_tp_rank()}" if torch.cuda.is_available() else "cpu")
-    ap.add_argument("--backend", choices=["ours", "ours_kv", "fast_dense", "hf"], default="ours")
+    ap.add_argument("--backend", choices=["ours", "fast_dense", "hf"], default="ours")
     ap.add_argument("--quantize", choices=["int8", "int4", "fp8"], default=None,
                     help="Quantize the MoE experts via the LLaDA_Quant toolkit "
                          "(optional dependency, not installed by requirements.txt). "
