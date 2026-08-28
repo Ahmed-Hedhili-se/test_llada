@@ -220,10 +220,23 @@ McNemar:
 > question; n=1000 would be ~3.5 h. A direct INT8-vs-FP8 pairing on one shared
 > question set has not been run.
 
-**Neither Δ is significant**, so the two formats are indistinguishable on
-accuracy at these sample sizes. This does *not* establish that quantization is
-free — both point estimates are negative, so a small real cost is not excluded.
-What it rules out is using small-n marginals to choose between modes.
+**Neither Δ is significant** on its own. But pooling every accuracy
+measurement this project has taken of the two formats — including the A6000
+historical figure below — separates them:
+
+| | measurements | pattern | read |
+|---|---|---|---|
+| **INT8** | A6000 n=50 **+2.0**, H100 n=50 **0.0**, H100 n=200 **−2.5** | scatters around zero, across two GPUs | **no measurable accuracy cost** |
+| **FP8** | H100 n=50 **−4.0**, H100 n=100 **−3.0** | both negative, stable estimate | small real cost **not excluded** |
+
+Three INT8 samples landing positive, zero and negative is what "no effect"
+looks like — the A6000 run that put INT8 *ahead* was noise in the same way our
+n=200 run that puts it behind is. FP8's two both point the same way, which is
+weak evidence rather than proof, but it is a different pattern.
+
+So the defensible statement is **"INT8 is measurably free; FP8 is probably
+slightly lossy but unconfirmed"** — not that the two are interchangeable.
+Settling FP8 needs n≈1000, which it cannot reach without a fused kernel.
 
 **On speed the two are not close:** INT8 has a fused W8A16 kernel and runs at
 parity with BF16; FP8 has none and runs ~3× slower per question. **INT8 is the

@@ -1454,7 +1454,60 @@ Consequences:
 
 ---
 
-## 17. Open items from this session
+## 17. Quantization accuracy across every measurement taken
+
+§15 measured each arm once. Pooling every accuracy measurement this project
+has of INT8 and FP8 — including the A6000 historical figure — separates the
+two formats in a way no single run does.
+
+### INT8: three measurements, scattering around zero
+
+| Measurement | BF16 | INT8 | Δ |
+|---|---:|---:|---:|
+| A6000, n=50 (README historical) | 74.0% | 76.0% | **+2.0** |
+| H100, n=50 (§6) | 74.0% | 74.0% | **0.0** |
+| H100, n=200 paired (§15) | 71.0% | 68.5% | **−2.5** (p=0.50) |
+
+Positive, zero, negative — across two different GPUs. **That scatter is what
+"no real effect" looks like.** The A6000 run that put INT8 one question ahead
+was noise, and so is our n=200 run that puts it 5 questions behind; the
+README's original text already called the +2.0 "noise on the accuracy axis",
+which was the correct read at the time and survives the extra data.
+
+**Conclusion: INT8 has no measurable accuracy cost.** This is the strongest
+statement any arm here supports, and it is stronger than §15 alone could
+make, because it rests on three independent samples rather than one.
+
+### FP8: two measurements, both negative
+
+| Measurement | BF16 | FP8 | Δ |
+|---|---:|---:|---:|
+| H100, n=50 (§6) | 74.0% | 70.0% | **−4.0** |
+| H100, n=100 paired (§15) | 73.0% | 70.0% | **−3.0** (p=0.61) |
+
+Neither is significant on its own, and two samples is not much. But **both
+point the same way, and the point estimate is stable (−3 to −4)** — a
+different pattern from INT8's scatter. That is weak evidence of a small real
+cost, not proof of one, and it is the honest reason to prefer INT8 on
+accuracy grounds even though no individual p-value clears 0.05.
+
+Settling it needs n≈1000 (§9), which FP8 cannot reach in reasonable
+wall-clock without a fused kernel. Until then the defensible statement is
+"INT8 is measurably free; FP8 is probably slightly lossy but unconfirmed" —
+not "both are indistinguishable", which §15 in isolation implied.
+
+### Why this matters for the recommendation
+
+The two formats are equal on memory (−42.4%, hardware-independent) and INT8
+wins decisively on speed (fused W8A16 vs ~3× slower dequantize-per-access).
+Accuracy was the one axis where they looked tied. Pooled across every
+measurement, INT8 is clean and FP8 is unresolved-but-consistently-negative,
+so accuracy stops being a tie and becomes a third, weaker argument in the
+same direction.
+
+---
+
+## 18. Open items from this session
 
 - [x] `moe_tune_config.json` — **DONE (§14d).** Device-keyed lookup added
       (`moe_tune_config.device_name=<GPU>.json`), legacy name still honoured
