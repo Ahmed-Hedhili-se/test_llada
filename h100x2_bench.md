@@ -353,7 +353,109 @@ noise needs the same n=200 treatment §4 already applied to BF16.
 
 ---
 
-## 7. Open items from this session
+## 7. Parallelism under load: TP+EP=2 vs DP=2
+
+Both topologies exercised end to end on the 2 GPUs, at rising concurrency,
+same request shape throughout (`max_tokens=128 steps=128 block_length=32`).
+
+### A real bug found launching this: `start_dp.sh` assumed its own CWD
+
+`start_dp.sh` never `cd`s into its own directory before backgrounding
+replica processes. `WEIGHT_DIR`/`LOG_DIR` are resolved to absolute paths up
+front so weight loading was never affected, but the replica launch itself
+is `"$PY" -m src.server ...`, and `-m` resolves the `src` package from the
+process's CWD when nothing else sets `PYTHONPATH`. Invoked from inside the
+repo (the README's own examples) this is invisible; invoked from anywhere
+else — exactly what an orchestration script outside the repo does — every
+replica dies instantly with `ModuleNotFoundError: No module named 'src'`.
+Fixed with a `cd "$SCRIPT_DIR"` mirroring what `start.sh` already does.
+Committed as `<pending>` (see below).
+
+### TP+EP=2: first real end-to-end run this project has done
+
+`load_weights_tp` at `tp_size>1` had never executed — flagged earlier this
+session as genuinely unexercised code. It worked cleanly on the first real
+attempt: both ranks mapped their shard (1683 tensors each — not exactly
+half of the 3,219 total, because embeddings/norms/`lm_head` replicate on
+every rank while q/k/v/o_proj and expert weights shard), fused MoE blocks
+built, server came up, served requests correctly.
+
+**Correctness sanity** (n=10, same GSM8K config as everywhere else in this
+log — too small to be more than a smoke test): **70.0% (7/10)**, in the
+same range as BF16's measured 74.0% at n=50. Not a substitute for a real
+n≥50 TP accuracy run, which hasn't been done — just confirmation that TP=2
+is not obviously broken.
+
+### The concurrency sweep
+
+| | TP+EP=2 | | DP=2 | |
+|---:|---:|---:|---:|---:|
+| Concurrency | Tok/s | p50 | Tok/s | p50 |
+| 1 | 24.8 | 4.14s | 23.3 | 3.57s |
+| 8 | 24.5 | 35.98s | 220.8 | 3.96s |
+| 32 | 25.1 | 138.05s | 814.0 | 4.58s |
+| 64 | *(not measured — see below)* | | **877.8** (peak) | 5.92s |
+| 128 | *(not measured)* | | 728.5 | 14.54s |
+
+TP+EP's 64/128 rows were deliberately skipped: the trend through 1→8→32 is
+already unambiguous — throughput dead flat regardless of concurrency,
+latency climbing linearly with it (4.14s → 138.05s, a 33× increase for
+zero throughput gain) — and finishing the sweep would have cost roughly 45
+more minutes to reconfirm the same serialization with no new information.
+This is `src/server.py`'s documented behavior working exactly as designed:
+`request_lock` serializes every request when `tp_size > 1`, so concurrent
+clients queue behind each other one at a time rather than batching.
+
+**At concurrency 32, DP delivers 32.4× TP's throughput at 1/30th the
+latency** (814.0 vs 25.1 tok/s; 4.58s vs 138.05s p50). This is the same
+conclusion the README's Multi-GPU section already states from first
+principles — measuring it end to end on real hardware is the point of this
+section, not a surprise result.
+
+### A finding that revises the README's own guidance: TP has no latency edge here either
+
+The README currently frames TP+EP as *"the right choice for single-request
+latency"*, backed by an A6000 figure: *"2× A6000 measured 6.15× vs a
+single-GPU baseline at 128 tokens."* That comparison was against the
+**unoptimized `src/` baseline**, not against `model_update/`'s own
+single-GPU path.
+
+At concurrency 1 here — the actual single-request case — **TP+EP=2 and a
+single DP replica are statistically tied**: 24.8 vs 23.3 tok/s, 4.14s vs
+3.57s p50. TP is not faster; if anything the single GPU edges it out. This
+is consistent with §0's hardware note: these are **H100 PCIe with PHB
+interconnect, no NVLink** (~25–50 GB/s between cards vs NVLink's ~900
+GB/s), and TP's attention *and* MoE blocks each do a SUM all-reduce every
+layer, every diffusion step — 32 all-reduces per layer-stack per step, all
+over that link. On this box, TP's communication cost appears to fully
+cancel out whatever compute-splitting benefit it would otherwise offer at
+batch size 1. **The README's "TP for latency" framing needs an NVLink
+caveat, or re-measurement on hardware that has one** — it is not free-
+standing hardware-independent guidance, and this session is the first time
+it's been checked against a same-generation single-GPU baseline at all.
+
+### DP scaling efficiency: real, but not linear — open question
+
+DP=2's peak (877.8 tok/s at concurrency 64) is **1.42×** the single-GPU
+sweep's own peak from §5 (618.9 tok/s at `BATCH_MAX_SIZE=64`), not the 2×
+a naive doubling would predict. Two replicas, independent GPUs, no shared
+state in the hot path — there's no obvious structural reason for a
+36-point efficiency loss, and it wasn't diagnosed further this session
+(would need `/v1/replicas` polled *during* the sweep to see whether
+least-outstanding actually splits load evenly at these concurrencies, or
+whether the router itself adds a measurable per-request tax). Flagged, not
+explained.
+
+**Also note the same shape as §5's single-GPU curve**: DP throughput peaks
+at concurrency 64 and *drops* at 128 (877.8 → 728.5) while p50 latency more
+than doubles (5.92s → 14.54s) and p95/p99 blow out to ~24s. Same lesson as
+§5: past a hardware-specific ceiling, more concurrency only buys queueing
+delay. For this deployment, **64 total concurrency (32/replica) is close
+to the actual ceiling**, not 128.
+
+---
+
+## 8. Open items from this session
 
 - [ ] `moe_tune_config.json` still not committed to git, and still not
       device-keyed (unlike `dInfer/configs/*device_name=...json`). Should
@@ -366,8 +468,20 @@ noise needs the same n=200 treatment §4 already applied to BF16.
       96/122/139/168/200 specifically.
 - [ ] The B=96 tie-break hypothesis above — confirm by logging the actual
       config `get_best_config` returns at M=96.
-- [ ] Fusion A/B, DP across both GPUs, TP=2 correctness pass — not yet run
-      this session; queued next.
+- [x] DP across both GPUs, TP=2 correctness pass — done in §7.
+- [ ] Fusion A/B — not yet run this session.
+- [ ] TP=2 GSM8K at n≥50 — only an n=10 sanity check has been run (§7).
+- [ ] TP+EP=2's concurrency 64/128 rows — deliberately skipped in §7 since
+      the trend was already unambiguous at 1/8/32; fill in if a firmer
+      curve shape is ever needed.
+- [ ] DP's 1.42×-not-2× scaling efficiency (§7) — undiagnosed. Needs
+      `/v1/replicas` polled during a sweep to see whether load actually
+      splits evenly, or whether the router itself taxes each request.
+- [ ] README's Multi-GPU section claims TP+EP wins on single-request
+      latency, sourced from an A6000-vs-unoptimized-baseline number. §7
+      measured TP+EP=2 vs a single DP replica (both `model_update/`,
+      same box) at concurrency 1 and found them statistically tied — no
+      NVLink on this box may be why. README needs an update or a caveat.
 - [ ] FP8 n=200 accuracy re-run (§6) — the 70.0% vs 74.0% n=50 gap needs
       the same noise check §4 already ran for BF16.
 - [ ] FP8 fused kernel — currently dequantize-per-access only; the 12.5s vs

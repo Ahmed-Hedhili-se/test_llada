@@ -47,6 +47,15 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Every replica runs `-m src.server`, which needs the repo root on Python's
+# module search path. `-m` resolves that from the CWD (absent PYTHONPATH), so
+# invoking this script by path from somewhere else -- `bash /path/to/
+# start_dp.sh`, or a caller like a monitoring script that lives outside the
+# repo -- silently launches replicas that die with "No module named 'src'"
+# the instant they start. WEIGHT_DIR/LOG_DIR are already absolute (derived
+# from SCRIPT_DIR above) so only the replica launch's CWD was ever missing.
+cd "$SCRIPT_DIR"
+
 PY="$VENV/bin/python"
 if [[ ! -f "$PY" ]]; then
     PY="$(command -v python3 || true)"
