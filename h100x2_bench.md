@@ -1334,7 +1334,20 @@ same:
 
 The H100 config is committed under its keyed name.
 
-### 14e. README corrections
+### 14e. Final validation from a clean checkout
+
+The server was reset to the committed HEAD (`158f7f5`), the legacy unkeyed
+`moe_tune_config.json` moved aside so only the device-keyed file is
+present, and everything re-run:
+
+- **Regression suite 9/9** — `test_fusions`, `test_fused_silu_epilogue`,
+  `test_variable_length_batch`, `test_num_logits_slice`,
+  `test_moe_align_block_size`, `test_select_transfer_indices`,
+  `test_threshold_decoding`, `test_router`, `test_oom_retry`.
+- **Fused RoPE bit-exact** at all 11 shape/layout cases, kernel 1.81–2.57×.
+- Device-keyed config loads without the legacy-file warning.
+
+### 14f. README corrections
 
 Four claims the H100 data contradicts, all now fixed at the source rather
 than only in this log:
@@ -1371,7 +1384,7 @@ than only in this log:
       layer through the L2 that ncu identifies as the bottleneck.
 - [x] README corrections — **DONE (§14e).** Kernel profile, steps_per_block
       guidance, TP-for-latency framing, and the QKV rejection note all
-      corrected at the source.
+      corrected at the source (§14f).
 - [x] `~/venv_new` — removed from the box.
 - [x] Decoding-collapse hypothesis — **confirmed and resolved in §8c.**
       `steps_per_block` ratio 1.0× eliminates all 5 known failures.
