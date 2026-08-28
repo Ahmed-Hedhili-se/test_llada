@@ -369,7 +369,7 @@ repo (the README's own examples) this is invisible; invoked from anywhere
 else — exactly what an orchestration script outside the repo does — every
 replica dies instantly with `ModuleNotFoundError: No module named 'src'`.
 Fixed with a `cd "$SCRIPT_DIR"` mirroring what `start.sh` already does.
-Committed as `<pending>` (see below).
+Committed as `c45fe6c`.
 
 ### TP+EP=2: first real end-to-end run this project has done
 
