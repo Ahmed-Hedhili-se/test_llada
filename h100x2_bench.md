@@ -808,7 +808,152 @@ actually produced is three corrections:
 
 ---
 
-## 10. Open items from this session
+## 10. Nsight Compute profiling: the "no headroom" claim is wrong on H100
+
+### Tooling
+
+Nsight Compute is not installed on this image and has no apt candidate
+until NVIDIA's repo is added (`cuda-keyring_1.1-1_all.deb`, then
+`nsight-compute-2025.3.1` — the distro-provided `nsight-compute` resolves
+to a 2021 build that predates sm_90). GPU performance counters are
+admin-gated, so a normal-user run fails with `ERR_NVGPUCTRPERM`; `sudo ncu`
+works and avoids rebooting to flip
+`NVreg_RestrictProfilingToAdminUsers`. Binary at
+`/opt/nvidia/nsight-compute/2025.3.1/ncu`.
+
+Profiling target is a real forward at the production shape the throughput
+sweep peaks at: `BATCH_MAX_SIZE=64`, `block_length=32` → M = 2048, with a
+256-token prompt prefix so attention sees a realistic context.
+
+### Kernel breakdown (H100, M=2048)
+
+| Kernel | Self ms | % GPU | Calls |
+|---|---:|---:|---:|
+| **`fused_moe_kernel`** | 504.47 | **55.29%** | 160 |
+| `sm90_xmma_gemm` (cuBLAS, attn/qkv/o_proj) | 110.19 | 12.08% | 325 |
+| `elementwise_kernel` (×4 variants, combined) | 113.64 | **12.46%** | 800 |
+| `_rmsnorm_kernel` (ours, fused) | 49.47 | 5.42% | 325 |
+| `CatArrayBatchedCopy` | 38.40 | 4.21% | 160 |
+| `reduce_kernel` | 30.73 | 3.37% | 80 |
+| `flash_fwd_kernel` | 27.02 | 2.96% | 80 |
+
+182.48 ms/forward. `fused_moe_kernel` at 55.3% tracks the README's 58.75%
+on A6000 — it is still the dominant kernel.
+
+### The headline: it is L2-bound, not DRAM-bound
+
+README currently states `fused_moe_kernel` runs at **"81% of theoretical
+weight-streaming bandwidth"** and concludes **"There is no kernel headroom
+left there."** Measured on H100 (Speed-of-Light, GEMM2 launch):
+
+| Metric | Value |
+|---|---:|
+| **DRAM Throughput** | **14.53%** |
+| **L2 Cache Throughput** | **79.70%** |
+| Memory Throughput (max of hierarchy) | 79.32% |
+| Compute (SM) Throughput | 49.59% |
+| Tensor pipe utilisation | 49.59% |
+| **L1/TEX Hit Rate** | **0.09%** |
+| Achieved occupancy | 12.43% |
+| Registers/thread | 234 (GEMM2) / 148 (GEMM1) |
+| Local memory spilling | **0** |
+
+ncu's own verdict: *"Memory is more heavily utilized than Compute: Look at
+the Memory Workload Analysis section to identify the **L2 bottleneck**."*
+
+**DRAM sits at 14.5%, not 81%.** The engine is nowhere near a memory-
+streaming wall on this hardware. What saturates is **L2 at 79.7%** — the
+expert weights are being served largely out of L2 (`moe_align_block_size`
+groups tokens by expert, giving ~256 rows of reuse per expert at M=2048),
+so DRAM barely works while L2 does everything.
+
+The README's *reasoning* was right and its *conclusion* was too strong: it
+already noted "Nsight's 96% is L2, not DRAM" and correctly inferred
+"remove intermediate traffic". But the accompanying "81% of weight-
+streaming bandwidth / no headroom left" framing is an A6000 artifact and
+does not survive the move to H100. **There is headroom; it is behind L2
+traffic, not DRAM bandwidth.**
+
+Occupancy is 12–18%, entirely register-limited (234 regs × 128 threads =
+29,952 of the SM's 65,536 → 2 blocks; 8 warps of 64 = 12.5%, matching the
+measured 12.43%). Notably **no register spilling**, so the tuner's configs
+are not pathological — they trade occupancy for ILP deliberately.
+
+`L1/TEX hit rate of 0.09%` is the other structural fact: Triton's
+pipelined loads go global→shared via `cp.async` and bypass L1 entirely, so
+L1 contributes nothing and all reuse pressure lands on L2.
+
+### Two optimisations tested and rejected
+
+**Raising the tuner's `BLOCK_SIZE_M ≤ 64` cap.** Hypothesis: each expert's
+weight tile is re-read from L2 once per M-block covering it, so at M=2048
+(256 rows/expert) `BM=64` re-reads every tile 4× and `BM=128` would halve
+the dominant L2 consumer. Swept the full config grid at caps 64/128/256
+across M ∈ {512, 1024, 2048, 4096}:
+
+| M | best @ cap64 | best @ cap128 | Δ latency |
+|---:|---:|---:|---:|
+| 512 | 0.5330 ms | 0.5073 ms | +4.8% |
+| 1024 | 0.6249 ms | 0.6459 ms | −3.4% |
+| 2048 | 0.9863 ms | 0.9913 ms | −0.5% |
+| 4096 | 1.8525 ms | 1.8381 ms | +0.8% |
+
+**Refuted.** The search picks `BM=64` (or 32) even when 128/256 are
+allowed, at every M — at M=2048 it returns the identical config. Larger
+tiles cost more in occupancy than they save in L2 traffic, and the tuner
+was already optimal within its space. The `≤64` cap is not leaving
+anything on the floor.
+
+**Upgrading Triton for Hopper codegen.** Built an isolated venv
+(`~/venv_new`, torch 2.11.0+cu128 / Triton 3.6.0 vs the pinned
+2.5.1+cu124 / 3.1.0) and ran the identical kernel:
+
+| M | Triton 3.1.0 | Triton 3.6.0 | Δ |
+|---:|---:|---:|---:|
+| 512 | 0.5315 ms | 0.5244 ms | −1.3% |
+| 1024 | 0.6396 ms | 0.6120 ms | −4.3% |
+| 2048 | 0.9626 ms | 0.9331 ms | −3.1% |
+| 4096 | 1.7389 ms | 1.7286 ms | −0.6% |
+
+**1–4%, not the Hopper win hypothesised.** The compiler improved, but
+Hopper's real features (TMA descriptors, warp specialisation, persistent
+wgmma pipelining) require *explicit opt-in in the kernel source* —
+upgrading the compiler does not rewrite the kernel. Not worth a torch
+upgrade's correctness risk on its own.
+
+### Two opportunities that are real, with evidence
+
+Op-level attribution (`ProfilerActivity.CPU + CUDA`) over the same forward
+identifies where the non-MoE 45% actually goes:
+
+**1. RoPE's `rotate_half` is unfused — ~4% of GPU time.**
+`aten::cat` (3.04%, 165 calls) and `aten::neg` (0.90%, 160 calls) are
+2-per-layer-per-forward, which is exactly `rotate_half`'s
+`torch.cat([-x2, x1], dim=-1)`. This materialises a full rotated copy of Q
+and K every layer, every step, purely to express a permutation. A Triton
+RoPE kernel that applies the rotation in-register removes the `cat`, the
+`neg`, and their L2 traffic. **Low risk, well-understood, ~4% available.**
+This is the same class of win as the RMSNorm and decode-tail fusions the
+project already landed.
+
+**2. The MoE top-k combine is a separate reduction — ~2.4–3.4%, plus L2
+relief.** `aten::sum` (2.43%, 160 calls = 2/layer) and `reduce_kernel`
+(3.37% kernel-side) are the `cache2.sum(dim=1)` that combines the `top_k`
+expert outputs. GEMM2 writes an `[M, top_k, K]` intermediate — at M=2048
+that is **67 MB written then 67 MB read back per layer**, ×16 layers, all
+through the L2 that ncu says is the bottleneck at 79.7%. Fusing the
+combine into GEMM2's epilogue would write `[M, K]` (8.4 MB) directly and
+delete the read entirely. Higher effort than the RoPE fusion — it needs
+either atomics or a grid remap that interacts with `moe_align_block_size`'s
+expert-major ordering — but it attacks the measured bottleneck head-on,
+and it is the same optimisation the SiLU epilogue already did for
+`intermediate_cache1`.
+
+Neither was implemented this session. Both are measured, not guessed.
+
+---
+
+## 11. Open items from this session
 
 - [ ] `moe_tune_config.json` still not committed to git, and still not
       device-keyed (unlike `dInfer/configs/*device_name=...json`). Should
@@ -816,6 +961,20 @@ actually produced is three corrections:
       silently stale on the next machine.
 - [ ] Autotuner's `shmem=None occ=None` introspection failure — cosmetic
       so far, but worth root-causing.
+- [ ] **Fuse RoPE's `rotate_half`** (§10) — `cat` + `neg` are ~4% of GPU
+      time and exist only to express a permutation. Highest
+      value-per-risk item found this session.
+- [ ] **Fuse the MoE top-k combine into GEMM2's epilogue** (§10) — the
+      `[M, top_k, K]` intermediate is 67 MB written + 67 MB read per
+      layer through the L2 that ncu identifies as the bottleneck.
+- [ ] **README correction required**: the Kernel-profile section claims
+      `fused_moe_kernel` runs at "81% of theoretical weight-streaming
+      bandwidth" and that "there is no kernel headroom left there."
+      Measured on H100: DRAM 14.5%, L2 79.7%, compute 49.6%. The claim is
+      an A6000 artifact and reads as "stop optimising" on hardware where
+      that is not true.
+- [ ] `~/venv_new` (torch 2.11/Triton 3.6) left on the box for future
+      Hopper-codegen testing; delete if the disk is ever wanted.
 - [x] Decoding-collapse hypothesis — **confirmed and resolved in §8c.**
       `steps_per_block` ratio 1.0× eliminates all 5 known failures.
       Remaining: the README's stability guidance (`≥ block_length/2`,
