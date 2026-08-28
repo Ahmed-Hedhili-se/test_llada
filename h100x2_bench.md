@@ -1086,7 +1086,75 @@ same fix: repeat, interleave, and report the spread.
 
 ---
 
-## 12. Open items from this session
+## 12. Current throughput, measured with repeats
+
+Every throughput number earlier in this log was **one sample per point**.
+§11 established the noise floor at ~5% (an unchanged arm moved 4.7%), so
+those points cannot be quoted as precise. Re-measured with **3 reps per
+point**, fused RoPE on (the current default), same request shape
+throughout (`max_tokens=128 steps=128 block_length=32`, varied prompts).
+
+### Single GPU
+
+| `BATCH_MAX_SIZE` | tok/s (mean) | sd | spread | p50 |
+|---:|---:|---:|---:|---:|
+| **32** | **656.9** | **3.5** | 652.1–660.4 | **5.33 s** |
+| 64 | 585.0 | 34.7 | 547.0–630.9 | 12.07 s |
+| 128 | 607.2 | 54.4 | 530.4–649.7 | 23.04 s |
+
+### DP=2 (both GPUs, one replica each)
+
+| Concurrency | tok/s (mean) | sd | spread | p50 |
+|---:|---:|---:|---:|---:|
+| 32 | 855.4 | 16.2 | 833.1–871.3 | **4.30 s** |
+| **64** | **897.9** | 55.3 | 820.4–946.1 | 5.60 s |
+| 128 | 601.4 | 80.2 | 534.8–714.3 | 18.21 s |
+
+### Headline
+
+**~900 tok/s peak on 2×H100** (DP=2, concurrency 64). At concurrency 32
+you get 855 tok/s — 5% less throughput for **24% better latency** (4.30 s
+vs 5.60 s) and a third of the variance, which is the better operating
+point for anything latency-sensitive.
+
+### This corrects §5: the single-GPU optimum is B=32, not B=64
+
+§5's single-sample sweep concluded "throughput peaks at B=64 and is flat
+through 256". With repeats that does not hold. **B=32 wins on all three
+axes at once** — highest throughput (656.9 vs 585.0/607.2), less than half
+the latency (5.33 s vs 12.07/23.04 s), and an order of magnitude less
+variance (sd 3.5 vs 34.7/54.4). B=32's *minimum* across reps (652.1)
+exceeds B=128's *maximum* (649.7), so the ordering is not a sampling
+accident.
+
+B=64 and B=128 are not distinguishable from each other — their ranges
+overlap almost entirely (547–631 vs 530–650). §5 reported them as 618.9
+and 568.1 and drew a curve through those points; both numbers were single
+draws from distributions this wide.
+
+**Practical consequence: `BATCH_MAX_SIZE=32` is the recommended
+single-GPU setting**, not 64 and certainly not the 256 the "flat past 64"
+reading would have permitted.
+
+### The variance is itself a finding
+
+Measurement noise scales sharply with batch size: sd 3.5 at B=32, 34.7 at
+B=64, 54.4 at B=128; and 16.2 → 55.3 → 80.2 across the DP concurrencies.
+Whatever the engine is doing at high batch is not just slower on average,
+it is *less predictable* — a p50 that swings 21–27 s between identical
+runs is a scheduling or memory-pressure symptom, not a throughput curve.
+Not diagnosed here; flagged as an open item.
+
+### DP scaling
+
+Best-to-best, DP=2 delivers **897.9 / 656.9 = 1.37×** a single GPU, and at
+matched concurrency 32 it is 855.4 / 656.9 = **1.30×**. Both are below
+§7's reported 1.42×, and all three are well short of 2×. The sub-linear
+scaling noted in §7 stands and remains undiagnosed.
+
+---
+
+## 13. Open items from this session
 
 - [ ] `moe_tune_config.json` still not committed to git, and still not
       device-keyed (unlike `dInfer/configs/*device_name=...json`). Should
@@ -1133,7 +1201,11 @@ same fix: repeat, interleave, and report the spread.
       (TP's cost scales with step count, not request-shape-independent)
       makes the 128-token throughput-benchmark numbers less central to
       the real question anyway.
-- [ ] DP's 1.42×-not-2× scaling efficiency (§7) — still undiagnosed. Needs
+- [ ] High-batch instability (§12) — measurement sd grows from 3.5 tok/s at
+      B=32 to 54.4 at B=128, and DP p50 swings 15.8-20.8 s between identical
+      runs. Less predictable, not just slower. Undiagnosed.
+- [ ] DP's sub-linear scaling (§12 remeasures it at 1.30-1.37×, §7 said
+      1.42×) — still undiagnosed. Needs
       `/v1/replicas` polled during a sweep to see whether load actually
       splits evenly, or whether the router itself taxes each request.
 - [ ] README's Multi-GPU section needs updating for **two** reasons now,
