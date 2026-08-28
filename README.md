@@ -241,6 +241,23 @@ deployable format**; FP8 is a memory play only until it gets a kernel.
 
 Memory drops 42% at every load; speed **inverts with batch size** — faster than BF16 at batch 1, parity at 32, half the speed at 64. The concurrency-64 collapse is not explained by the roofline (BF16 is flat from 32→64 while the quantized arm halves) and remains open.
 
+> ### The A6000 speed win does not transfer to H100 — and the profiling says why
+>
+> On A6000, `INT8 + fused W8A16` was **19% faster** than BF16 on GSM8K
+> (5.8 vs 7.2 s/question). On H100 the same configuration is **24% slower**
+> (4.2 vs 3.4 s/question). Same code, opposite sign.
+>
+> | | DRAM throughput | What INT8 does |
+> |---|---:|---|
+> | A6000 | 66–68% | close to the bandwidth wall, so halving the weight bytes relieves the **binding** constraint → faster |
+> | H100 | **14.5%** | DRAM was never the constraint (L2 is, at 79.7%) → fewer bytes buys nothing, while the W8A16 dequantize work still costs → slower |
+>
+> **INT8 buys speed only when you are bandwidth-starved.** The A6000 is; the
+> H100 is not. This is the same measurement that overturned the "no kernel
+> headroom" claim in [Kernel profile](#kernel-profile) — once you know DRAM sits
+> at 14.5% on H100, INT8 losing there is the predictable outcome rather than a
+> surprise. Memory savings (−42.4%) are hardware-independent and hold on both.
+
 **Recommendation:** on a card that fits the model, stay BF16 for throughput.
 Quantization earns its place when memory is the binding constraint, or for
 single-request latency. On H100 specifically, using the freed memory to run

@@ -1409,7 +1409,52 @@ yet, so it is 3× slower per question.
 
 ---
 
-## 16. Open items from this session
+## 16. Why the A6000's INT8 speed win does not transfer
+
+The README's historical A6000 table reports `INT8 + fused W8A16` at **5.8
+s/question on GSM8K against BF16's 7.2 s — 19% faster**, with 42% less
+memory. That is a real result and it was the basis for treating INT8 as a
+speed optimisation, not only a memory one.
+
+**It reverses on H100.** §6 measured, same config, same harness:
+
+| | A6000 | H100 |
+|---|---:|---:|
+| BF16, s/question | 7.2 | 3.4 |
+| INT8 + fused W8A16, s/question | **5.8** | **4.2** |
+| INT8 vs BF16 | **1.24× faster** | **0.81× — 24% slower** |
+
+Same code, opposite sign. §10's profiling explains it without needing a new
+experiment:
+
+| | DRAM throughput | Binding constraint | What halving weight bytes does |
+|---|---:|---|---|
+| A6000 | 66–68% | close to the DRAM wall | relieves it → faster |
+| H100 | **14.5%** | **L2 (79.7%)**, not DRAM | nothing, while the W8A16 dequantize still costs → slower |
+
+**INT8 buys speed only when the kernel is bandwidth-starved.** The A6000 is;
+the H100 is not. This is the same measurement that overturned the "81% of
+weight-streaming bandwidth / no kernel headroom" claim — once DRAM is known
+to sit at 14.5%, INT8 losing on H100 is the predicted outcome rather than an
+anomaly, and the two findings corroborate each other.
+
+Consequences:
+
+- **The memory saving is hardware-independent** (−42.4%, §6) and holds on
+  both cards. The *speed* claim is not portable and should never have been
+  stated without the hardware attached.
+- This is a third instance of the same pattern in this log — a conclusion
+  correct on A6000 that inverts on H100, alongside the kernel-profile claim
+  (§10) and fused QKV (§10, README). The common cause is that A6000 is
+  bandwidth-bound where H100 is not, so every optimisation that trades
+  compute for bytes changes sign between them.
+- It also reframes §8d: co-locating INT8 replicas lost to BF16 not because
+  quantization is broken under contention, but because on this hardware INT8
+  is already the slower arm before contention is added.
+
+---
+
+## 17. Open items from this session
 
 - [x] `moe_tune_config.json` — **DONE (§14d).** Device-keyed lookup added
       (`moe_tune_config.device_name=<GPU>.json`), legacy name still honoured
