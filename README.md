@@ -15,67 +15,40 @@ Measured on 2× H100 PCIe (full log: [`h100x2_bench.md`](h100x2_bench.md)) and o
 
 ---
 
+---
+
 ## Contents
 
-- [Architecture](#architecture) · [Optimizations](#optimizations) · [Benchmarks](#benchmarks)
-- [Quantization](#quantization-int8-experts) · [Autotuner](#triton-autotuner) · [Correctness](#correctness)
-- [Decoding](#adaptive-decoding) · [Multi-GPU](#multi-gpu) · [Getting Started](#getting-started) · [Structure](#project-structure)
-- **[`h100x2_bench.md`](h100x2_bench.md)** — full 2× H100 validation log: every measurement, the bugs found, and the hypotheses that were tested and rejected
+- **[Benchmarks](#benchmarks)** · **[Correctness](#correctness--tests)** · **[Quantization](#quantization)** · [Quick start](#quick-start)
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — model internals, the 7 optimizations, autotuner, project layout
+- [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) — install, launch, multi-GPU topology, decoding configuration
+- [`docs/h100x2_bench.md`](docs/h100x2_bench.md) — the full 2× H100 validation log: every measurement, the bugs found, and the hypotheses tested and rejected
+- [`docs/INVESTIGATION_LOG.md`](docs/INVESTIGATION_LOG.md) — the correctness investigation, including what was retracted
 
 ---
 
-## Architecture
+## How to read these numbers
 
-Generation is iterative unmasking, not next-token prediction. Every forward pass sees the entire sequence; `[MASK]` tokens are progressively replaced over N denoising steps, highest-confidence first.
+Two things dominate every figure below, and both were measured rather than assumed:
 
-| | |
-|---|---|
-| Layers / hidden / heads | 16 (all MoE) / 2048 / 16 (MHA, head dim 128) |
-| Experts | 64, top-8, inner dim 1024 |
-| Vocabulary | 157,184 |
-| Attention | **Bidirectional** (non-causal), RoPE θ=50,000 |
+| | Measured noise floor | Consequence |
+|---|---|---|
+| **Throughput** | **~±5%** run-to-run (±15% at high batch) — an *unchanged* arm moved 4.7% between runs | Anything under ~10% is not a result. H100 figures are 3 reps/point with `sd`; A6000 figures are single samples. |
+| **Accuracy** | **~17% of GSM8K questions flip** under *any* numerical perturbation on this checkpoint | n=200 carries ±3pt of intrinsic churn. Marginal comparison at that scale is invalid — **paired McNemar required**, and resolving a 3-point effect needs n≈1000. |
 
-Each expert is a SwiGLU FFN: `W1 = [gate ; up]` (2048 → 2×1024), `SiLU(gate) ⊙ up`, then `W2` (1024 → 2048). Expert weights are ~92% of the model.
-
-> Static top-8 throughout. Reduced expert activation (top-5, step ramps, adaptive thresholds) was evaluated and dropped — this checkpoint's router is near-uniform, so fewer experts cost accuracy without a compensating win.
-
----
-
-## Optimizations
-
-`src/` is the unoptimized reference. `dminfr/engine/` is the optimized engine.
-
-**1. Triton fused MoE** — the baseline loops all 64 experts sequentially. One grouped-GEMM kernel replaces 64 launches: tokens are sorted by expert, padded to block boundaries, processed together. `moe_align_block_size` is fully vectorized (the original made 128 host-device syncs per call).
-
-**2. Block-wise KV caching** — prompt and finalized blocks have fixed content, so their post-RoPE K/V never change. Each step computes only the active block against `[cached ; fresh]`. A block's K/V is committed only after it is fully unmasked, and priming runs over the *full* mask-filled sequence — the model was trained to always see one, and truncating it causes premature EOS collapse.
-
-**3. Fused SiLU epilogue** — `w1` packs `[gate ; up]` along N, so each program computes two B tiles and applies `SiLU(gate)*up` in registers, never materializing the 2·EI-wide intermediate (~1.2 GB of round-trip traffic per forward). **Bit-exact**: accumulators are rounded to bf16 *before* the activation, reproducing the unfused op order exactly.
-
-**4. Narrowed `lm_head`** — `lm_head` is the widest GEMM (2048 → 157,184, ~644 MB of weights) and callers discarded most of its output: the cache-prime and block-finalize passes discard *all* of it. `num_logits` restricts it to the rows actually consumed. **Bit-exact** (GEMM rows are independent; RMSNorm reduces along the feature axis).
-
-**5. Fused RMSNorm + decode tail** — eager RMSNorm is 8 launches, and the model runs 65 per forward (~30% of all kernel launches). The decode tail did a full fp32 copy → 157k-wide softmax → gather of one value. One Triton kernel each: **9.1–11.4×** and **3.1–6.3×** respectively. Not bit-exact (both reassociate a reduction); disable with `LLADA_FUSE_RMSNORM=0` / `LLADA_FUSE_DECODE=0`.
-
-**6. Fused RoPE** — `rotate_half` was `torch.cat([-x2, x1])`, materializing a
-full rotated copy of q and k every layer, every step, purely to express a
-permutation of the head dimension. ncu attributed ~4% of GPU time to the
-resulting `aten::cat` + `aten::neg`. One kernel reads the partner element
-directly and never builds the copy: **2.55×** on the op, and **bit-exact** —
-it reproduces ATen's three-bf16-op rounding order rather than taking the more
-accurate fully-fp32 route, so q/k are identical downstream and accuracy is
-provably unchanged. Disable with `LLADA_FUSE_ROPE=0`.
-
-**7. Variable-length batching** — prompts of different lengths are left-padded to a common width, with per-row RoPE positions and an additive attention mask. Before this, requests could only batch if their prompts tokenized to *exactly* the same length.
-
-**Rejected on A6000, flips on H100: fused QKV.** One GEMM instead of three measured 1.62× at M=32, 0.99× at M=256, **0.96× at M=1024**, 1.17× at M=2048 on A6000 — and this engine runs at M = batch × suffix_length, so batch 32 at block 32 sits near M=1024, exactly where it lost. On **H100 the same test measures 1.87× / 3.76× / 1.18× / 1.12×** — faster at every size, and bit-exact at M≥256. It remains unfused because `lm_head` dominates the cuBLAS time, so the end-to-end gain is ~0.5%, below the measurement noise floor, and enabling it would need a shape-dependent bit-exactness rule. `tests/test_fusions.py` measures it on whatever card you run: the answer is cuBLAS- and shape-dependent, not universal.
+Several previously-published numbers in this repo did not survive that
+standard. They are corrected below and the retractions are recorded in
+[`docs/h100x2_bench.md`](docs/h100x2_bench.md) rather than quietly dropped.
 
 ---
 
 ## Benchmarks
 
+
 > Two hardware sets below. **H100 numbers are 3 repetitions per point**; A6000
 > numbers are single samples and should be read as approximate — the measured
 > run-to-run noise floor on this harness is **~±5%** (up to ±15% at high batch),
-> so anything under ~10% is not a result. See `h100x2_bench.md` §11.
+> so anything under ~10% is not a result. See [`docs/h100x2_bench.md`](h100x2_bench.md) §11.
 
 ### 2× H100 PCIe — current
 
@@ -167,13 +140,68 @@ Throughput is past its knee by 32: 4× the batch buys 1.62× the throughput. The
 
 On A6000 it is close to a weight-streaming wall: the expert weights (805 MB/layer) stream every forward regardless of token count.
 
-On H100 it is **not**. Nsight Compute at the production shape measures **DRAM throughput 14.5%, L2 79.7%, compute 49.6%** — ncu names the L2 as the bottleneck outright, and DRAM is nowhere near saturated. An earlier revision of this section claimed "81% of theoretical weight-streaming bandwidth" and "no kernel headroom left"; that is an A6000 figure and does not transfer. See `h100x2_bench.md` §10.
+On H100 it is **not**. Nsight Compute at the production shape measures **DRAM throughput 14.5%, L2 79.7%, compute 49.6%** — ncu names the L2 as the bottleneck outright, and DRAM is nowhere near saturated. An earlier revision of this section claimed "81% of theoretical weight-streaming bandwidth" and "no kernel headroom left"; that is an A6000 figure and does not transfer. See [`docs/h100x2_bench.md`](h100x2_bench.md) §10.
 
 > Nsight's "Memory Throughput ~96%" is **L2**, not DRAM (DRAM sits at 66–68%). Read as a DRAM ceiling it says "nothing to gain"; read as an L2 ceiling it says "remove intermediate traffic" — which is what produced optimization 3.
 
 ---
 
-## Quantization (INT8 / FP8 experts)
+## Correctness & Tests
+
+
+**GSM8K on 2× H100: 75.2% at n=1000** (`steps=1024 block_length=64 threshold 0.9/0.4`).
+Regression suite **9/9**, `LLaDA_Quant` **276/276**, autotuner validates
+`cos_sim = 1.000000` at every M, optimized output is **character-identical** to
+the baseline (0/128 divergence).
+
+> **Sample size matters more than anything else here.** The same engine and config
+> scores 74.0% at n=50, 71.0% at n=200 and **75.2% at n=1000** — the small
+> subsets are simply unrepresentative. Worse, **~17% of GSM8K questions flip
+> outcome under *any* numerical perturbation** on this checkpoint (measured: a
+> router-precision change with no accuracy effect still churned 167/1000
+> questions). So n=200 carries ±3pt of intrinsic noise, marginal comparison at
+> that scale is invalid, and **paired McNemar is required** — resolving a 3-point
+> effect needs n≈1000. Every accuracy figure below n=1000 in this repo's history
+> inherits this. See [`docs/h100x2_bench.md`](h100x2_bench.md) §9.
+
+Against the HuggingFace reference at the logit level: **3,219/3,219 weights mapped**, logit cosine **0.9781**, top-1 token match **91.0%**.
+
+A residual ~6pt fixed-schedule gap vs HF was investigated and closed as **inherent, not a bug**: this checkpoint's router is near-uniform (top-1 weight ~1.7–5%), so bf16-level noise flips top-8 expert membership for 43–90% of positions per layer. A 2×2 kernel-isolation matrix exonerated the Triton MoE kernel entirely. See [`docs/INVESTIGATION_LOG.md`](INVESTIGATION_LOG.md) §2.9–2.11.
+
+Regression tests (`python -m tests.<name>`):
+
+| | |
+|---|---|
+| `test_fusions` | RMSNorm / decode / QKV numerics + speed, and token identity |
+| `test_variable_length_batch` | a padded row reproduces its solo run **exactly** |
+| `test_num_logits_slice` | narrowed `lm_head` is bit-exact |
+| `test_moe_align_block_size` | vectorized alignment vs a frozen reference |
+| `test_select_transfer_indices` | vectorized per-row top-k vs a frozen reference |
+| `test_router` | dispatch, health, failover, recovery (no GPU needed) |
+
+> **Accuracy figures predating `_stable_subset` are not comparable across machines.** `random.shuffle` over a HuggingFace dataset whose row order varies by version meant the same `--seed` selected *different questions* on different boxes — two runs shared only 6 of their first 10. Fixed by sorting on a content hash before shuffling. Re-measure before comparing any historical accuracy number.
+
+---
+
+### Decoding: anchored accuracy pair
+
+`ANCHORED` — A6000, GSM8K n=50 seed=42, `max_tokens=1024 steps=512 block_length=64`, threshold 0.9/low 0.4, under the fixed question selection:
+
+| Config | Accuracy | s/question |
+|---|---:|---:|
+| **BF16** | **74.0%** (37/50) | **7.2** |
+| **INT8 + fused W8A16** | **76.0%** (38/50) | **5.8** |
+
+Same 50 questions, same box — the first genuinely comparable accuracy pair in this project. INT8 is 19% faster *and* one question ahead, which at n=50 is noise on the accuracy axis and a real win on the time axis.
+
+> Configuration guidance — including why `steps_per_block >= block_length` is
+> the recommended setting rather than the documented floor — is in
+> [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
+
+---
+
+## Quantization
+
 
 **This engine runs BF16.** Nothing in `dminfr/engine/` quantizes anything. (The
 `use_fp8_w8a8` / `use_int8_w8a16` parameters that used to sit in
@@ -183,8 +211,8 @@ they have since been removed.)
 INT8 is available through the optional [`LLaDA_Quant`](https://github.com/Ahmed-Hedhili-se/LLaDA_Quant) toolkit, imported lazily and absent from `requirements.txt`:
 
 ```bash
-bash start.sh --backend fast_dense --weight-dir weights --quantize int8
-bash start.sh --backend fast_dense --weight-dir weights --quantize fp8   # E4M3
+bash scripts/start.sh --backend fast_dense --weight-dir weights --quantize int8
+bash scripts/start.sh --backend fast_dense --weight-dir weights --quantize fp8   # E4M3
 ```
 
 ### Measured on 2× H100
@@ -276,165 +304,31 @@ Quantization earns its place when memory is the binding constraint, or for
 single-request latency. On H100 specifically, using the freed memory to run
 *more replicas per GPU* was tested and is a **net loss** — the MoE kernel is
 bandwidth-bound, so co-located replicas compete for bytes rather than adding
-throughput (`h100x2_bench.md` §8d).
+throughput ([`docs/h100x2_bench.md`](h100x2_bench.md) §8d).
 
 ---
 
-## Triton Autotuner
-
-`dminfr.tuning.autotune_moe.py` generates a hardware-specific `moe_tune_config.json`, loaded at import time. **Run it on every new GPU** — it was the single largest speed win found in this project (2.2× on the MoE pipeline at M=2048).
+## Quick start
 
 ```bash
-python dminfr.tuning.autotune_moe.py --model FULL_CFG          # single GPU
-python dminfr.tuning.autotune_moe.py --model FULL_CFG --tp-size 8
+bash scripts/setup.sh                              # venv + torch + ~15 GB weights
+python -m dminfr.tuning.autotune_moe --model FULL_CFG   # do not skip
+bash scripts/start.sh --backend fast_dense --weight-dir weights
 ```
 
-It scores the *complete* pipeline (`GEMM1 → activation → GEMM2 → sum`, following `FUSE_SILU`), not one GEMM, and penalizes configs that inflate padding: `score = latency × (1 + penalty × padding_ratio)`. Shared-memory limits are queried from the device. The winner is validated at `cos_sim > 0.999` — **not** bit-exactness, so retuning can legitimately shift generated tokens.
-
----
-
-## Correctness
-
-**GSM8K on 2× H100: 75.2% at n=1000** (`steps=1024 block_length=64 threshold 0.9/0.4`).
-Regression suite **9/9**, `LLaDA_Quant` **276/276**, autotuner validates
-`cos_sim = 1.000000` at every M, optimized output is **character-identical** to
-the baseline (0/128 divergence).
-
-> **Sample size matters more than anything else here.** The same engine and config
-> scores 74.0% at n=50, 71.0% at n=200 and **75.2% at n=1000** — the small
-> subsets are simply unrepresentative. Worse, **~17% of GSM8K questions flip
-> outcome under *any* numerical perturbation** on this checkpoint (measured: a
-> router-precision change with no accuracy effect still churned 167/1000
-> questions). So n=200 carries ±3pt of intrinsic noise, marginal comparison at
-> that scale is invalid, and **paired McNemar is required** — resolving a 3-point
-> effect needs n≈1000. Every accuracy figure below n=1000 in this repo's history
-> inherits this. See `h100x2_bench.md` §9.
-
-Against the HuggingFace reference at the logit level: **3,219/3,219 weights mapped**, logit cosine **0.9781**, top-1 token match **91.0%**.
-
-A residual ~6pt fixed-schedule gap vs HF was investigated and closed as **inherent, not a bug**: this checkpoint's router is near-uniform (top-1 weight ~1.7–5%), so bf16-level noise flips top-8 expert membership for 43–90% of positions per layer. A 2×2 kernel-isolation matrix exonerated the Triton MoE kernel entirely. See `INVESTIGATION_LOG.md` §2.9–2.11.
-
-Regression tests (`python -m tests.<name>`):
-
-| | |
-|---|---|
-| `test_fusions` | RMSNorm / decode / QKV numerics + speed, and token identity |
-| `test_variable_length_batch` | a padded row reproduces its solo run **exactly** |
-| `test_num_logits_slice` | narrowed `lm_head` is bit-exact |
-| `test_moe_align_block_size` | vectorized alignment vs a frozen reference |
-| `test_select_transfer_indices` | vectorized per-row top-k vs a frozen reference |
-| `test_router` | dispatch, health, failover, recovery (no GPU needed) |
-
-> **Accuracy figures predating `_stable_subset` are not comparable across machines.** `random.shuffle` over a HuggingFace dataset whose row order varies by version meant the same `--seed` selected *different questions* on different boxes — two runs shared only 6 of their first 10. Fixed by sorting on a content hash before shuffling. Re-measure before comparing any historical accuracy number.
-
----
-
-## Adaptive Decoding
-
-Opt-in threshold decoding (`confidence_threshold`), ported from dInfer's `HierarchyDecoder`: at most one reveal per contiguous run of selectable positions, floored by `low_confidence_threshold`, unioned with positions clearing the threshold outright.
-
-GSM8K, n=50, seed 42, chat-templated:
-
-`ANCHORED` — A6000, GSM8K n=50 seed=42, `max_tokens=1024 steps=512 block_length=64`, threshold 0.9/low 0.4, under the fixed question selection:
-
-| Config | Accuracy | s/question |
-|---|---:|---:|
-| **BF16** | **74.0%** (37/50) | **7.2** |
-| **INT8 + fused W8A16** | **76.0%** (38/50) | **5.8** |
-
-Same 50 questions, same box — the first genuinely comparable accuracy pair in this project. INT8 is 19% faster *and* one question ahead, which at n=50 is noise on the accuracy axis and a real win on the time axis.
-
-> `HISTORICAL, NOT REPRODUCIBLE AS STATED` — earlier runs reported 88.0% (threshold 0.9/0.4) against an HF reference at 82.0%, and 76.0% for the fixed schedule. Those predate the `_stable_subset` fix, so `--seed 42` selected a *different* 50 questions on a different machine. They are not wrong for the set they saw, and they are not comparable to the table above. Re-run before quoting.
-
-> **`steps_per_block >= block_length / 2` is the floor, not the recommended setting.** At ratio 0.25 generation collapses into degenerate repetition (0% accuracy); at 0.5 it recovers fully and a runtime warning fires below that. But **0.5 is still on the edge**: measured at n=200 on H100, ratio 0.5 produced 5 deterministic degenerate-repetition failures (2.5% of questions) that **ratio 1.0 eliminates entirely**, worth +3.5pt accuracy for +6% time — the step budget is a ceiling, not a floor, so early exit absorbs most of the extra. **Prefer `steps_per_block >= block_length`.** See `h100x2_bench.md` §8c. A `remask_threshold` mechanism was tried for the residual repetition and made things categorically worse (0%) — reverted.
-
-> `_grade_gsm8k` falls back to "last number anywhere in the response" when the extracted span has no digits; 3 of 44 correct answers in one run rest on that fallback. Comparisons *within* this harness hold; the margin over the paper's 82.41% is softer than it looks.
-
----
-
-## Multi-GPU
-
-**Use data parallelism, not tensor parallelism, for throughput.** `dminfr/serving/server.py` disables request batching whenever `tp_size > 1` — above one rank every request serializes through `request_lock`, so TP=8 delivers roughly an eighth of what the hardware can do. The model is ~14 GiB against an 80 GiB H100, so there is no capacity reason to shard it either.
-
 ```bash
-bash start_dp.sh --gpus 8 --weight-dir weights          # one replica per GPU + router
-bash start_dp.sh --gpus 8 --quantize int8
-```
+# regression suite
+python -m tests.test_fusions
 
-`dminfr/serving/router.py` routes **least-outstanding**, not round-robin: a replica runs a whole batch to completion, so one that just accepted 32 requests is busy for ~35 s while an idle one answers immediately. Unhealthy replicas leave rotation and are retried in the background. `GET /v1/replicas` shows live per-replica load.
-
-TP+EP remains available (`start.sh --tp-size N`), but **do not reach for it on latency grounds without measuring on your own hardware.** The 6.15× figure previously quoted here was 2× A6000 against the *unoptimized* baseline, not against `dminfr/engine/` on one GPU. Measured on 2× H100 PCIe (no NVLink):
-
-- At concurrency 1 with 128-token generation, TP+EP=2 and a single replica are **statistically tied** (24.8 vs 23.3 tok/s).
-- At realistic GSM8K length it **inverts**: 19.4 s/question against a single GPU's 3.4–3.8 s, because TP's per-layer NCCL all-reduce cost is paid *per diffusion step* and GSM8K runs far more steps than the throughput benchmark does.
-
-On an NVLink'd node the picture may differ; on PCIe it does not favour TP. See `h100x2_bench.md` §7, §8e.
-
----
-
-## Getting Started
-
-```bash
-bash setup.sh                                        # venv + torch 2.5.1 + ~15 GB weights
-python dminfr.tuning.autotune_moe.py --model FULL_CFG   # do not skip
-bash start.sh --backend fast_dense --weight-dir weights
-```
-
-Requires an NVIDIA GPU with Triton, ≥24 GB VRAM (bf16), CUDA 12.x, `transformers==4.53.2` (5.x removed `ROPE_INIT_FUNCTIONS['default']`, which this model needs).
-
-```bash
-# benchmark
+# latency vs the unoptimized baseline
 python -m benchmarks.check_time_inference --weight-dir weights --mode both
 
 # throughput
-python -m benchmarks.throughput.run_throughput --base-url http://localhost:8000 \
-    --concurrency 32 --n-requests 96 --max-tokens 128 --steps 128 --block-length 32
+python -m benchmarks.throughput.run_throughput --base-url http://localhost:8000     --concurrency 32 --n-requests 96 --max-tokens 128 --steps 128 --block-length 32
 
 # accuracy
-python -m benchmarks.correctness.run_math_reasoning_code --task gsm8k \
-    --limit 50 --seed 42 --max-tokens 1024 --steps 512 --block-length 64 \
-    --confidence-threshold 0.9 --low-confidence-threshold 0.4
+python -m benchmarks.correctness.run_math_reasoning_code --task gsm8k     --limit 200 --seed 42 --max-tokens 1024 --steps 1024 --block-length 64     --confidence-threshold 0.9 --low-confidence-threshold 0.4
 ```
 
-The server is OpenAI-compatible (`/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/v1/quantization`).
-
----
-
-## Project Structure
-
-```
-dminfr/                     the package
-  engine/                   the optimized engine — what runs in production
-    model.py                KV cache, RoPE, attention, fused MoE block
-    generate.py             block-wise cached diffusion decoding
-    fused_moe_triton.py     grouped-GEMM MoE kernel + SiLU epilogue + autotune loader
-    fused_ops.py            fused RMSNorm, decode tail, RoPE
-    distributed.py          TP/EP helpers and weight loading
-  serving/                  how it is served
-    server.py               OpenAI-compatible API, request batching, --quantize
-    router.py               data-parallel router (least-outstanding)
-  reference/                the unoptimized baseline every speedup is measured
-    model.py  generate.py   against. Loops 64 experts in Python; not for deployment.
-  tuning/
-    autotune_moe.py         end-to-end-aware MoE autotuner
-
-tests/                      regression suite (python -m tests.<name>)
-benchmarks/                 latency, throughput and accuracy harnesses
-  correctness/              GSM8K / BBH / CRUX-O / MMLU-Pro
-  throughput/               concurrent-request benchmark
-scripts/                    setup.sh, start.sh, start_dp.sh
-tools/                      download_weights.py
-docs/                       INVESTIGATION_LOG.md, h100x2_bench.md
-archive/investigations/     one-off scripts behind INVESTIGATION_LOG's findings
-```
-
-The `engine` / `reference` split was previously `model_update/` vs `src/` —
-which also left the production server sitting inside the directory named after
-the slow reference path. `dminfr.engine` is the engine; `dminfr.reference` is
-the thing it is faster *than*.
-
----
-
-## Dependencies
-
-`torch>=2.0` (tested 2.5.1), `triton>=2.1`, `transformers==4.53.2`, `safetensors`, `fastapi`, `uvicorn`, `aiohttp`, `lm-eval[api]>=0.4.4`. Full list in `requirements.txt`. `LLaDA_Quant` is optional and deliberately not listed.
+Full installation, multi-GPU launch and configuration:
+**[`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)**.
