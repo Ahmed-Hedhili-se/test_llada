@@ -7,7 +7,9 @@
 
 Self-contained PyTorch reimplementation of [inclusionAI/LLaDA-MoE-7B-A1B-Instruct](https://huggingface.co/inclusionAI/LLaDA-MoE-7B-A1B-Instruct), a masked-diffusion LLM. Triton fused MoE, block-wise KV caching, fused RMSNorm/decode kernels, variable-length batching, an OpenAI-compatible server, a data-parallel router, and an end-to-end-aware autotuner.
 
-**8.70× single-request and 103× total-pipeline throughput vs the unoptimized baseline** (single RTX A6000).
+**~955 tok/s on 2× H100 PCIe** · **10.2× single-request and ~179× single-GPU total-pipeline throughput** vs the unoptimized baseline.
+
+Measured on 2× H100 PCIe (full log: [`h100x2_bench.md`](h100x2_bench.md)) and on a single RTX A6000. Ratios are **not hardware-portable** — the baseline is CPU-dispatch-bound, so the same engine scores 8.70× on A6000 and 10.2× on H100 with no code difference.
 
 > The mark is an 8×10 token lattice shaped as a **D**: masked in the upper left, resolved in the lower right, with four tokens stepping violet→blue through the counter — this engine's own decoding process, drawn. Full identity in [`assets/logo/`](assets/logo/README.md).
 
@@ -18,6 +20,7 @@ Self-contained PyTorch reimplementation of [inclusionAI/LLaDA-MoE-7B-A1B-Instruc
 - [Architecture](#architecture) · [Optimizations](#optimizations) · [Benchmarks](#benchmarks)
 - [Quantization](#quantization-int8-experts) · [Autotuner](#triton-autotuner) · [Correctness](#correctness)
 - [Decoding](#adaptive-decoding) · [Multi-GPU](#multi-gpu) · [Getting Started](#getting-started) · [Structure](#project-structure)
+- **[`h100x2_bench.md`](h100x2_bench.md)** — full 2× H100 validation log: every measurement, the bugs found, and the hypotheses that were tested and rejected
 
 ---
 
@@ -52,13 +55,61 @@ Each expert is a SwiGLU FFN: `W1 = [gate ; up]` (2048 → 2×1024), `SiLU(gate) 
 
 **5. Fused RMSNorm + decode tail** — eager RMSNorm is 8 launches, and the model runs 65 per forward (~30% of all kernel launches). The decode tail did a full fp32 copy → 157k-wide softmax → gather of one value. One Triton kernel each: **9.1–11.4×** and **3.1–6.3×** respectively. Not bit-exact (both reassociate a reduction); disable with `LLADA_FUSE_RMSNORM=0` / `LLADA_FUSE_DECODE=0`.
 
-**6. Variable-length batching** — prompts of different lengths are left-padded to a common width, with per-row RoPE positions and an additive attention mask. Before this, requests could only batch if their prompts tokenized to *exactly* the same length.
+**6. Fused RoPE** — `rotate_half` was `torch.cat([-x2, x1])`, materializing a
+full rotated copy of q and k every layer, every step, purely to express a
+permutation of the head dimension. ncu attributed ~4% of GPU time to the
+resulting `aten::cat` + `aten::neg`. One kernel reads the partner element
+directly and never builds the copy: **2.55×** on the op, and **bit-exact** —
+it reproduces ATen's three-bf16-op rounding order rather than taking the more
+accurate fully-fp32 route, so q/k are identical downstream and accuracy is
+provably unchanged. Disable with `LLADA_FUSE_ROPE=0`.
+
+**7. Variable-length batching** — prompts of different lengths are left-padded to a common width, with per-row RoPE positions and an additive attention mask. Before this, requests could only batch if their prompts tokenized to *exactly* the same length.
 
 **Rejected on A6000, flips on H100: fused QKV.** One GEMM instead of three measured 1.62× at M=32, 0.99× at M=256, **0.96× at M=1024**, 1.17× at M=2048 on A6000 — and this engine runs at M = batch × suffix_length, so batch 32 at block 32 sits near M=1024, exactly where it lost. On **H100 the same test measures 1.87× / 3.76× / 1.18× / 1.12×** — faster at every size, and bit-exact at M≥256. It remains unfused because `lm_head` dominates the cuBLAS time, so the end-to-end gain is ~0.5%, below the measurement noise floor, and enabling it would need a shape-dependent bit-exactness rule. `eval/test_fusions.py` measures it on whatever card you run: the answer is cuBLAS- and shape-dependent, not universal.
 
 ---
 
 ## Benchmarks
+
+> Two hardware sets below. **H100 numbers are 3 repetitions per point**; A6000
+> numbers are single samples and should be read as approximate — the measured
+> run-to-run noise floor on this harness is **~±5%** (up to ±15% at high batch),
+> so anything under ~10% is not a result. See `h100x2_bench.md` §11.
+
+### 2× H100 PCIe — current
+
+**Throughput, single GPU** (fused RoPE on, 3 reps/point)
+
+| `BATCH_MAX_SIZE` | Tok/s | sd | p50 |
+|---:|---:|---:|---:|
+| **32** ← optimum | **656.9** | 3.5 | **5.33 s** |
+| 64 | 585.0 | 34.7 | 12.07 s |
+| 128 | 607.2 | 54.4 | 23.04 s |
+
+**Throughput, DP=2 across both GPUs**
+
+| Concurrency | Tok/s | sd | p50 |
+|---:|---:|---:|---:|
+| 32 | 871.6 | 23.9 | **4.18 s** |
+| **64** ← peak | **954.5** | 52.8 | 5.48 s |
+| 128 | 599.3 | 129.3 | 16.17 s |
+
+Past concurrency 64 throughput *drops* while p50 triples — 64 total (32/replica)
+is the operating point, not a floor to push past.
+
+**Speedup** (5 runs, 0/128 token divergence vs baseline)
+
+| | Tok/s | vs baseline |
+|---|---:|---:|
+| Baseline `src/`, single request | 3.67 | 1.00× |
+| Optimized, single request | 37.29 | **10.2×** |
+| 1 GPU batched (`BATCH_MAX_SIZE=32`) | 656.9 | **~179×** |
+| 2 GPUs (DP=2, concurrency 64) | 954.5 | **~260×** |
+
+Decomposition cross-checks (10.16 × 17.62 = 179.0), but the `src/` baseline
+drifted 7.8% between two runs of identical code — **quote a range: ~165–180×
+on one GPU, ~225–260× on two**, not a single digit.
 
 ### Single request vs baseline — RTX A6000
 
@@ -122,17 +173,47 @@ On H100 it is **not**. Nsight Compute at the production shape measures **DRAM th
 
 ---
 
-## Quantization (INT8 experts)
+## Quantization (INT8 / FP8 experts)
 
-**This engine runs BF16.** Nothing in `model_update/` quantizes anything — the `use_fp8_w8a8` / `use_int8_w8a16` parameters in `fused_moe_kernel` are inherited from vLLM, always `False`, never referenced.
+**This engine runs BF16.** Nothing in `model_update/` quantizes anything. (The
+`use_fp8_w8a8` / `use_int8_w8a16` parameters that used to sit in
+`fused_moe_kernel` were inherited from vLLM, always `False`, never referenced —
+they have since been removed.)
 
 INT8 is available through the optional [`LLaDA_Quant`](https://github.com/Ahmed-Hedhili-se/LLaDA_Quant) toolkit, imported lazily and absent from `requirements.txt`:
 
 ```bash
 bash start.sh --backend fast_dense --weight-dir weights --quantize int8
+bash start.sh --backend fast_dense --weight-dir weights --quantize fp8   # E4M3
 ```
 
-`MEASURED` on one A6000, 128-token generation:
+### Measured on 2× H100
+
+Resident memory, tensor-level accounting (`LLaDA_Quant.memory.resident_memory` —
+**not** `nvidia-smi`, which reports the allocator's peak reserve and made
+quantization look like it *grew* the model):
+
+| | Resident | vs BF16 |
+|---|---:|---:|
+| BF16 | 14032 MiB | — |
+| INT8 packed | 8080 MiB | **−42.4%** |
+| FP8-E4M3 packed | 8080 MiB | **−42.4%** |
+
+Identical, as they must be — both are 1 byte/weight over the same shapes.
+
+Accuracy, **paired against BF16 on identical questions** with McNemar:
+
+| Arm | n | BF16 | quantized | Δ | McNemar p |
+|---|---:|---:|---:|---:|---:|
+| INT8 (packed + fused W8A16) | 200 | 71.0% | 68.5% | −2.5 pt | **0.50** |
+| FP8-E4M3 (packed, no fused kernel) | 100 | 73.0% | 70.0% | −3.0 pt | **0.61** |
+
+**Neither is significant**, and this does *not* establish that quantization is
+free — both point estimates are negative, so a small real cost is not excluded.
+What it rules out is using small-n marginals to choose between modes. FP8 has no
+fused kernel yet, so it runs ~3× slower per question than INT8.
+
+### Historical — one A6000, 128-token generation
 
 | Load | BF16 | INT8 PACKED | INT8 PACKED + fused W8A16 |
 |---|---:|---:|---:|
@@ -144,7 +225,12 @@ bash start.sh --backend fast_dense --weight-dir weights --quantize int8
 
 Memory drops 42% at every load; speed **inverts with batch size** — faster than BF16 at batch 1, parity at 32, half the speed at 64. The concurrency-64 collapse is not explained by the roofline (BF16 is flat from 32→64 while the quantized arm halves) and remains open.
 
-**Recommendation:** on a card that fits the model, stay BF16 for throughput. Quantization earns its place when memory is the binding constraint, or for single-request latency.
+**Recommendation:** on a card that fits the model, stay BF16 for throughput.
+Quantization earns its place when memory is the binding constraint, or for
+single-request latency. On H100 specifically, using the freed memory to run
+*more replicas per GPU* was tested and is a **net loss** — the MoE kernel is
+bandwidth-bound, so co-located replicas compete for bytes rather than adding
+throughput (`h100x2_bench.md` §8d).
 
 ---
 
@@ -162,6 +248,21 @@ It scores the *complete* pipeline (`GEMM1 → activation → GEMM2 → sum`, fol
 ---
 
 ## Correctness
+
+**GSM8K on 2× H100: 75.2% at n=1000** (`steps=1024 block_length=64 threshold 0.9/0.4`).
+Regression suite **9/9**, `LLaDA_Quant` **276/276**, autotuner validates
+`cos_sim = 1.000000` at every M, optimized output is **character-identical** to
+the baseline (0/128 divergence).
+
+> **Sample size matters more than anything else here.** The same engine and config
+> scores 74.0% at n=50, 71.0% at n=200 and **75.2% at n=1000** — the small
+> subsets are simply unrepresentative. Worse, **~17% of GSM8K questions flip
+> outcome under *any* numerical perturbation** on this checkpoint (measured: a
+> router-precision change with no accuracy effect still churned 167/1000
+> questions). So n=200 carries ±3pt of intrinsic noise, marginal comparison at
+> that scale is invalid, and **paired McNemar is required** — resolving a 3-point
+> effect needs n≈1000. Every accuracy figure below n=1000 in this repo's history
+> inherits this. See `h100x2_bench.md` §9.
 
 Against the HuggingFace reference at the logit level: **3,219/3,219 weights mapped**, logit cosine **0.9781**, top-1 token match **91.0%**.
 
