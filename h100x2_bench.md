@@ -1368,7 +1368,48 @@ than only in this log:
 
 ---
 
-## 15. Open items from this session
+## 15. Quantization accuracy, re-measured paired
+
+§6 compared BF16/INT8/FP8 at n=50 and §9 then proved that meaningless
+here: ~17% of GSM8K flips under any numerical perturbation, so a
+2-question marginal difference is noise. Re-measured **paired against
+BF16 on the identical questions**, with McNemar rather than a marginal
+comparison. BF16's arm is the §9e n=1000 run (same config: `steps=1024
+block_length=64 threshold 0.9/0.4`), so all arms share the seeded
+question order.
+
+| Arm | n | BF16 | quantized | Δ | churn | McNemar p |
+|---|---:|---:|---:|---:|---:|---:|
+| **INT8** (packed, fused W8A16) | 200 | 71.0% | **68.5%** | −2.5 pt | 17.5% | **0.50** |
+| **FP8-E4M3** (packed, no fused kernel) | 100 | 73.0% | **70.0%** | −3.0 pt | 15.0% | **0.61** |
+
+**Neither is significant.** INT8's 35 discordant pairs split 15/20 and
+FP8's 15 split 6/9 — both indistinguishable from a coin flip. The
+measured churn (17.5% and 15.0%) matches §9's 16.7% at n=1000, confirming
+that figure is a property of the checkpoint rather than of one experiment.
+
+What this does and does not license:
+
+- **It does not show quantization is free.** Both point estimates are
+  negative (−2.5, −3.0) and §6's n=50 run also came out −4.0 for FP8. A
+  consistently negative direction across three independent samples is
+  weak evidence of a small real cost, not evidence of none. Resolving a
+  2–3 point effect needs n≈1000 (§9), which INT8 could reach and FP8
+  cannot in reasonable wall-clock without a fused kernel — it runs ~3×
+  slower per question, which is why its arm stops at n=100.
+- **It does show the n=50 figures in §6 cannot be used to choose between
+  these modes.** "INT8 is free, FP8 costs 4 points" was an artifact of
+  reading marginals at a sample size this checkpoint's routing noise
+  swamps.
+
+The deployment recommendation is unchanged and rests on memory and speed,
+not accuracy: INT8 packed+fused saves 42.4% resident memory (§6) at
+parity-or-better speed; FP8 saves the same memory but has no fused kernel
+yet, so it is 3× slower per question.
+
+---
+
+## 16. Open items from this session
 
 - [x] `moe_tune_config.json` — **DONE (§14d).** Device-keyed lookup added
       (`moe_tune_config.device_name=<GPU>.json`), legacy name still honoured
@@ -1446,14 +1487,17 @@ than only in this log:
       n=1000 (p=0.757); free at throughput (−0.3%) but ~12% cost on the
       single-stream path. Flag kept default-off with the negative result
       documented so the idea isn't re-investigated from scratch.
-- [ ] **Every n=50/n=200 accuracy figure in this log is superseded by
-      §9e's n=1000 result (75.2%).** §6's quantization comparison
-      (BF16/INT8/FP8 at n=50) and §8e's TP figure inherit the same
-      sampling problem and should be re-run at n≥1000 before any of them
-      is used to choose between configurations. Given §9's measured 17%
-      churn, none of those 2-question differences mean anything.
-- [ ] FP8 n=200 accuracy re-run (§6) — superseded by the item above; run
-      at n≥1000 or not at all.
+- [x] Quantization accuracy re-measured **paired** (§15): INT8 −2.5 pt at
+      n=200 (p=0.50), FP8 −3.0 pt at n=100 (p=0.61). Neither significant;
+      §6's n=50 marginals cannot be used to choose between modes. Direction
+      is consistently negative across three samples, so a small real cost
+      is not excluded — resolving it needs n≈1000, which FP8 cannot reach
+      without a fused kernel.
+- [ ] §8e's TP accuracy figure (n=50) still inherits the §9 sampling
+      problem and would need the same paired treatment to mean anything.
+- [x] FP8 accuracy re-run — done at n=100 (§15), paired. Capped there
+      rather than n≥1000 because without a fused kernel FP8 runs ~3×
+      slower per question; n=1000 would be ~3.5 h.
 - [ ] FP8 fused kernel — currently dequantize-per-access only, so §6's
       12.5s vs 4.2s/question is not apples-to-apples. This is a real
       engineering project (an FP8xBF16 or native FP8 tensor-core Triton
