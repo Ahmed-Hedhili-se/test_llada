@@ -176,6 +176,44 @@ Keep them locally or attach them to the report.
 
 ---
 
+## Building the comparison
+
+The raw outputs are per-milestone. To get the cross-milestone view the report
+needs:
+
+```bash
+python profiling/summarize.py            # table only
+python profiling/summarize.py --plots    # table + PNG charts
+```
+
+Writes into `profiling/results/`:
+
+| File | Contents |
+|---|---|
+| `SUMMARY.md` | one row per milestone: latency, tok/s, speedup, kernel launches, kernel time, syncs, memcpy — plus a top-kernel breakdown per milestone |
+| `summary.csv` | the same, for a spreadsheet or your own plotting |
+| `plot_*.png` | throughput, speedup, kernel launches, sync count (only with `--plots`) |
+
+It is **standard library only**; `matplotlib` is imported lazily and only for
+`--plots`, so it adds no project dependency. Without it you still get the
+table, which is what the report actually needs. Install with
+`pip install matplotlib` if you want the charts.
+
+Two things it does automatically, both of which are easy to forget by hand:
+
+- **Reports the control-arm spread.** The frozen baseline is measured in every
+  run, so `SUMMARY.md` prints its min–max across milestones as an explicit
+  noise figure — *"treat any optimized-path difference smaller than this as
+  unresolved."*
+- **Warns on mixed runs.** If the GPU or the tuned-config line differs between
+  milestones, the table says so at the top rather than letting you compare rows
+  that are not comparable.
+
+Milestones missing nsys CSVs (run with `--no-nsys`) simply leave the
+kernel/sync columns blank and are called out at the end.
+
+---
+
 ## Metrics to extract
 
 Everything below comes from the CSVs the script already exports, so the report
