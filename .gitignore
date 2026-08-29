@@ -69,3 +69,7 @@ dInfer/
 
 # Reference clone, not part of this project
 sglang/
+
+# Historical profiling traces (large; keep local)
+profiling/results/
+.profiling_worktrees/
